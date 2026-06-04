@@ -1,0 +1,23 @@
+# RunPod serverless SDK
+runpod>=1.7.0
+
+# Image decoding
+Pillow>=10.0.0
+
+# HTTP / schema validation
+requests>=2.31.0
+pydantic>=2.0.0
+
+# Numerical
+numpy>=1.24.0
+
+# DEIMv2 upstream requirements (also installed from source in Dockerfile)
+torch==2.5.1
+torchvision==0.20.1
+faster-coco-eval>=1.6.7
+PyYAML
+scipy
+transformers
+
+# COCO class labels helper
+huggingface-hub>=0.20.0
