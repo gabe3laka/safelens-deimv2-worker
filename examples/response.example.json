@@ -1,0 +1,26 @@
+{
+  "entities": [
+    {
+      "label": "person",
+      "class_id": 0,
+      "confidence": 0.91,
+      "bbox": { "x": 0.12, "y": 0.05, "w": 0.18, "h": 0.72 }
+    },
+    {
+      "label": "person",
+      "class_id": 0,
+      "confidence": 0.84,
+      "bbox": { "x": 0.52, "y": 0.08, "w": 0.16, "h": 0.68 }
+    },
+    {
+      "label": "truck",
+      "class_id": 7,
+      "confidence": 0.76,
+      "bbox": { "x": 0.68, "y": 0.20, "w": 0.30, "h": 0.45 }
+    }
+  ],
+  "inference_ms": 48.3,
+  "model": "deimv2-s",
+  "img_w": 1280,
+  "img_h": 720
+}
