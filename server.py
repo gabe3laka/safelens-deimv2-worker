@@ -6,11 +6,12 @@ Pattern: adapted from Kingo333/fluxrt-serverless.
 
 Routes
 ------
-GET  /health          -- returns immediately, no model required
-GET  /ping            -- alias for /health
-GET  /debug/startup   -- environment + torch diagnostics
-POST /detect          -- run DEIMv2 inference (503 if model not ready)
-POST /warmup          -- trigger background model load
+GET  /health            -- returns immediately, no model required
+GET  /ping              -- alias for /health
+GET  /debug/startup     -- environment + torch diagnostics (?deep=true for imports)
+POST /debug/model-load  -- attempt model load only, return structured result
+POST /detect            -- run DEIMv2 inference (503 if model not ready)
+POST /warmup            -- trigger background model load
 """
 
 import asyncio
@@ -20,6 +21,7 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -36,7 +38,7 @@ log = logging.getLogger("safelens-deimv2-worker")
 # -- Config -------------------------------------------------------------------
 
 PORT = int(os.getenv("PORT", "8000"))
-WORKER_VERSION = "0.2.0-live-server"
+WORKER_VERSION = "0.2.1-live-server"
 SKIP_WARMUP = os.getenv("SKIP_WARMUP", "false").strip().lower() in ("1", "true", "yes", "on")
 AUTO_WARMUP = os.getenv("AUTO_WARMUP", "true").strip().lower() in ("1", "true", "yes", "on")
 WARMUP_TIMEOUT_S = int(os.getenv("WARMUP_TIMEOUT_S", "600"))
@@ -48,6 +50,7 @@ _STATE_LOCK = threading.RLock()
 _STATE: Dict[str, Any] = {
     "status": "cold",
     "error": None,
+    "error_traceback": None,
     "model": None,
     "processor": None,
     "device": None,
@@ -68,7 +71,6 @@ def _log_startup(msg: str) -> None:
     except Exception:
         pass
 
-
 # -- Public state helper ------------------------------------------------------
 
 def _public_state() -> Dict[str, Any]:
@@ -77,11 +79,11 @@ def _public_state() -> Dict[str, Any]:
             "status": _STATE["status"],
             "model_loaded": _STATE["model"] is not None,
             "error": _STATE["error"],
+            "error_traceback": _STATE["error_traceback"],
             "warmup_started_at": _STATE["warmup_started_at"],
             "ready_at": _STATE["ready_at"],
             "uptime_seconds": round(time.time() - _BOOT_TS, 2),
         }
-
 
 # -- Model warmup (background thread) -----------------------------------------
 
@@ -91,6 +93,7 @@ def _warmup_blocking() -> None:
             return
         _STATE["status"] = "loading"
         _STATE["error"] = None
+        _STATE["error_traceback"] = None
         _STATE["warmup_started_at"] = time.time()
 
     _log_startup("warmup: starting DEIMv2 model load")
@@ -106,11 +109,13 @@ def _warmup_blocking() -> None:
         _log_startup(f"warmup: ready -- model on {device}")
     except Exception as exc:
         err_msg = f"{type(exc).__name__}: {exc}"
+        tb = traceback.format_exc()
         _log_startup(f"warmup: FAILED -- {err_msg}")
+        _log_startup(tb)
         with _STATE_LOCK:
             _STATE["status"] = "error"
             _STATE["error"] = err_msg
-
+            _STATE["error_traceback"] = tb
 
 def _start_warmup_background() -> None:
     with _STATE_LOCK:
@@ -118,7 +123,6 @@ def _start_warmup_background() -> None:
             return
     t = threading.Thread(target=_warmup_blocking, name="deimv2-warmup", daemon=True)
     t.start()
-
 
 # -- FastAPI lifespan ---------------------------------------------------------
 
@@ -136,9 +140,7 @@ async def lifespan(app: FastAPI):
     yield
     _log_startup("server shutting down")
 
-
 app = FastAPI(title="safelens-deimv2-worker", version=WORKER_VERSION, lifespan=lifespan)
-
 
 # -- Health / ping (no model dependency) -------------------------------------
 
@@ -153,7 +155,6 @@ async def health():
         **_public_state(),
     })
 
-
 @app.get("/ping")
 async def ping():
     """Alias for /health."""
@@ -165,12 +166,82 @@ async def ping():
         **_public_state(),
     })
 
+# -- Import diagnostics helper (no secrets) -----------------------------------
+
+def _safe_version(module_name: str) -> Optional[str]:
+    try:
+        mod = __import__(module_name)
+        return getattr(mod, "__version__", "unknown")
+    except Exception as exc:
+        return f"ERROR: {type(exc).__name__}: {exc}"
+
+def _import_check(import_stmt: str, callable_test) -> Dict[str, Any]:
+    """Run a single import test and return ok / structured error (no secrets)."""
+    try:
+        callable_test()
+        return {"status": "ok"}
+    except Exception as exc:
+        return {
+            "status": "error",
+            "exception_type": type(exc).__name__,
+            "exception_message": str(exc),
+            "traceback": traceback.format_exc()[-3000:],
+        }
+
+def _collect_import_diagnostics() -> Dict[str, Any]:
+    """Deep import diagnostics. Never exposes secret values, only env names."""
+    versions: Dict[str, Any] = {}
+    for name in ("transformers", "huggingface_hub", "torch", "torchvision", "PIL",
+                 "timm", "safetensors", "tokenizers", "accelerate", "numpy"):
+        versions[name] = _safe_version(name)
+
+    cuda: Dict[str, Any] = {}
+    try:
+        import torch
+        cuda["available"] = bool(torch.cuda.is_available())
+        cuda["device_count"] = torch.cuda.device_count()
+        if torch.cuda.is_available():
+            cuda["gpu_name"] = torch.cuda.get_device_name(0)
+    except Exception as exc:
+        cuda["error"] = f"{type(exc).__name__}: {exc}"
+
+    def _imp_auto_image_processor():
+        from transformers import AutoImageProcessor  # noqa: F401
+
+    def _imp_auto_model_obj_det():
+        from transformers import AutoModelForObjectDetection  # noqa: F401
+
+    def _imp_timm():
+        import timm  # noqa: F401
+
+    def _imp_safetensors():
+        import safetensors  # noqa: F401
+
+    def _imp_torchvision():
+        import torchvision  # noqa: F401
+
+    raw_imports = {
+        "AutoImageProcessor": _import_check("from transformers import AutoImageProcessor", _imp_auto_image_processor),
+        "AutoModelForObjectDetection": _import_check("from transformers import AutoModelForObjectDetection", _imp_auto_model_obj_det),
+        "timm": _import_check("import timm", _imp_timm),
+        "safetensors": _import_check("import safetensors", _imp_safetensors),
+        "torchvision": _import_check("import torchvision", _imp_torchvision),
+    }
+    # Compact summary as requested: {"AutoImageProcessor": "ok", ...}
+    imports_summary = {k: ("ok" if v.get("status") == "ok" else "error") for k, v in raw_imports.items()}
+
+    return {
+        "versions": versions,
+        "cuda": cuda,
+        "imports": imports_summary,
+        "imports_detail": raw_imports,
+    }
 
 # -- Debug / startup diagnostics ----------------------------------------------
 
 @app.get("/debug/startup")
 async def debug_startup(deep: bool = Query(False)):
-    """Environment info, disk usage, and optional torch/CUDA diagnostics."""
+    """Environment info, disk usage, and optional deep import diagnostics."""
     total, used, free = shutil.disk_usage("/")
     info: Dict[str, Any] = {
         "ok": True,
@@ -212,14 +283,58 @@ async def debug_startup(deep: bool = Query(False)):
                 info["torch"]["gpu_mem_free_gb"] = round(free_mem / 1e9, 2)
         except Exception as exc:
             info["torch_error"] = f"{type(exc).__name__}: {exc}"
+        # Deep import diagnostics (versions + import test results, no secrets)
         try:
-            import transformers
-            info["transformers_version"] = transformers.__version__
+            info["diagnostics"] = _collect_import_diagnostics()
         except Exception as exc:
-            info["transformers_error"] = f"{type(exc).__name__}: {exc}"
+            info["diagnostics_error"] = f"{type(exc).__name__}: {exc}"
 
     return JSONResponse(info)
 
+# -- Model-load diagnostic route ----------------------------------------------
+
+@app.post("/debug/model-load")
+async def debug_model_load():
+    """
+    Attempt ONLY the model-loading part (no inference) and return a structured
+    result. Never crashes the worker; on failure returns the full traceback.
+    """
+    model_id = os.environ.get("DEIMV2_MODEL_ID", "Intellindust-AI-Lab/DEIMv2-S")
+    result: Dict[str, Any] = {
+        "ok": False,
+        "model_id": model_id,
+        "device": None,
+        "transformers_version": None,
+    }
+    try:
+        import transformers
+        result["transformers_version"] = transformers.__version__
+    except Exception as exc:
+        result["transformers_version"] = f"ERROR: {type(exc).__name__}: {exc}"
+
+    try:
+        import torch
+        device = "cuda" if (os.environ.get("DEIMV2_DEVICE", "cuda").lower() == "cuda"
+                            and torch.cuda.is_available()) else "cpu"
+        result["device"] = device
+    except Exception as exc:
+        result["device"] = f"ERROR: {type(exc).__name__}: {exc}"
+
+    try:
+        from transformers import AutoImageProcessor, AutoModelForObjectDetection
+        processor = AutoImageProcessor.from_pretrained(model_id, trust_remote_code=True)
+        model = AutoModelForObjectDetection.from_pretrained(model_id, trust_remote_code=True)
+        result["ok"] = True
+        result["processor_class"] = type(processor).__name__
+        result["model_class"] = type(model).__name__
+    except Exception as exc:
+        result["ok"] = False
+        result["exception_type"] = type(exc).__name__
+        result["exception_message"] = str(exc)
+        result["traceback"] = traceback.format_exc()
+        _log_startup(f"debug/model-load FAILED: {type(exc).__name__}: {exc}")
+
+    return JSONResponse(result)
 
 # -- Warmup trigger -----------------------------------------------------------
 
@@ -234,7 +349,6 @@ async def warmup(wait: bool = Query(False)):
                 return JSONResponse({"ok": state["status"] == "ready", **state})
             await asyncio.sleep(1)
     return JSONResponse({"ok": True, "triggered": True, **_public_state()})
-
 
 # -- Detect endpoint ----------------------------------------------------------
 
@@ -284,7 +398,6 @@ async def detect(payload: Dict[str, Any]):
             {"error": f"inference_failed: {type(exc).__name__}: {exc}", "entities": []},
             status_code=500,
         )
-
 
 # -- Entrypoint ---------------------------------------------------------------
 
