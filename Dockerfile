@@ -1,8 +1,11 @@
 # safelens-deimv2-worker/Dockerfile
-# Builds a RunPod-compatible serverless worker that runs DEIMv2 inference.
+# Builds the SafeLens DEIMv2 live-server worker for RunPod load-balancing endpoints.
 #
-# Model weights are NOT baked in - they are loaded at cold-start from
-# HuggingFace hub (configurable via DEIMV2_MODEL_ID env var).
+# Architecture: long-running FastAPI/uvicorn server (adapted from Kingo333/fluxrt-serverless).
+# Model weights are NOT baked in -- they are downloaded at cold-start from HuggingFace Hub.
+#
+# RunPod endpoint type: HTTP (load-balancing), not serverless queue.
+# Health probe: GET /health or GET /ping (returns immediately, no model required).
 
 FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime
 
@@ -13,7 +16,7 @@ RUN apt-get update && apt-get install -y \
     git wget curl libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Python worker dependencies
+# Python worker dependencies (includes fastapi + uvicorn for live-server mode)
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -28,18 +31,44 @@ RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.
 
 # Copy worker code
 WORKDIR /app
-COPY handler.py      /app/handler.py
+COPY handler.py    /app/handler.py
 COPY deimv2_infer.py /app/deimv2_infer.py
-COPY schema.py       /app/schema.py
+COPY schema.py     /app/schema.py
+COPY server.py     /app/server.py
+COPY bootstrap.py  /app/bootstrap.py
 
 # DEIMv2 source on PYTHONPATH so its modules are importable
 ENV PYTHONPATH="/opt/DEIMv2:/app:${PYTHONPATH}"
 
+# ------- RunPod HTTP endpoint configuration ----------------------------------
+
+# Port the uvicorn server listens on.  RunPod load-balancer forwards traffic here.
+ENV PORT="8000"
+
+# Uvicorn log level
+ENV UVICORN_LOG_LEVEL="info"
+
+# Set to "true" to skip model load on startup (diagnostic / smoke-test mode).
+# /health and /debug/startup still return 200.
+ENV SKIP_WARMUP="false"
+
+# Set to "true" to start model load immediately on container start.
+# Set to "false" to defer until POST /warmup is called.
+ENV AUTO_WARMUP="true"
+
+# Warmup timeout in seconds before giving up and setting status=error.
+ENV WARMUP_TIMEOUT_S="600"
+
+# Log file written during startup (readable via GET /debug/startup)
+ENV STARTUP_LOG="/tmp/safelens_startup.log"
+
+# ------- DEIMv2 inference configuration -------------------------------------
+
 # Device: "cuda" (default on RunPod GPU workers) or "cpu"
 ENV DEIMV2_DEVICE="cuda"
 
-# HuggingFace model id - override to switch model size:
-#   Intellindust-AI-Lab/DEIMv2-S  (9.7M params, 50.9 AP, recommended)
+# HuggingFace model id. Override to switch model size:
+#   Intellindust-AI-Lab/DEIMv2-S  (9.7M params, 50.9 AP, default)
 #   Intellindust-AI-Lab/DEIMv2-N  (3.6M params, 43.0 AP, ultra-light)
 #   Intellindust-AI-Lab/DEIMv2-M  (18.1M params, 53.0 AP)
 #   Intellindust-AI-Lab/DEIMv2-L  (32.2M params, 56.0 AP)
@@ -51,7 +80,11 @@ ENV DEIMV2_CONF="0.35"
 # Shorter-side resize resolution before inference.
 ENV DEIMV2_IMG_SIZE="640"
 
-# HuggingFace cache - mount a RunPod volume here to persist weights
+# HuggingFace cache -- mount a RunPod volume here to persist weights.
 ENV HF_HOME="/runpod-volume/.cache/huggingface"
 
-CMD ["python", "-u", "handler.py"]
+EXPOSE ${PORT}
+
+# bootstrap.py: starts server.py; falls back to minimal health-only server
+#               if server.py fails to import (prevents silent container death).
+CMD ["python", "-u", "/app/bootstrap.py"]
