@@ -21,6 +21,7 @@ from schema import BBox, Entity, InferResponse
 
 log = logging.getLogger(__name__)
 
+# COCO class names — used as fallback when model config lacks id2label.
 COCO_NAMES = [
     "person","bicycle","car","motorcycle","airplane","bus","train","truck",
     "boat","traffic light","fire hydrant","stop sign","parking meter","bench",
@@ -71,6 +72,19 @@ def get_model():
     return _model, _processor, _device
 
 
+def _get_label(model, cid: int) -> str:
+    """Prefer model config id2label if available; fall back to COCO_NAMES."""
+    id2label = getattr(getattr(model, "config", None), "id2label", None)
+    if isinstance(id2label, dict):
+        # keys may be int or str depending on how the config was loaded
+        label = id2label.get(cid, id2label.get(str(cid)))
+        if label:
+            return str(label)
+    if 0 <= cid < len(COCO_NAMES):
+        return COCO_NAMES[cid]
+    return f"class_{cid}"
+
+
 def decode_image(image_b64: str) -> Image.Image:
     raw = base64.b64decode(image_b64)
     return Image.open(io.BytesIO(raw)).convert("RGB")
@@ -99,7 +113,7 @@ def run_inference(
     )[0]
     scores = results["scores"].cpu().numpy()
     labels = results["labels"].cpu().numpy()
-    boxes  = results["boxes"].cpu().numpy()
+    boxes = results["boxes"].cpu().numpy()
     ms = (time.perf_counter() - t0) * 1000.0
     entities = []
     for score, lid, box in zip(scores, labels, boxes):
@@ -111,7 +125,7 @@ def run_inference(
         ny = max(0.0, min(1.0, float(y1) / new_h))
         nw = max(0.0, min(1.0 - nx, float(x2 - x1) / new_w))
         nh = max(0.0, min(1.0 - ny, float(y2 - y1) / new_h))
-        name = COCO_NAMES[cid] if cid < len(COCO_NAMES) else "class_" + str(cid)
+        name = _get_label(model, cid)
         entities.append(Entity(
             label=name, class_id=cid, confidence=float(score),
             bbox=BBox(x=nx, y=ny, w=nw, h=nh),
