@@ -38,7 +38,8 @@ log = logging.getLogger("safelens-deimv2-worker")
 # -- Config -------------------------------------------------------------------
 
 PORT = int(os.getenv("PORT", "8000"))
-WORKER_VERSION = "0.2.1-live-server"
+WORKER_VERSION = "0.3.0-live-server"
+DEFAULT_MODEL_ID = "Intellindust/DEIMv2_DINOv3_S_COCO"
 SKIP_WARMUP = os.getenv("SKIP_WARMUP", "false").strip().lower() in ("1", "true", "yes", "on")
 AUTO_WARMUP = os.getenv("AUTO_WARMUP", "true").strip().lower() in ("1", "true", "yes", "on")
 WARMUP_TIMEOUT_S = int(os.getenv("WARMUP_TIMEOUT_S", "600"))
@@ -175,7 +176,7 @@ def _safe_version(module_name: str) -> Optional[str]:
     except Exception as exc:
         return f"ERROR: {type(exc).__name__}: {exc}"
 
-def _import_check(import_stmt: str, callable_test) -> Dict[str, Any]:
+def _import_check(callable_test) -> Dict[str, Any]:
     """Run a single import test and return ok / structured error (no secrets)."""
     try:
         callable_test()
@@ -205,36 +206,71 @@ def _collect_import_diagnostics() -> Dict[str, Any]:
     except Exception as exc:
         cuda["error"] = f"{type(exc).__name__}: {exc}"
 
+    # Dependency imports DEIMv2 needs (timm/safetensors/torchvision are required).
+    def _imp_timm():
+        import timm  # noqa: F401
+    def _imp_safetensors():
+        import safetensors  # noqa: F401
+    def _imp_torchvision():
+        import torchvision  # noqa: F401
+    def _imp_hub_mixin():
+        from huggingface_hub import PyTorchModelHubMixin  # noqa: F401
+
+    # Official DEIMv2 engine imports (from /opt/DEIMv2 on PYTHONPATH).
+    def _imp_engine_backbone():
+        from engine.backbone import HGNetv2, DINOv3STAs  # noqa: F401
+    def _imp_engine_deim():
+        from engine.deim import HybridEncoder, DEIMTransformer  # noqa: F401
+    def _imp_engine_postproc():
+        from engine.deim.postprocessor import PostProcessor  # noqa: F401
+    def _imp_official_loader():
+        import official_deimv2_loader  # noqa: F401
+
+    # AutoImageProcessor is OPTIONAL now -- only used by the transformers-fallback
+    # backend, NOT by the official DEIMv2 loader.
     def _imp_auto_image_processor():
         from transformers import AutoImageProcessor  # noqa: F401
-
     def _imp_auto_model_obj_det():
         from transformers import AutoModelForObjectDetection  # noqa: F401
 
-    def _imp_timm():
-        import timm  # noqa: F401
-
-    def _imp_safetensors():
-        import safetensors  # noqa: F401
-
-    def _imp_torchvision():
-        import torchvision  # noqa: F401
-
-    raw_imports = {
-        "AutoImageProcessor": _import_check("from transformers import AutoImageProcessor", _imp_auto_image_processor),
-        "AutoModelForObjectDetection": _import_check("from transformers import AutoModelForObjectDetection", _imp_auto_model_obj_det),
-        "timm": _import_check("import timm", _imp_timm),
-        "safetensors": _import_check("import safetensors", _imp_safetensors),
-        "torchvision": _import_check("import torchvision", _imp_torchvision),
+    required = {
+        "timm": _import_check(_imp_timm),
+        "safetensors": _import_check(_imp_safetensors),
+        "torchvision": _import_check(_imp_torchvision),
+        "PyTorchModelHubMixin": _import_check(_imp_hub_mixin),
     }
-    # Compact summary as requested: {"AutoImageProcessor": "ok", ...}
-    imports_summary = {k: ("ok" if v.get("status") == "ok" else "error") for k, v in raw_imports.items()}
+    deimv2_official = {
+        "engine.backbone": _import_check(_imp_engine_backbone),
+        "engine.deim": _import_check(_imp_engine_deim),
+        "engine.deim.postprocessor": _import_check(_imp_engine_postproc),
+        "official_deimv2_loader": _import_check(_imp_official_loader),
+    }
+    optional = {
+        "AutoImageProcessor": _import_check(_imp_auto_image_processor),
+        "AutoModelForObjectDetection": _import_check(_imp_auto_model_obj_det),
+    }
+
+    def _summary(d):
+        return {k: ("ok" if v.get("status") == "ok" else "error") for k, v in d.items()}
+
+    imports_summary = {}
+    imports_summary.update(_summary(required))
+    imports_summary.update(_summary(deimv2_official))
+    imports_summary.update(_summary(optional))
 
     return {
         "versions": versions,
         "cuda": cuda,
         "imports": imports_summary,
-        "imports_detail": raw_imports,
+        "imports_detail": {
+            "required": required,
+            "deimv2_official": deimv2_official,
+            "optional_transformers_auto": optional,
+        },
+        "notes": {
+            "AutoImageProcessor": "optional -- only used by transformers-fallback backend",
+            "deimv2_backend": os.environ.get("DEIMV2_BACKEND", "official-deimv2-hf"),
+        },
     }
 
 # -- Debug / startup diagnostics ----------------------------------------------
@@ -283,7 +319,6 @@ async def debug_startup(deep: bool = Query(False)):
                 info["torch"]["gpu_mem_free_gb"] = round(free_mem / 1e9, 2)
         except Exception as exc:
             info["torch_error"] = f"{type(exc).__name__}: {exc}"
-        # Deep import diagnostics (versions + import test results, no secrets)
         try:
             info["diagnostics"] = _collect_import_diagnostics()
         except Exception as exc:
@@ -296,12 +331,16 @@ async def debug_startup(deep: bool = Query(False)):
 @app.post("/debug/model-load")
 async def debug_model_load():
     """
-    Attempt ONLY the model-loading part (no inference) and return a structured
-    result. Never crashes the worker; on failure returns the full traceback.
+    Attempt ONLY the model-loading part (no inference) using the OFFICIAL DEIMv2
+    loader (PyTorchModelHubMixin), or the transformers-fallback backend if
+    DEIMV2_BACKEND=transformers-fallback. Never crashes the worker; on failure
+    returns the full structured traceback.
     """
-    model_id = os.environ.get("DEIMV2_MODEL_ID", "Intellindust-AI-Lab/DEIMv2-S")
+    model_id = os.environ.get("DEIMV2_MODEL_ID", DEFAULT_MODEL_ID)
+    backend = os.environ.get("DEIMV2_BACKEND", "official-deimv2-hf").strip().lower()
     result: Dict[str, Any] = {
         "ok": False,
+        "backend": "official-deimv2-hf" if backend != "transformers-fallback" else "transformers-fallback",
         "model_id": model_id,
         "device": None,
         "transformers_version": None,
@@ -321,12 +360,22 @@ async def debug_model_load():
         result["device"] = f"ERROR: {type(exc).__name__}: {exc}"
 
     try:
-        from transformers import AutoImageProcessor, AutoModelForObjectDetection
-        processor = AutoImageProcessor.from_pretrained(model_id, trust_remote_code=True)
-        model = AutoModelForObjectDetection.from_pretrained(model_id, trust_remote_code=True)
-        result["ok"] = True
-        result["processor_class"] = type(processor).__name__
-        result["model_class"] = type(model).__name__
+        if backend == "transformers-fallback":
+            from deimv2_infer import _load_fallback
+            import deimv2_infer
+            deimv2_infer._model = None
+            _load_fallback()
+            result["ok"] = True
+            result["model_class"] = type(deimv2_infer._model).__name__
+            result["backend"] = "transformers-fallback"
+            deimv2_infer._model = None
+        else:
+            from official_deimv2_loader import load_official_deimv2
+            model, dev, cls = load_official_deimv2(model_id=model_id)
+            result["ok"] = True
+            result["model_class"] = cls
+            result["backend"] = "official-deimv2-hf"
+            del model
     except Exception as exc:
         result["ok"] = False
         result["exception_type"] = type(exc).__name__
@@ -358,7 +407,7 @@ async def detect(payload: Dict[str, Any]):
     Run DEIMv2 object detection.
 
     Request body:
-        {"image_b64": "<base64>", "conf": 0.35, "img_size": 640, "classes": null}
+      {"image_b64": "<base64>", "conf": 0.35, "img_size": 640, "classes": null}
 
     Returns 503 if the model is not ready yet.
     """
