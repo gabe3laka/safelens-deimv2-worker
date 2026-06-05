@@ -1,280 +1,119 @@
 # safelens-deimv2-worker
 
-**Sprint 4A-DEIMv2** — Standalone Dockerized DEIMv2 RunPod serverless worker
-Part of the Eagle Vision 2 / SafeLens HSE object-detection pipeline.
-
----
-
-## What this repo is
-
-This is the RunPod serverless worker that runs DEIMv2 GPU inference for Eagle Vision 2.
-
-It is completely separate from the Eagle Vision 2 frontend repo (`gabe3laka/HSE-eagle-vision-2`).
-RunPod builds and runs containers from this repo.
-
----
+SafeLens DEIMv2 detection worker for RunPod — live HTTP server mode.
 
 ## Architecture
 
-```
-Browser camera frame
-  -> Eagle Vision 2 BackendVisionDetector (frontend, dry-run mode)
-  -> Supabase Edge Function proxy (hides RunPod key from browser)
-  -> RunPod DEIMv2 worker (this repo)
-  -> DEIMv2 returns normalised entity boxes
-  -> Eagle Vision 2 displays entities in dev/debug mode
-  -> No DEIMv2 safety alerts yet (Sprint 4A is dry-run)
-```
+This worker runs as a **long-running FastAPI/uvicorn HTTP server** on a RunPod
+load-balancing endpoint (not a serverless queue worker).
 
----
+Pattern adapted from [Kingo333/fluxrt-serverless](https://github.com/Kingo333/fluxrt-serverless).
 
-## Repo structure
+### Why live-server mode?
 
-```
-safelens-deimv2-worker/
-  README.md              This file
-  Dockerfile             CUDA/PyTorch base; clones DEIMv2 at build time
-  requirements.txt       Python deps (runpod, Pillow, pydantic, torch, ...)
-  handler.py             RunPod serverless entry point
-  deimv2_infer.py        DEIMv2 model loading + inference wrapper
-  schema.py              Pydantic request / response models
-  .gitignore             Excludes weights, checkpoints, cache
-  scripts/
-    smoke_test.py        Dry-run + local + live endpoint smoke tests
-  tests/
-    __init__.py          Package marker
-    test_schema.py       pytest unit tests (schema, handler, helpers)
-  examples/
-    request.example.json   Sample RunPod request payload
-    response.example.json  Sample RunPod response payload
-```
+The previous queue-based RunPod serverless handler was fine for static-image
+validation but caused repeated start/stop cycles and queued-but-never-processed
+jobs because the health probe had no route to answer while the model was loading.
 
----
+The live-server architecture solves this by:
 
-## Environment variables
+1. Starting the HTTP server **immediately** before any model is loaded.
+2. Returning 200 from `/health` and `/ping` at all times (no model dependency).
+3. Loading the DEIMv2 model in a **background thread** so the server stays responsive.
+4. Using `bootstrap.py` as a failsafe launcher — if `server.py` crashes during
+   import, a minimal fallback FastAPI app is started on the same port so RunPod's
+   health probe can still surface the real error.
 
-| Variable           | Default                          | Description                        |
-|--------------------|----------------------------------|------------------------------------|
-| `DEIMV2_MODEL_ID` | `Intellindust-AI-Lab/DEIMv2-S`   | HuggingFace model id               |
-| `DEIMV2_DEVICE`   | `cuda`                           | `cuda` or `cpu`                    |
-| `DEIMV2_CONF`     | `0.35`                           | Confidence threshold (0..1)        |
-| `DEIMV2_IMG_SIZE` | `640`                            | Shorter-side resize before inference |
-| `HF_HOME`         | `/runpod-volume/.cache/huggingface` | HuggingFace cache dir           |
+## Routes
 
----
+| Method | Path | Notes |
+|--------|------|-------|
+| GET | `/health` | Returns immediately, **no model required** |
+| GET | `/ping` | Alias for `/health` |
+| GET | `/debug/startup` | Env info, disk, startup log. Add `?deep=true` for torch/CUDA details |
+| POST | `/warmup` | Trigger background model load. Add `?wait=true` to block until ready |
+| POST | `/detect` | Run DEIMv2 inference. Returns 503 if model is not ready yet |
 
-## Available model sizes
+### `/health` response (model not yet loaded)
 
-| Model      | AP (COCO) | Params  | Use case             |
-|------------|-----------|---------|----------------------|
-| DEIMv2-N   | 43.0      | 3.6 M   | Ultra-light / CPU    |
-| DEIMv2-S   | 50.9      | 9.7 M   | Recommended default  |
-| DEIMv2-M   | 53.0      | 18.1 M  | Higher accuracy      |
-| DEIMv2-L   | 56.0      | 32.2 M  | Best accuracy        |
-
----
-
-## Request / response schema
-
-### Request (sent by Supabase Edge Function proxy)
 ```json
 {
-  "input": {
-    "image_b64": "<base64-encoded JPEG or PNG>",
-    "conf": 0.35,
-    "img_size": 640,
-    "classes": null
-  }
+  "ok": true,
+  "worker": "safelens-deimv2-worker",
+  "mode": "live-server",
+  "version": "0.2.0-live-server",
+  "status": "cold",
+  "model_loaded": false,
+  "error": null
 }
 ```
 
-### Response (success)
+### `/detect` request
+
 ```json
 {
-  "entities": [
-    {
-      "label": "person",
-      "class_id": 0,
-      "confidence": 0.91,
-      "bbox": { "x": 0.12, "y": 0.05, "w": 0.18, "h": 0.72 }
-    }
-  ],
-  "inference_ms": 48.3,
-  "model": "deimv2-s",
-  "img_w": 1280,
-  "img_h": 720,
-  "error": null,
-  "warning": null
+  "image_b64": "<base64-encoded JPEG or PNG>",
+  "conf": 0.35,
+  "img_size": 640,
+  "classes": [0, 2, 7]
 }
 ```
 
-### Response (error — handler never crashes)
-```json
-{
-  "entities": [],
-  "error": "missing_image_b64"
-}
+## Docker image
+
+Built and pushed to GitHub Container Registry on every push to `main`:
+
+```
+ghcr.io/gabe3laka/safelens-deimv2-worker:latest
 ```
 
-Known error codes: `missing_image_b64`, `invalid_base64`, `model_load_failed: <msg>`.
+## RunPod configuration
 
-All bounding boxes are normalised to **0..1** relative to the original image.
+### Endpoint type
 
----
+Use **HTTP service** (load-balancing), **not** serverless queue.
 
-## Smoke testing
+Set the container port to match the `PORT` env var (default: `8000`).
+
+### Health probe
+
+Configure RunPod to probe `GET /health` (or `GET /ping`).
+
+### Key environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8000` | Uvicorn listen port |
+| `AUTO_WARMUP` | `true` | Start model load immediately on container start |
+| `SKIP_WARMUP` | `false` | Skip model load entirely (diagnostic mode) |
+| `WARMUP_TIMEOUT_S` | `600` | Seconds before warmup is marked failed |
+| `DEIMV2_MODEL_ID` | `Intellindust-AI-Lab/DEIMv2-S` | HuggingFace model ID |
+| `DEIMV2_DEVICE` | `cuda` | Inference device (`cuda` or `cpu`) |
+| `DEIMV2_CONF` | `0.35` | Default confidence threshold |
+| `DEIMV2_IMG_SIZE` | `640` | Shorter-side resize before inference |
+| `HF_HOME` | `/runpod-volume/.cache/huggingface` | HuggingFace cache (mount volume here) |
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `server.py` | FastAPI app — all routes, warmup logic, state |
+| `bootstrap.py` | Failsafe launcher — starts server.py, falls back to minimal app on error |
+| `deimv2_infer.py` | DEIMv2 model loading and inference |
+| `handler.py` | Legacy RunPod serverless handler (kept for reference) |
+| `schema.py` | Pydantic request/response models |
+
+## Diagnostic mode
+
+Set `SKIP_WARMUP=true` to start the server without loading the model.
+`/health` and `/debug/startup` work immediately. Useful for smoke-testing
+the container boot without waiting for model download.
+
+## Building locally
 
 ```bash
-# Install deps (once)
-pip install -r requirements.txt
-
-# ── Dry-run: syntax + import + schema checks only ────────────────────────────
-# Does NOT load model weights. Safe to run anywhere.
-python scripts/smoke_test.py --dry-run
-
-# ── Local handler test (downloads model weights on first run) ─────────────────
-# Uses a real image file. Requires GPU or CPU torch.
-python scripts/smoke_test.py --image path/to/test.jpg
-
-# ── Local handler test with no image (uses synthetic JPEG) ────────────────────
-# Model will be loaded. If weights not present, returns structured error.
-python scripts/smoke_test.py
-
-# ── Live RunPod endpoint test ─────────────────────────────────────────────────
-export RUNPOD_ENDPOINT_ID=<your-endpoint-id>
-export RUNPOD_API_KEY=<your-api-key>   # Never commit this!
-python scripts/smoke_test.py --endpoint --image path/to/test.jpg
+docker build -t safelens-deimv2-worker:local .
+docker run --rm -p 8000:8000 -e SKIP_WARMUP=true safelens-deimv2-worker:local
+curl http://localhost:8000/health
+curl http://localhost:8000/debug/startup
 ```
-
----
-
-## Running tests
-
-```bash
-# Run all unit tests (no GPU or model weights needed)
-pytest tests/ -v
-
-# Run just the schema tests
-pytest tests/test_schema.py -v
-```
-
-Tests that are safe to run without model weights:
-- schema imports
-- InferRequest/BBox/Entity/InferResponse validation
-- handler missing-image and invalid-base64 error paths
-- _get_label mock-based tests
-
----
-
-## Building and deploying
-
-### 1. Build locally
-```bash
-docker build -t safelens-deimv2-worker:latest .
-```
-
-### 2. Test locally (CPU, no GPU required)
-```bash
-docker run --rm -e DEIMV2_DEVICE=cpu -e DEIMV2_MODEL_ID=Intellindust-AI-Lab/DEIMv2-N \
-  safelens-deimv2-worker:latest python scripts/smoke_test.py
-```
-
-### 3. Push to Docker Hub
-```bash
-docker tag safelens-deimv2-worker:latest <your-dockerhub>/safelens-deimv2-worker:latest
-docker push <your-dockerhub>/safelens-deimv2-worker:latest
-```
-
-### 4. Deploy to RunPod Serverless
-1. Go to [RunPod Serverless](https://www.runpod.io/console/serverless)
-2. Create a new endpoint → "Custom" → paste your Docker image URL
-3. Set environment variables (see table above)
-4. Set a GPU tier (RTX 3090 or A4000 recommended for DEIMv2-S)
-5. Mount a network volume at `/runpod-volume` to cache model weights
-
----
-
-## Model weights
-
-> **Model weights are never committed to this repo.**
-
-- Weights are downloaded automatically from HuggingFace hub on first run
-- They are cached in `HF_HOME` (`/runpod-volume/.cache/huggingface` by default)
-- Mount a RunPod network volume at `/runpod-volume` to persist the cache across restarts
-- The `--dry-run` smoke test and unit tests work without model weights
-
----
-
-## Sprint 4A notes (dry-run)
-
-- DEIMv2 returns entities (normalised boxes + labels) only
-- Eagle Vision 2 displays entities in **dev/debug mode only**
-- No DEIMv2 safety alerts are emitted in Sprint 4A
-- MediaPipe Pose continues to handle `unsafe_lift`, `person_proximity`, `restricted_zone`
-- DEIMv2 will drive `ppe_missing`, `forklift_proximity`, `blocked_exit` in Sprint 4B+
-
----
-
-## Security
-
-- **Never expose your RunPod API key in the browser frontend**
-- The frontend calls a Supabase Edge Function which holds the key as a secret
-- See `supabase/functions/deimv2-proxy/` in the Eagle Vision 2 repo for the proxy
-
-
----
-
-## Docker image (GHCR)
-
-The pre-built Docker image is published automatically to **GitHub Container Registry** on every push to `main`.
-
-| Tag | When produced |
-|---|---|
-| `ghcr.io/gabe3laka/safelens-deimv2-worker:latest` | Every push to `main` |
-| `ghcr.io/gabe3laka/safelens-deimv2-worker:<short-sha>` | Every push to `main` |
-
-> **Model weights are not baked into the image.**  
-> They are downloaded from HuggingFace at RunPod cold-start and cached in `/runpod-volume/.cache/huggingface`.
-
----
-
-## CI/CD — GitHub Actions workflow
-
-Workflow file: `.github/workflows/docker-publish.yml`
-
-**Triggers:**
-- Push to `main` — automatic
-- Manual — go to **Actions → Build and push Docker image to GHCR → Run workflow**
-
-**What it does:**
-1. Checks out the repo
-2. Logs in to GHCR with the built-in `GITHUB_TOKEN` (no secrets to configure)
-3. Builds the Docker image from the repo's `Dockerfile`
-4. Pushes `latest` + `<short-sha>` tags to `ghcr.io/gabe3laka/safelens-deimv2-worker`
-
-**Permissions used** (set in the workflow file):
-```yaml
-permissions:
-  contents: read
-  packages: write
-```
-
-**No model weights are downloaded during the build.** The `Dockerfile` sets `HF_HOME=/runpod-volume/.cache/huggingface` but does not pre-download weights — they are pulled at RunPod cold-start.
-
----
-
-## Using the GHCR image in RunPod
-
-1. Trigger (or wait for) a successful workflow run via **Actions → Build and push Docker image to GHCR**.
-2. Copy the image URL:
-   ```
-   ghcr.io/gabe3laka/safelens-deimv2-worker:latest
-   ```
-3. In RunPod Serverless, create or edit your endpoint:
-   - **Container image** → paste the URL above
-   - **GPU** → RTX 3090 / A4000 recommended
-   - **Network volume** → mount at `/runpod-volume` to cache model weights between cold-starts
-   - **Environment variables** → see table above (all have sensible defaults)
-4. Deploy. On first cold-start the worker will pull the DEIMv2 weights from HuggingFace into `/runpod-volume/.cache/huggingface` and then serve inference requests.
-
-> **Tip:** pin a specific commit tag (e.g. `ghcr.io/gabe3laka/safelens-deimv2-worker:a1b2c3d`) in production so a bad push can't silently change your running endpoint.
