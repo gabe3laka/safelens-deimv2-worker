@@ -1,0 +1,69 @@
+# .github/workflows/docker-publish.yml
+# Builds the DEIMv2 worker image and pushes it to GitHub Container Registry (GHCR).
+# Model weights are NOT downloaded during the build - they are fetched at RunPod cold-start.
+
+name: Build and push Docker image to GHCR
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: Build and push
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout source ──────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Docker Buildx (enables layer caching + multi-platform) ───
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 3. Log in to GHCR using the built-in GITHUB_TOKEN ─────────────────
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 4. Extract metadata (tags + labels) ───────────────────────────────
+      # Produces:
+      #   ghcr.io/gabe3laka/safelens-deimv2-worker:latest
+      #   ghcr.io/gabe3laka/safelens-deimv2-worker:<short-sha>
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{is_default_branch}}
+            type=sha,prefix=,format=short
+
+      # ── 5. Build and push ──────────────────────────────────────────────────
+      # NOTE: No model weights are downloaded here.
+      # HF_HOME is set to /runpod-volume inside the container (see Dockerfile).
+      # Weights are fetched at RunPod cold-start and cached in the network volume.
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions cache speeds up repeat builds
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
