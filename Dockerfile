@@ -29,20 +29,33 @@ RUN git clone --depth 1 --branch ${DEIMV2_BRANCH} ${DEIMV2_REPO_URL} /opt/DEIMv2
 WORKDIR /opt/DEIMv2
 RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
 
-# Copy worker code
+# Re-apply SafeLens pinned runtime deps AFTER upstream DEIMv2 deps.
+# DEIMv2's requirements.txt may downgrade/overwrite transformers and friends,
+# which is what caused the AutoImageProcessor ModuleNotFoundError at warmup.
+# This force-reinstall layer guarantees the final, compatible versions win.
 WORKDIR /app
-COPY handler.py    /app/handler.py
+RUN pip install --no-cache-dir --upgrade \
+    "transformers>=4.46.0,<4.50.0" \
+    "huggingface-hub>=0.26.0" \
+    "safetensors>=0.4.5" \
+    "tokenizers>=0.20.0" \
+    "accelerate>=1.0.0" \
+    "timm>=1.0.11" \
+    "opencv-python-headless>=4.10.0.84"
+
+# Copy worker code
+COPY handler.py /app/handler.py
 COPY deimv2_infer.py /app/deimv2_infer.py
-COPY schema.py     /app/schema.py
-COPY server.py     /app/server.py
-COPY bootstrap.py  /app/bootstrap.py
+COPY schema.py /app/schema.py
+COPY server.py /app/server.py
+COPY bootstrap.py /app/bootstrap.py
 
 # DEIMv2 source on PYTHONPATH so its modules are importable
 ENV PYTHONPATH="/opt/DEIMv2:/app:${PYTHONPATH}"
 
 # ------- RunPod HTTP endpoint configuration ----------------------------------
 
-# Port the uvicorn server listens on.  RunPod load-balancer forwards traffic here.
+# Port the uvicorn server listens on. RunPod load-balancer forwards traffic here.
 ENV PORT="8000"
 
 # Uvicorn log level
@@ -68,10 +81,10 @@ ENV STARTUP_LOG="/tmp/safelens_startup.log"
 ENV DEIMV2_DEVICE="cuda"
 
 # HuggingFace model id. Override to switch model size:
-#   Intellindust-AI-Lab/DEIMv2-S  (9.7M params, 50.9 AP, default)
-#   Intellindust-AI-Lab/DEIMv2-N  (3.6M params, 43.0 AP, ultra-light)
-#   Intellindust-AI-Lab/DEIMv2-M  (18.1M params, 53.0 AP)
-#   Intellindust-AI-Lab/DEIMv2-L  (32.2M params, 56.0 AP)
+#   Intellindust-AI-Lab/DEIMv2-S (9.7M params, 50.9 AP, default)
+#   Intellindust-AI-Lab/DEIMv2-N (3.6M params, 43.0 AP, ultra-light)
+#   Intellindust-AI-Lab/DEIMv2-M (18.1M params, 53.0 AP)
+#   Intellindust-AI-Lab/DEIMv2-L (32.2M params, 56.0 AP)
 ENV DEIMV2_MODEL_ID="Intellindust-AI-Lab/DEIMv2-S"
 
 # Confidence threshold (0..1). Lower = more detections.
@@ -86,5 +99,5 @@ ENV HF_HOME="/runpod-volume/.cache/huggingface"
 EXPOSE ${PORT}
 
 # bootstrap.py: starts server.py; falls back to minimal health-only server
-#               if server.py fails to import (prevents silent container death).
+# if server.py fails to import (prevents silent container death).
 CMD ["python", "-u", "/app/bootstrap.py"]
