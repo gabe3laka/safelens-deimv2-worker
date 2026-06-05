@@ -1,5 +1,9 @@
-# RunPod serverless SDK
+# RunPod serverless SDK (kept for backward compatibility with handler.py)
 runpod>=1.7.0
+
+# FastAPI live-server (live-server mode -- server.py / bootstrap.py)
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
 
 # Image decoding
 Pillow>=10.0.0
