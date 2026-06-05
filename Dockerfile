@@ -20,7 +20,9 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Clone DEIMv2 source (architecture modules needed on PYTHONPATH)
+# Clone DEIMv2 source (architecture modules needed on PYTHONPATH).
+# The official DEIMv2 model is loaded via the engine.* package from this clone
+# (PyTorchModelHubMixin custom class), NOT via transformers Auto classes.
 ARG DEIMV2_REPO_URL=https://github.com/Intellindust-AI-Lab/DEIMv2.git
 ARG DEIMV2_BRANCH=main
 RUN git clone --depth 1 --branch ${DEIMV2_BRANCH} ${DEIMV2_REPO_URL} /opt/DEIMv2
@@ -30,8 +32,7 @@ WORKDIR /opt/DEIMv2
 RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
 
 # Re-apply SafeLens pinned runtime deps AFTER upstream DEIMv2 deps.
-# DEIMv2's requirements.txt may downgrade/overwrite transformers and friends,
-# which is what caused the AutoImageProcessor ModuleNotFoundError at warmup.
+# DEIMv2's requirements.txt may downgrade/overwrite transformers and friends.
 # This force-reinstall layer guarantees the final, compatible versions win.
 WORKDIR /app
 RUN pip install --no-cache-dir --upgrade \
@@ -46,11 +47,12 @@ RUN pip install --no-cache-dir --upgrade \
 # Copy worker code
 COPY handler.py /app/handler.py
 COPY deimv2_infer.py /app/deimv2_infer.py
+COPY official_deimv2_loader.py /app/official_deimv2_loader.py
 COPY schema.py /app/schema.py
 COPY server.py /app/server.py
 COPY bootstrap.py /app/bootstrap.py
 
-# DEIMv2 source on PYTHONPATH so its modules are importable
+# DEIMv2 source on PYTHONPATH so its engine.* modules are importable
 ENV PYTHONPATH="/opt/DEIMv2:/app:${PYTHONPATH}"
 
 # ------- RunPod HTTP endpoint configuration ----------------------------------
@@ -62,11 +64,9 @@ ENV PORT="8000"
 ENV UVICORN_LOG_LEVEL="info"
 
 # Set to "true" to skip model load on startup (diagnostic / smoke-test mode).
-# /health and /debug/startup still return 200.
 ENV SKIP_WARMUP="false"
 
 # Set to "true" to start model load immediately on container start.
-# Set to "false" to defer until POST /warmup is called.
 ENV AUTO_WARMUP="true"
 
 # Warmup timeout in seconds before giving up and setting status=error.
@@ -80,17 +80,22 @@ ENV STARTUP_LOG="/tmp/safelens_startup.log"
 # Device: "cuda" (default on RunPod GPU workers) or "cpu"
 ENV DEIMV2_DEVICE="cuda"
 
-# HuggingFace model id. Override to switch model size:
-#   Intellindust-AI-Lab/DEIMv2-S (9.7M params, 50.9 AP, default)
-#   Intellindust-AI-Lab/DEIMv2-N (3.6M params, 43.0 AP, ultra-light)
-#   Intellindust-AI-Lab/DEIMv2-M (18.1M params, 53.0 AP)
-#   Intellindust-AI-Lab/DEIMv2-L (32.2M params, 56.0 AP)
-ENV DEIMV2_MODEL_ID="Intellindust-AI-Lab/DEIMv2-S"
+# Detection backend:
+#   official-deimv2-hf      -> official DEIMv2 PyTorchModelHubMixin loader (default)
+#   transformers-fallback   -> facebook/detr-resnet-50 (pipeline validation only,
+#                              clearly labelled FALLBACK, NOT DEIMv2)
+ENV DEIMV2_BACKEND="official-deimv2-hf"
+
+# Official DEIMv2-S HuggingFace model id (DINOv3 ViT-Tiny backbone, COCO).
+# Override to switch model size, e.g.:
+#   Intellindust/DEIMv2_DINOv3_S_COCO  (9.7M params, 50.9 AP, default)
+#   Intellindust/DEIMv2_DINOv3_M_COCO  (18.1M params, 53.0 AP)
+ENV DEIMV2_MODEL_ID="Intellindust/DEIMv2_DINOv3_S_COCO"
 
 # Confidence threshold (0..1). Lower = more detections.
 ENV DEIMV2_CONF="0.35"
 
-# Shorter-side resize resolution before inference.
+# Square resize resolution before inference (DEIMv2-S eval size = 640).
 ENV DEIMV2_IMG_SIZE="640"
 
 # HuggingFace cache -- mount a RunPod volume here to persist weights.
