@@ -1,6 +1,6 @@
 # safelens-deimv2-worker
 
-SafeLens DEIMv2 detection worker for RunPod — live HTTP server mode.
+SafeLens DEIMv2 detection worker for RunPod -- live HTTP server mode.
 
 ## Architecture
 
@@ -20,9 +20,31 @@ The live-server architecture solves this by:
 1. Starting the HTTP server **immediately** before any model is loaded.
 2. Returning 200 from `/health` and `/ping` at all times (no model dependency).
 3. Loading the DEIMv2 model in a **background thread** so the server stays responsive.
-4. Using `bootstrap.py` as a failsafe launcher — if `server.py` crashes during
+4. Using `bootstrap.py` as a failsafe launcher -- if `server.py` crashes during
    import, a minimal fallback FastAPI app is started on the same port so RunPod's
    health probe can still surface the real error.
+
+## Model loading (official DEIMv2, not transformers Auto classes)
+
+DEIMv2 is **not** a standard Transformers `AutoImageProcessor` /
+`AutoModelForObjectDetection` model. The official checkpoints
+(e.g. `Intellindust/DEIMv2_DINOv3_S_COCO`) are pushed to the Hub via
+`huggingface_hub.PyTorchModelHubMixin` and contain only `config.json` +
+`model.safetensors` -- there is **no** `preprocessor_config.json` and no custom
+HF modeling code on the Hub.
+
+The architecture lives in the upstream GitHub repo
+([Intellindust-AI-Lab/DEIMv2](https://github.com/Intellindust-AI-Lab/DEIMv2)),
+cloned into `/opt/DEIMv2` and placed on `PYTHONPATH` by the Dockerfile. The
+worker loads the model with the official custom class:
+
+```python
+from official_deimv2_loader import load_official_deimv2
+model, device, cls = load_official_deimv2("Intellindust/DEIMv2_DINOv3_S_COCO")
+```
+
+See `official_deimv2_loader.py` for the loader, preprocessing
+(`Resize((640, 640))` + `ToTensor()`), and postprocessing (normalized boxes).
 
 ## Routes
 
@@ -30,23 +52,10 @@ The live-server architecture solves this by:
 |--------|------|-------|
 | GET | `/health` | Returns immediately, **no model required** |
 | GET | `/ping` | Alias for `/health` |
-| GET | `/debug/startup` | Env info, disk, startup log. Add `?deep=true` for torch/CUDA details |
+| GET | `/debug/startup` | Env info, disk, startup log. Add `?deep=true` for torch/CUDA + import diagnostics |
+| POST | `/debug/model-load` | Attempt model load only (official loader). Returns structured `ok`/`backend`/`model_class` or traceback |
 | POST | `/warmup` | Trigger background model load. Add `?wait=true` to block until ready |
 | POST | `/detect` | Run DEIMv2 inference. Returns 503 if model is not ready yet |
-
-### `/health` response (model not yet loaded)
-
-```json
-{
-  "ok": true,
-  "worker": "safelens-deimv2-worker",
-  "mode": "live-server",
-  "version": "0.2.0-live-server",
-  "status": "cold",
-  "model_loaded": false,
-  "error": null
-}
-```
 
 ### `/detect` request
 
@@ -87,19 +96,38 @@ Configure RunPod to probe `GET /health` (or `GET /ping`).
 | `AUTO_WARMUP` | `true` | Start model load immediately on container start |
 | `SKIP_WARMUP` | `false` | Skip model load entirely (diagnostic mode) |
 | `WARMUP_TIMEOUT_S` | `600` | Seconds before warmup is marked failed |
-| `DEIMV2_MODEL_ID` | `Intellindust-AI-Lab/DEIMv2-S` | HuggingFace model ID |
+| `DEIMV2_BACKEND` | `official-deimv2-hf` | `official-deimv2-hf` (default) or `transformers-fallback` (DETR, pipeline validation only) |
+| `DEIMV2_MODEL_ID` | `Intellindust/DEIMv2_DINOv3_S_COCO` | Official DEIMv2-S HuggingFace model ID |
 | `DEIMV2_DEVICE` | `cuda` | Inference device (`cuda` or `cpu`) |
 | `DEIMV2_CONF` | `0.35` | Default confidence threshold |
-| `DEIMV2_IMG_SIZE` | `640` | Shorter-side resize before inference |
+| `DEIMV2_IMG_SIZE` | `640` | Square resize before inference (DEIMv2-S eval size) |
 | `HF_HOME` | `/runpod-volume/.cache/huggingface` | HuggingFace cache (mount volume here) |
+| `HF_TOKEN` | _(unset)_ | Optional; only for private/gated mirrors. Never logged or exposed. |
+
+### RunPod env block (copy/paste)
+
+```
+PORT=8000
+PORT_HEALTH=8000
+SKIP_WARMUP=true
+AUTO_WARMUP=false
+DEIMV2_DEVICE=cuda
+DEIMV2_BACKEND=official-deimv2-hf
+DEIMV2_MODEL_ID=Intellindust/DEIMv2_DINOv3_S_COCO
+DEIMV2_CONF=0.35
+DEIMV2_IMG_SIZE=640
+HF_HOME=/runpod-volume/.cache/huggingface
+TRANSFORMERS_CACHE=/runpod-volume/.cache/huggingface
+```
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `server.py` | FastAPI app — all routes, warmup logic, state |
-| `bootstrap.py` | Failsafe launcher — starts server.py, falls back to minimal app on error |
-| `deimv2_infer.py` | DEIMv2 model loading and inference |
+| `server.py` | FastAPI app -- all routes, warmup logic, state |
+| `bootstrap.py` | Failsafe launcher -- starts server.py, falls back to minimal app on error |
+| `deimv2_infer.py` | Backend dispatch + inference (official DEIMv2 / transformers fallback) |
+| `official_deimv2_loader.py` | Official DEIMv2 PyTorchModelHubMixin loader + pre/post-processing |
 | `handler.py` | Legacy RunPod serverless handler (kept for reference) |
 | `schema.py` | Pydantic request/response models |
 
