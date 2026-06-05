@@ -220,3 +220,61 @@ docker push <your-dockerhub>/safelens-deimv2-worker:latest
 - **Never expose your RunPod API key in the browser frontend**
 - The frontend calls a Supabase Edge Function which holds the key as a secret
 - See `supabase/functions/deimv2-proxy/` in the Eagle Vision 2 repo for the proxy
+
+
+---
+
+## Docker image (GHCR)
+
+The pre-built Docker image is published automatically to **GitHub Container Registry** on every push to `main`.
+
+| Tag | When produced |
+|---|---|
+| `ghcr.io/gabe3laka/safelens-deimv2-worker:latest` | Every push to `main` |
+| `ghcr.io/gabe3laka/safelens-deimv2-worker:<short-sha>` | Every push to `main` |
+
+> **Model weights are not baked into the image.**  
+> They are downloaded from HuggingFace at RunPod cold-start and cached in `/runpod-volume/.cache/huggingface`.
+
+---
+
+## CI/CD — GitHub Actions workflow
+
+Workflow file: `.github/workflows/docker-publish.yml`
+
+**Triggers:**
+- Push to `main` — automatic
+- Manual — go to **Actions → Build and push Docker image to GHCR → Run workflow**
+
+**What it does:**
+1. Checks out the repo
+2. Logs in to GHCR with the built-in `GITHUB_TOKEN` (no secrets to configure)
+3. Builds the Docker image from the repo's `Dockerfile`
+4. Pushes `latest` + `<short-sha>` tags to `ghcr.io/gabe3laka/safelens-deimv2-worker`
+
+**Permissions used** (set in the workflow file):
+```yaml
+permissions:
+  contents: read
+  packages: write
+```
+
+**No model weights are downloaded during the build.** The `Dockerfile` sets `HF_HOME=/runpod-volume/.cache/huggingface` but does not pre-download weights — they are pulled at RunPod cold-start.
+
+---
+
+## Using the GHCR image in RunPod
+
+1. Trigger (or wait for) a successful workflow run via **Actions → Build and push Docker image to GHCR**.
+2. Copy the image URL:
+   ```
+   ghcr.io/gabe3laka/safelens-deimv2-worker:latest
+   ```
+3. In RunPod Serverless, create or edit your endpoint:
+   - **Container image** → paste the URL above
+   - **GPU** → RTX 3090 / A4000 recommended
+   - **Network volume** → mount at `/runpod-volume` to cache model weights between cold-starts
+   - **Environment variables** → see table above (all have sensible defaults)
+4. Deploy. On first cold-start the worker will pull the DEIMv2 weights from HuggingFace into `/runpod-volume/.cache/huggingface` and then serve inference requests.
+
+> **Tip:** pin a specific commit tag (e.g. `ghcr.io/gabe3laka/safelens-deimv2-worker:a1b2c3d`) in production so a bad push can't silently change your running endpoint.
