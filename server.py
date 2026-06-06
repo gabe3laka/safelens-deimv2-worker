@@ -1,17 +1,21 @@
 """
-server.py -- FastAPI/uvicorn live-server for the SafeLens DEIMv2 worker.
+server.py -- FastAPI/uvicorn live-server for the SafeLens vision worker.
 
 Architecture: long-running HTTP server (RunPod load-balancing endpoint mode).
 Pattern: adapted from Kingo333/fluxrt-serverless.
 
+Backends (selected via VISION_BACKEND):
+  edgecrafter (default) -> EdgeCrafter ECDet-S boxes + optional ECPose-S poses
+  deimv2     (fallback) -> legacy DEIMv2 boxes only
+
 Routes
 ------
-GET  /health            -- returns immediately, no model required
-GET  /ping              -- alias for /health
-GET  /debug/startup     -- environment + torch diagnostics (?deep=true for imports)
-POST /debug/model-load  -- attempt model load only, return structured result
-POST /detect            -- run DEIMv2 inference (503 if model not ready)
-POST /warmup            -- trigger background model load
+GET  /health           -- returns immediately, no model required
+GET  /ping             -- alias for /health
+GET  /debug/startup    -- environment + torch diagnostics (?deep=true for imports)
+POST /debug/model-load -- attempt model load only, return structured result
+POST /warmup           -- trigger background model load
+POST /detect           -- run inference (503 if model not ready)
 """
 
 import asyncio
@@ -33,37 +37,38 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-log = logging.getLogger("safelens-deimv2-worker")
+log = logging.getLogger("safelens-vision-worker")
 
 # -- Config -------------------------------------------------------------------
 
 PORT = int(os.getenv("PORT", "8000"))
-WORKER_VERSION = "0.3.0-live-server"
-DEFAULT_MODEL_ID = "Intellindust/DEIMv2_DINOv3_S_COCO"
+WORKER_VERSION = "0.4.0-edgecrafter"
 SKIP_WARMUP = os.getenv("SKIP_WARMUP", "false").strip().lower() in ("1", "true", "yes", "on")
 AUTO_WARMUP = os.getenv("AUTO_WARMUP", "true").strip().lower() in ("1", "true", "yes", "on")
 WARMUP_TIMEOUT_S = int(os.getenv("WARMUP_TIMEOUT_S", "600"))
 STARTUP_LOG_PATH = Path(os.getenv("STARTUP_LOG", "/tmp/safelens_startup.log"))
 
+
+def _active_backend():
+    return os.getenv("VISION_BACKEND", "edgecrafter").strip().lower()
+
+
 # -- State --------------------------------------------------------------------
 
 _STATE_LOCK = threading.RLock()
-_STATE: Dict[str, Any] = {
+_STATE = {
     "status": "cold",
     "error": None,
     "error_traceback": None,
-    "model": None,
-    "processor": None,
-    "device": None,
-    "warmup_started_at": None,
+    "summary": None,
     "ready_at": None,
+    "warmup_started_at": None,
 }
 _BOOT_TS = time.time()
 
-# -- Startup log helper -------------------------------------------------------
 
-def _log_startup(msg: str) -> None:
-    line = f"[{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] {msg}"
+def _log_startup(msg):
+    line = "[" + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "] " + msg
     print(line, flush=True)
     try:
         STARTUP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -72,13 +77,13 @@ def _log_startup(msg: str) -> None:
     except Exception:
         pass
 
-# -- Public state helper ------------------------------------------------------
 
-def _public_state() -> Dict[str, Any]:
+def _public_state():
     with _STATE_LOCK:
         return {
             "status": _STATE["status"],
-            "model_loaded": _STATE["model"] is not None,
+            "model_loaded": _STATE["status"] == "ready",
+            "backend": _active_backend(),
             "error": _STATE["error"],
             "error_traceback": _STATE["error_traceback"],
             "warmup_started_at": _STATE["warmup_started_at"],
@@ -86,9 +91,10 @@ def _public_state() -> Dict[str, Any]:
             "uptime_seconds": round(time.time() - _BOOT_TS, 2),
         }
 
+
 # -- Model warmup (background thread) -----------------------------------------
 
-def _warmup_blocking() -> None:
+def _warmup_blocking():
     with _STATE_LOCK:
         if _STATE["status"] in ("loading", "ready"):
             return
@@ -97,40 +103,40 @@ def _warmup_blocking() -> None:
         _STATE["error_traceback"] = None
         _STATE["warmup_started_at"] = time.time()
 
-    _log_startup("warmup: starting DEIMv2 model load")
+    _log_startup("warmup: starting model load (backend=" + _active_backend() + ")")
     try:
-        from deimv2_infer import get_model
-        model, processor, device = get_model()
+        from vision_backend import load_models
+        summary = load_models()
         with _STATE_LOCK:
-            _STATE["model"] = model
-            _STATE["processor"] = processor
-            _STATE["device"] = device
+            _STATE["summary"] = summary
             _STATE["status"] = "ready"
             _STATE["ready_at"] = time.time()
-        _log_startup(f"warmup: ready -- model on {device}")
+        _log_startup("warmup: ready -- " + str(summary))
     except Exception as exc:
-        err_msg = f"{type(exc).__name__}: {exc}"
+        err_msg = type(exc).__name__ + ": " + str(exc)
         tb = traceback.format_exc()
-        _log_startup(f"warmup: FAILED -- {err_msg}")
+        _log_startup("warmup: FAILED -- " + err_msg)
         _log_startup(tb)
         with _STATE_LOCK:
             _STATE["status"] = "error"
             _STATE["error"] = err_msg
             _STATE["error_traceback"] = tb
 
-def _start_warmup_background() -> None:
+
+def _start_warmup_background():
     with _STATE_LOCK:
         if _STATE["status"] in ("loading", "ready"):
             return
-    t = threading.Thread(target=_warmup_blocking, name="deimv2-warmup", daemon=True)
+    t = threading.Thread(target=_warmup_blocking, name="vision-warmup", daemon=True)
     t.start()
+
 
 # -- FastAPI lifespan ---------------------------------------------------------
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    _log_startup(f"server starting -- port={PORT} version={WORKER_VERSION}")
-    _log_startup(f"skip_warmup={SKIP_WARMUP} auto_warmup={AUTO_WARMUP}")
+async def lifespan(app):
+    _log_startup("server starting -- port=" + str(PORT) + " version=" + WORKER_VERSION + " backend=" + _active_backend())
+    _log_startup("skip_warmup=" + str(SKIP_WARMUP) + " auto_warmup=" + str(AUTO_WARMUP))
     if SKIP_WARMUP:
         _log_startup("SKIP_WARMUP=true: skipping model load (diagnostic mode)")
     elif AUTO_WARMUP:
@@ -141,43 +147,39 @@ async def lifespan(app: FastAPI):
     yield
     _log_startup("server shutting down")
 
-app = FastAPI(title="safelens-deimv2-worker", version=WORKER_VERSION, lifespan=lifespan)
+
+app = FastAPI(title="safelens-vision-worker", version=WORKER_VERSION, lifespan=lifespan)
+
 
 # -- Health / ping (no model dependency) -------------------------------------
 
 @app.get("/health")
 async def health():
-    """Returns immediately without loading DEIMv2."""
     return JSONResponse({
-        "ok": True,
-        "worker": "safelens-deimv2-worker",
-        "mode": "live-server",
-        "version": WORKER_VERSION,
-        **_public_state(),
+        "ok": True, "worker": "safelens-vision-worker",
+        "mode": "live-server", "version": WORKER_VERSION, **_public_state(),
     })
+
 
 @app.get("/ping")
 async def ping():
-    """Alias for /health."""
     return JSONResponse({
-        "ok": True,
-        "worker": "safelens-deimv2-worker",
-        "mode": "live-server",
-        "version": WORKER_VERSION,
-        **_public_state(),
+        "ok": True, "worker": "safelens-vision-worker",
+        "mode": "live-server", "version": WORKER_VERSION, **_public_state(),
     })
 
-# -- Import diagnostics helper (no secrets) -----------------------------------
 
-def _safe_version(module_name: str) -> Optional[str]:
+# -- Import diagnostics helper ------------------------------------------------
+
+def _safe_version(module_name):
     try:
         mod = __import__(module_name)
         return getattr(mod, "__version__", "unknown")
     except Exception as exc:
-        return f"ERROR: {type(exc).__name__}: {exc}"
+        return "ERROR: " + type(exc).__name__ + ": " + str(exc)
 
-def _import_check(callable_test) -> Dict[str, Any]:
-    """Run a single import test and return ok / structured error (no secrets)."""
+
+def _import_check(callable_test):
     try:
         callable_test()
         return {"status": "ok"}
@@ -189,14 +191,72 @@ def _import_check(callable_test) -> Dict[str, Any]:
             "traceback": traceback.format_exc()[-3000:],
         }
 
-def _collect_import_diagnostics() -> Dict[str, Any]:
-    """Deep import diagnostics. Never exposes secret values, only env names."""
-    versions: Dict[str, Any] = {}
-    for name in ("transformers", "huggingface_hub", "torch", "torchvision", "PIL",
-                 "timm", "safetensors", "tokenizers", "accelerate", "numpy"):
+
+def _checkpoint_info():
+    """Existence + file size for the EdgeCrafter checkpoints (no secrets)."""
+    out = {}
+    for key, env in (("det", "EDGECRAFTER_DET_CHECKPOINT_PATH"),
+                     ("pose", "EDGECRAFTER_POSE_CHECKPOINT_PATH")):
+        path = os.getenv(env, "")
+        info = {"path": path, "exists": False, "size_bytes": 0}
+        try:
+            p = Path(path)
+            if path and p.exists():
+                info["exists"] = True
+                info["size_bytes"] = p.stat().st_size
+        except Exception as exc:
+            info["error"] = type(exc).__name__ + ": " + str(exc)
+        out[key] = info
+    return out
+
+
+def _collect_edgecrafter_diagnostics():
+    def _imp_torchvision():
+        import torchvision  # noqa: F401
+    def _imp_loader():
+        import edgecrafter_loader  # noqa: F401
+    def _imp_det_engine():
+        import edgecrafter_loader as ec
+        ec._purge_engine_modules()
+        ec._add_subtree_to_path("ecdetseg")
+        from engine.core import YAMLConfig  # noqa: F401
+    def _imp_pose_engine():
+        import edgecrafter_loader as ec
+        ec._purge_engine_modules()
+        ec._add_subtree_to_path("ecpose")
+        from engine.core import YAMLConfig  # noqa: F401
+
+    imports = {
+        "torchvision": _import_check(_imp_torchvision),
+        "edgecrafter_loader": _import_check(_imp_loader),
+        "ecdetseg.engine.core": _import_check(_imp_det_engine),
+        "ecpose.engine.core": _import_check(_imp_pose_engine),
+    }
+
+    tasks = []
+    try:
+        import edgecrafter_loader as ec
+        tasks = ec.parse_tasks()
+    except Exception:
+        pass
+
+    return {
+        "vision_backend": _active_backend(),
+        "edgecrafter_tasks": tasks,
+        "edgecrafter_tasks_env": os.getenv("EDGECRAFTER_TASKS", ""),
+        "imports": {k: v.get("status") for k, v in imports.items()},
+        "imports_detail": imports,
+        "checkpoints": _checkpoint_info(),
+    }
+
+
+def _collect_import_diagnostics():
+    versions = {}
+    for name in ("torch", "torchvision", "PIL", "numpy", "transformers",
+                 "huggingface_hub", "yaml", "cv2"):
         versions[name] = _safe_version(name)
 
-    cuda: Dict[str, Any] = {}
+    cuda = {}
     try:
         import torch
         cuda["available"] = bool(torch.cuda.is_available())
@@ -204,87 +264,28 @@ def _collect_import_diagnostics() -> Dict[str, Any]:
         if torch.cuda.is_available():
             cuda["gpu_name"] = torch.cuda.get_device_name(0)
     except Exception as exc:
-        cuda["error"] = f"{type(exc).__name__}: {exc}"
-
-    # Dependency imports DEIMv2 needs (timm/safetensors/torchvision are required).
-    def _imp_timm():
-        import timm  # noqa: F401
-    def _imp_safetensors():
-        import safetensors  # noqa: F401
-    def _imp_torchvision():
-        import torchvision  # noqa: F401
-    def _imp_hub_mixin():
-        from huggingface_hub import PyTorchModelHubMixin  # noqa: F401
-
-    # Official DEIMv2 engine imports (from /opt/DEIMv2 on PYTHONPATH).
-    def _imp_engine_backbone():
-        from engine.backbone import HGNetv2, DINOv3STAs  # noqa: F401
-    def _imp_engine_deim():
-        from engine.deim import HybridEncoder, DEIMTransformer  # noqa: F401
-    def _imp_engine_postproc():
-        from engine.deim.postprocessor import PostProcessor  # noqa: F401
-    def _imp_official_loader():
-        import official_deimv2_loader  # noqa: F401
-
-    # AutoImageProcessor is OPTIONAL now -- only used by the transformers-fallback
-    # backend, NOT by the official DEIMv2 loader.
-    def _imp_auto_image_processor():
-        from transformers import AutoImageProcessor  # noqa: F401
-    def _imp_auto_model_obj_det():
-        from transformers import AutoModelForObjectDetection  # noqa: F401
-
-    required = {
-        "timm": _import_check(_imp_timm),
-        "safetensors": _import_check(_imp_safetensors),
-        "torchvision": _import_check(_imp_torchvision),
-        "PyTorchModelHubMixin": _import_check(_imp_hub_mixin),
-    }
-    deimv2_official = {
-        "engine.backbone": _import_check(_imp_engine_backbone),
-        "engine.deim": _import_check(_imp_engine_deim),
-        "engine.deim.postprocessor": _import_check(_imp_engine_postproc),
-        "official_deimv2_loader": _import_check(_imp_official_loader),
-    }
-    optional = {
-        "AutoImageProcessor": _import_check(_imp_auto_image_processor),
-        "AutoModelForObjectDetection": _import_check(_imp_auto_model_obj_det),
-    }
-
-    def _summary(d):
-        return {k: ("ok" if v.get("status") == "ok" else "error") for k, v in d.items()}
-
-    imports_summary = {}
-    imports_summary.update(_summary(required))
-    imports_summary.update(_summary(deimv2_official))
-    imports_summary.update(_summary(optional))
+        cuda["error"] = type(exc).__name__ + ": " + str(exc)
 
     return {
         "versions": versions,
         "cuda": cuda,
-        "imports": imports_summary,
-        "imports_detail": {
-            "required": required,
-            "deimv2_official": deimv2_official,
-            "optional_transformers_auto": optional,
-        },
-        "notes": {
-            "AutoImageProcessor": "optional -- only used by transformers-fallback backend",
-            "deimv2_backend": os.environ.get("DEIMV2_BACKEND", "official-deimv2-hf"),
-        },
+        "edgecrafter": _collect_edgecrafter_diagnostics(),
     }
+
 
 # -- Debug / startup diagnostics ----------------------------------------------
 
 @app.get("/debug/startup")
 async def debug_startup(deep: bool = Query(False)):
-    """Environment info, disk usage, and optional deep import diagnostics."""
     total, used, free = shutil.disk_usage("/")
-    info: Dict[str, Any] = {
+    info = {
         "ok": True,
-        "worker": "safelens-deimv2-worker",
+        "worker": "safelens-vision-worker",
         "version": WORKER_VERSION,
         "mode": "live-server",
         "port": PORT,
+        "vision_backend": _active_backend(),
+        "edgecrafter_tasks": os.getenv("EDGECRAFTER_TASKS", ""),
         "cwd": os.getcwd(),
         "python_version": sys.version,
         "skip_warmup": SKIP_WARMUP,
@@ -318,78 +319,46 @@ async def debug_startup(deep: bool = Query(False)):
                 free_mem, _ = torch.cuda.mem_get_info(0)
                 info["torch"]["gpu_mem_free_gb"] = round(free_mem / 1e9, 2)
         except Exception as exc:
-            info["torch_error"] = f"{type(exc).__name__}: {exc}"
+            info["torch_error"] = type(exc).__name__ + ": " + str(exc)
         try:
             info["diagnostics"] = _collect_import_diagnostics()
         except Exception as exc:
-            info["diagnostics_error"] = f"{type(exc).__name__}: {exc}"
+            info["diagnostics_error"] = type(exc).__name__ + ": " + str(exc)
 
     return JSONResponse(info)
+
 
 # -- Model-load diagnostic route ----------------------------------------------
 
 @app.post("/debug/model-load")
 async def debug_model_load():
-    """
-    Attempt ONLY the model-loading part (no inference) using the OFFICIAL DEIMv2
-    loader (PyTorchModelHubMixin), or the transformers-fallback backend if
-    DEIMV2_BACKEND=transformers-fallback. Never crashes the worker; on failure
-    returns the full structured traceback.
-    """
-    model_id = os.environ.get("DEIMV2_MODEL_ID", DEFAULT_MODEL_ID)
-    backend = os.environ.get("DEIMV2_BACKEND", "official-deimv2-hf").strip().lower()
-    result: Dict[str, Any] = {
-        "ok": False,
-        "backend": "official-deimv2-hf" if backend != "transformers-fallback" else "transformers-fallback",
-        "model_id": model_id,
-        "device": None,
-        "transformers_version": None,
-    }
+    """Attempt ONLY model loading (no inference). Never crashes the worker."""
     try:
-        import transformers
-        result["transformers_version"] = transformers.__version__
-    except Exception as exc:
-        result["transformers_version"] = f"ERROR: {type(exc).__name__}: {exc}"
-
-    try:
-        import torch
-        device = "cuda" if (os.environ.get("DEIMV2_DEVICE", "cuda").lower() == "cuda"
-                            and torch.cuda.is_available()) else "cpu"
-        result["device"] = device
-    except Exception as exc:
-        result["device"] = f"ERROR: {type(exc).__name__}: {exc}"
-
-    try:
-        if backend == "transformers-fallback":
-            from deimv2_infer import _load_fallback
-            import deimv2_infer
-            deimv2_infer._model = None
-            _load_fallback()
-            result["ok"] = True
-            result["model_class"] = type(deimv2_infer._model).__name__
-            result["backend"] = "transformers-fallback"
-            deimv2_infer._model = None
+        from vision_backend import model_load_summary
+        result = model_load_summary()
+        if result.get("ok"):
+            with _STATE_LOCK:
+                _STATE["summary"] = result
+                if _STATE["status"] != "ready":
+                    _STATE["status"] = "ready"
+                    _STATE["ready_at"] = time.time()
         else:
-            from official_deimv2_loader import load_official_deimv2
-            model, dev, cls = load_official_deimv2(model_id=model_id)
-            result["ok"] = True
-            result["model_class"] = cls
-            result["backend"] = "official-deimv2-hf"
-            del model
+            _log_startup("debug/model-load FAILED: " + str(result.get("exception_type")) + ": " + str(result.get("exception_message")))
+        return JSONResponse(result)
     except Exception as exc:
-        result["ok"] = False
-        result["exception_type"] = type(exc).__name__
-        result["exception_message"] = str(exc)
-        result["traceback"] = traceback.format_exc()
-        _log_startup(f"debug/model-load FAILED: {type(exc).__name__}: {exc}")
+        return JSONResponse({
+            "ok": False,
+            "backend": _active_backend(),
+            "exception_type": type(exc).__name__,
+            "exception_message": str(exc),
+            "traceback": traceback.format_exc(),
+        })
 
-    return JSONResponse(result)
 
 # -- Warmup trigger -----------------------------------------------------------
 
 @app.post("/warmup")
 async def warmup(wait: bool = Query(False)):
-    """Trigger background model load. Use ?wait=true to block until ready."""
     _start_warmup_background()
     if wait:
         for _ in range(WARMUP_TIMEOUT_S):
@@ -399,22 +368,21 @@ async def warmup(wait: bool = Query(False)):
             await asyncio.sleep(1)
     return JSONResponse({"ok": True, "triggered": True, **_public_state()})
 
+
 # -- Detect endpoint ----------------------------------------------------------
 
 @app.post("/detect")
 async def detect(payload: Dict[str, Any]):
-    """
-    Run DEIMv2 object detection.
+    """Run inference for the active backend.
 
-    Request body:
-      {"image_b64": "<base64>", "conf": 0.35, "img_size": 640, "classes": null}
-
-    Returns 503 if the model is not ready yet.
+    Returns entities (boxes) and poses (keypoints/skeleton). On any failure,
+    returns a structured error with entities: [] and poses: [].
     """
     state = _public_state()
     if state["status"] != "ready":
         return JSONResponse(
-            {"error": "model_not_ready", "status": state["status"], "entities": []},
+            {"error": "model_not_ready", "status": state["status"],
+             "entities": [], "poses": [], "backend": _active_backend()},
             status_code=503,
         )
 
@@ -423,30 +391,36 @@ async def detect(payload: Dict[str, Any]):
 
     image_b64 = payload.get("image_b64")
     if not image_b64:
-        return JSONResponse({"error": "missing_image_b64", "entities": []}, status_code=400)
+        return JSONResponse(
+            {"error": "missing_image_b64", "entities": [], "poses": []},
+            status_code=400,
+        )
     try:
         _b64.b64decode(image_b64, validate=True)
     except (binascii.Error, ValueError):
-        return JSONResponse({"error": "invalid_base64", "entities": []}, status_code=400)
+        return JSONResponse(
+            {"error": "invalid_base64", "entities": [], "poses": []},
+            status_code=400,
+        )
 
     try:
-        from deimv2_infer import run_inference
-        conf = float(os.environ.get("DEIMV2_CONF", payload.get("conf", 0.35)))
-        img_size = int(os.environ.get("DEIMV2_IMG_SIZE", payload.get("img_size", 640)))
+        from vision_backend import run_inference
+        conf = float(os.getenv("EDGECRAFTER_CONF", payload.get("conf", 0.25)))
+        img_size = int(os.getenv("EDGECRAFTER_IMG_SIZE", payload.get("img_size", 640)))
         class_filter = payload.get("classes")
         resp = run_inference(
-            image_b64=image_b64,
-            conf_threshold=conf,
-            img_size=img_size,
-            class_filter=class_filter,
+            image_b64=image_b64, conf=conf,
+            img_size=img_size, class_filter=class_filter,
         )
         return JSONResponse(resp.model_dump())
     except Exception as exc:
         log.exception("detect failed: %s", exc)
         return JSONResponse(
-            {"error": f"inference_failed: {type(exc).__name__}: {exc}", "entities": []},
+            {"error": "inference_failed: " + type(exc).__name__ + ": " + str(exc),
+             "entities": [], "poses": [], "backend": _active_backend()},
             status_code=500,
         )
+
 
 # -- Entrypoint ---------------------------------------------------------------
 
