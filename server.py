@@ -5,17 +5,18 @@ Architecture: long-running HTTP server (RunPod load-balancing endpoint mode).
 Pattern: adapted from Kingo333/fluxrt-serverless.
 
 Backends (selected via VISION_BACKEND):
-  edgecrafter (default) -> EdgeCrafter ECDet-S boxes + optional ECPose-S poses
-  deimv2     (fallback) -> legacy DEIMv2 boxes only
+    edgecrafter (default) -> EdgeCrafter ECDet-S boxes + optional ECPose-S poses
+    deimv2      (fallback) -> legacy DEIMv2 boxes only
 
 Routes
 ------
-GET  /health           -- returns immediately, no model required
-GET  /ping             -- alias for /health
-GET  /debug/startup    -- environment + torch diagnostics (?deep=true for imports)
+GET  /health         -- returns immediately, no model required
+GET  /ping           -- alias for /health
+GET  /debug/startup  -- environment + torch diagnostics (?deep=true for imports)
 POST /debug/model-load -- attempt model load only, return structured result
-POST /warmup           -- trigger background model load
-POST /detect           -- run inference (503 if model not ready)
+POST /warmup         -- trigger background model load
+POST /detect         -- run inference (503 if model not ready)
+WS   /ws/echo        -- Phase 0 WebSocket connectivity probe (echoes JSON)
 """
 
 import asyncio
@@ -30,7 +31,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 logging.basicConfig(
@@ -48,10 +49,8 @@ AUTO_WARMUP = os.getenv("AUTO_WARMUP", "true").strip().lower() in ("1", "true", 
 WARMUP_TIMEOUT_S = int(os.getenv("WARMUP_TIMEOUT_S", "600"))
 STARTUP_LOG_PATH = Path(os.getenv("STARTUP_LOG", "/tmp/safelens_startup.log"))
 
-
 def _active_backend():
     return os.getenv("VISION_BACKEND", "edgecrafter").strip().lower()
-
 
 # -- State --------------------------------------------------------------------
 
@@ -66,7 +65,6 @@ _STATE = {
 }
 _BOOT_TS = time.time()
 
-
 def _log_startup(msg):
     line = "[" + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "] " + msg
     print(line, flush=True)
@@ -76,7 +74,6 @@ def _log_startup(msg):
             fh.write(line + "\n")
     except Exception:
         pass
-
 
 def _public_state():
     with _STATE_LOCK:
@@ -90,7 +87,6 @@ def _public_state():
             "ready_at": _STATE["ready_at"],
             "uptime_seconds": round(time.time() - _BOOT_TS, 2),
         }
-
 
 # -- Model warmup (background thread) -----------------------------------------
 
@@ -122,14 +118,12 @@ def _warmup_blocking():
             _STATE["error"] = err_msg
             _STATE["error_traceback"] = tb
 
-
 def _start_warmup_background():
     with _STATE_LOCK:
         if _STATE["status"] in ("loading", "ready"):
             return
     t = threading.Thread(target=_warmup_blocking, name="vision-warmup", daemon=True)
     t.start()
-
 
 # -- FastAPI lifespan ---------------------------------------------------------
 
@@ -147,9 +141,7 @@ async def lifespan(app):
     yield
     _log_startup("server shutting down")
 
-
 app = FastAPI(title="safelens-vision-worker", version=WORKER_VERSION, lifespan=lifespan)
-
 
 # -- Health / ping (no model dependency) -------------------------------------
 
@@ -160,14 +152,12 @@ async def health():
         "mode": "live-server", "version": WORKER_VERSION, **_public_state(),
     })
 
-
 @app.get("/ping")
 async def ping():
     return JSONResponse({
         "ok": True, "worker": "safelens-vision-worker",
         "mode": "live-server", "version": WORKER_VERSION, **_public_state(),
     })
-
 
 # -- Import diagnostics helper ------------------------------------------------
 
@@ -177,7 +167,6 @@ def _safe_version(module_name):
         return getattr(mod, "__version__", "unknown")
     except Exception as exc:
         return "ERROR: " + type(exc).__name__ + ": " + str(exc)
-
 
 def _import_check(callable_test):
     try:
@@ -190,7 +179,6 @@ def _import_check(callable_test):
             "exception_message": str(exc),
             "traceback": traceback.format_exc()[-3000:],
         }
-
 
 def _checkpoint_info():
     """Existence + file size for the EdgeCrafter checkpoints (no secrets)."""
@@ -208,7 +196,6 @@ def _checkpoint_info():
             info["error"] = type(exc).__name__ + ": " + str(exc)
         out[key] = info
     return out
-
 
 def _collect_edgecrafter_diagnostics():
     def _imp_torchvision():
@@ -249,7 +236,6 @@ def _collect_edgecrafter_diagnostics():
         "checkpoints": _checkpoint_info(),
     }
 
-
 def _collect_import_diagnostics():
     versions = {}
     for name in ("torch", "torchvision", "PIL", "numpy", "transformers",
@@ -271,7 +257,6 @@ def _collect_import_diagnostics():
         "cuda": cuda,
         "edgecrafter": _collect_edgecrafter_diagnostics(),
     }
-
 
 # -- Debug / startup diagnostics ----------------------------------------------
 
@@ -327,7 +312,6 @@ async def debug_startup(deep: bool = Query(False)):
 
     return JSONResponse(info)
 
-
 # -- Model-load diagnostic route ----------------------------------------------
 
 @app.post("/debug/model-load")
@@ -354,7 +338,6 @@ async def debug_model_load():
             "traceback": traceback.format_exc(),
         })
 
-
 # -- Warmup trigger -----------------------------------------------------------
 
 @app.post("/warmup")
@@ -367,7 +350,6 @@ async def warmup(wait: bool = Query(False)):
                 return JSONResponse({"ok": state["status"] == "ready", **state})
             await asyncio.sleep(1)
     return JSONResponse({"ok": True, "triggered": True, **_public_state()})
-
 
 # -- Detect endpoint ----------------------------------------------------------
 
@@ -421,6 +403,40 @@ async def detect(payload: Dict[str, Any]):
             status_code=500,
         )
 
+# -- Phase 0: WebSocket connectivity probe ------------------------------------
+
+@app.websocket("/ws/echo")
+async def ws_echo(websocket: WebSocket):
+    """Minimal WebSocket echo route.
+
+    Phase 0 connectivity probe used to verify that the RunPod load-balancing
+    endpoint forwards and upgrades WebSocket connections end to end. It does
+    NOT touch the model or any inference path.
+
+    Behaviour:
+      * accept the connection
+      * send {"type": "connected"}
+      * echo every received JSON message back verbatim
+      * close cleanly on client disconnect (never crashes the server)
+    """
+    await websocket.accept()
+    await websocket.send_json({"type": "connected"})
+    try:
+        while True:
+            try:
+                data = await websocket.receive_json()
+            except (ValueError, TypeError):
+                await websocket.send_json({"type": "error", "error": "invalid_json"})
+                continue
+            await websocket.send_json(data)
+    except WebSocketDisconnect:
+        log.info("ws/echo: client disconnected")
+    except Exception as exc:
+        log.warning("ws/echo: unexpected error: %s", exc)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 # -- Entrypoint ---------------------------------------------------------------
 
