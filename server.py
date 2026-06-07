@@ -438,6 +438,62 @@ async def ws_echo(websocket: WebSocket):
         except Exception:
             pass
 
+# -- Phase 1: streaming vision WebSocket (/ws/vision) -------------------------
+#
+# Registered through ws_vision.register_ws_vision with injected dependencies so
+# the streaming layer REUSES the existing warmed model + warmup + inference path
+# (vision_backend.run_inference / _start_warmup_background). No model is loaded
+# here and nothing is reloaded per frame. ws_vision is imported lazily and the
+# whole block is guarded so a problem in the streaming module can never break
+# server boot or any of the existing routes above.
+
+def _ws_run_inference(image_b64, conf, img_size, class_filter):
+    """Run one streamed frame through the same backend path as POST /detect."""
+    from vision_backend import run_inference
+    return run_inference(
+        image_b64=image_b64, conf=conf,
+        img_size=img_size, class_filter=class_filter,
+    )
+
+def _ws_active_tasks():
+    """Active EdgeCrafter tasks, with a torch-free fallback to the env parse."""
+    if _active_backend() == "deimv2":
+        return ["det"]
+    try:
+        import edgecrafter_loader as ec
+        return list(ec._STATE.tasks) if ec._STATE.tasks else ec.parse_tasks()
+    except Exception:
+        raw = os.getenv("EDGECRAFTER_TASKS", "det,pose")
+        out = [t.strip().lower() for t in raw.split(",")
+               if t.strip().lower() in ("det", "pose")]
+        return out or ["det"]
+
+def _ws_gpu_device():
+    """GPU device name if CUDA is available, else None (never raises)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return None
+
+try:
+    import ws_vision
+    ws_vision.register_ws_vision(
+        app,
+        get_state=_public_state,
+        trigger_warmup=_start_warmup_background,
+        run_inference=_ws_run_inference,
+        get_backend=_active_backend,
+        get_tasks=_ws_active_tasks,
+        get_gpu_device=_ws_gpu_device,
+    )
+    _log_startup("ws/vision: streaming route + /debug/stream registered")
+except Exception as exc:  # noqa: BLE001 -- streaming must never break server boot
+    _log_startup("ws/vision: registration FAILED -- " + type(exc).__name__ + ": " + str(exc))
+    log.warning("ws/vision registration failed: %s", exc)
+
 # -- Entrypoint ---------------------------------------------------------------
 
 if __name__ == "__main__":

@@ -63,6 +63,7 @@ COPY vision_backend.py /app/vision_backend.py
 COPY deimv2_infer.py /app/deimv2_infer.py
 COPY official_deimv2_loader.py /app/official_deimv2_loader.py
 COPY server.py /app/server.py
+COPY ws_vision.py /app/ws_vision.py
 COPY bootstrap.py /app/bootstrap.py
 COPY handler.py /app/handler.py
 
