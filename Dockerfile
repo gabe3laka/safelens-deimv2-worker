@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # safelens-deimv2-worker/Dockerfile
 # Builds the SafeLens vision live-server worker for RunPod load-balancing endpoints.
 #
@@ -55,6 +56,20 @@ RUN pip install --no-cache-dir --upgrade \
     "timm>=1.0.11" \
     "pyyaml>=6.0" \
     "opencv-python-headless>=4.10.0.84"
+
+# ---- Pin huggingface-hub below 1.0 (MUST be the last hub install) -----------
+# EdgeCrafter's engine.core.YAMLConfig -> calflops -> transformers requires
+# huggingface-hub<1.0. The ">=0.26.0" --upgrade above resolves to 1.18.0, which
+# transformers rejects at import time and breaks EdgeCrafter warmup. Force the
+# compatible range, then verify at build time so a bad resolve fails the build.
+RUN python -m pip install --no-cache-dir --force-reinstall "huggingface-hub>=0.26.0,<1.0"
+RUN python - <<'PY'
+import huggingface_hub
+from packaging.version import Version
+v = Version(huggingface_hub.__version__)
+assert Version("0.26.0") <= v < Version("1.0"), f"bad huggingface-hub version: {v}"
+print("huggingface-hub OK:", v)
+PY
 
 # Copy worker code
 COPY schema.py /app/schema.py
