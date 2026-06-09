@@ -65,9 +65,16 @@ _STATE = {
 }
 _BOOT_TS = time.time()
 
+# In-memory tail of startup log lines, surfaced by GET /debug/state.
+_STARTUP_LOG_BUFFER = []
+_STARTUP_LOG_MAX = 200
+
 def _log_startup(msg):
     line = "[" + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "] " + msg
     print(line, flush=True)
+    _STARTUP_LOG_BUFFER.append(line)
+    if len(_STARTUP_LOG_BUFFER) > _STARTUP_LOG_MAX:
+        del _STARTUP_LOG_BUFFER[:-_STARTUP_LOG_MAX]
     try:
         STARTUP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with STARTUP_LOG_PATH.open("a") as fh:
@@ -87,6 +94,24 @@ def _public_state():
             "ready_at": _STATE["ready_at"],
             "uptime_seconds": round(time.time() - _BOOT_TS, 2),
         }
+
+def _ckpt_exists(env_name):
+    """True if the checkpoint path held in env var `env_name` exists on disk."""
+    path = os.getenv(env_name, "")
+    try:
+        return bool(path) and os.path.exists(path)
+    except Exception:
+        return False
+
+def _torch_cuda_info():
+    """(cuda_available, gpu_name) from torch if importable, else (False, None)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return True, torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return False, None
 
 # -- Model warmup (background thread) -----------------------------------------
 
@@ -129,8 +154,18 @@ def _start_warmup_background():
 
 @asynccontextmanager
 async def lifespan(app):
-    _log_startup("server starting -- port=" + str(PORT) + " version=" + WORKER_VERSION + " backend=" + _active_backend())
-    _log_startup("skip_warmup=" + str(SKIP_WARMUP) + " auto_warmup=" + str(AUTO_WARMUP))
+    _log_startup("server starting")
+    _log_startup("port=" + str(PORT))
+    _log_startup("version=" + WORKER_VERSION)
+    _log_startup("backend=" + _active_backend())
+    _log_startup("SKIP_WARMUP=" + str(SKIP_WARMUP))
+    _log_startup("AUTO_WARMUP=" + str(AUTO_WARMUP))
+    _log_startup("EDGECRAFTER_TASKS=" + os.getenv("EDGECRAFTER_TASKS", ""))
+    _log_startup("EDGECRAFTER_REPO_DIR=" + os.getenv("EDGECRAFTER_REPO_DIR", ""))
+    _log_startup("det_checkpoint_exists=" + str(_ckpt_exists("EDGECRAFTER_DET_CHECKPOINT_PATH")))
+    _log_startup("pose_checkpoint_exists=" + str(_ckpt_exists("EDGECRAFTER_POSE_CHECKPOINT_PATH")))
+    _cuda_available, _gpu_name = _torch_cuda_info()
+    _log_startup("cuda_available=" + str(_cuda_available))
     if SKIP_WARMUP:
         _log_startup("SKIP_WARMUP=true: skipping model load (diagnostic mode)")
     elif AUTO_WARMUP:
@@ -338,6 +373,44 @@ async def debug_model_load():
             "traceback": traceback.format_exc(),
         })
 
+# -- State diagnostics route --------------------------------------------------
+
+@app.get("/debug/state")
+async def debug_state():
+    """Non-sensitive snapshot of worker state, config, checkpoints and GPU.
+
+    Surfaces only the EdgeCrafter config env vars listed below -- never
+    secrets, API keys, or tokens (e.g. HF_TOKEN is deliberately excluded).
+    """
+    cuda_available, gpu_name = _torch_cuda_info()
+    return JSONResponse({
+        "ok": True,
+        "worker_version": WORKER_VERSION,
+        "backend": _active_backend(),
+        "skip_warmup": SKIP_WARMUP,
+        "auto_warmup": AUTO_WARMUP,
+        "state": _public_state(),
+        "env_subset": {
+            "VISION_BACKEND": os.getenv("VISION_BACKEND", ""),
+            "EDGECRAFTER_TASKS": os.getenv("EDGECRAFTER_TASKS", ""),
+            "EDGECRAFTER_DEVICE": os.getenv("EDGECRAFTER_DEVICE", ""),
+            "EDGECRAFTER_IMG_SIZE": os.getenv("EDGECRAFTER_IMG_SIZE", ""),
+            "EDGECRAFTER_CONF": os.getenv("EDGECRAFTER_CONF", ""),
+            "EDGECRAFTER_REPO_DIR": os.getenv("EDGECRAFTER_REPO_DIR", ""),
+            "EDGECRAFTER_DET_CONFIG": os.getenv("EDGECRAFTER_DET_CONFIG", ""),
+            "EDGECRAFTER_DET_CHECKPOINT_PATH": os.getenv("EDGECRAFTER_DET_CHECKPOINT_PATH", ""),
+            "EDGECRAFTER_POSE_CONFIG": os.getenv("EDGECRAFTER_POSE_CONFIG", ""),
+            "EDGECRAFTER_POSE_CHECKPOINT_PATH": os.getenv("EDGECRAFTER_POSE_CHECKPOINT_PATH", ""),
+        },
+        "checkpoint_exists": {
+            "det": _ckpt_exists("EDGECRAFTER_DET_CHECKPOINT_PATH"),
+            "pose": _ckpt_exists("EDGECRAFTER_POSE_CHECKPOINT_PATH"),
+        },
+        "cuda_available": cuda_available,
+        "gpu_name": gpu_name,
+        "startup_log_tail": _STARTUP_LOG_BUFFER[-50:],
+    })
+
 # -- Warmup trigger -----------------------------------------------------------
 
 @app.post("/warmup")
@@ -362,9 +435,25 @@ async def detect(payload: Dict[str, Any]):
     """
     state = _public_state()
     if state["status"] != "ready":
+        # Not ready yet: log the full state, trigger the existing background
+        # warmup, then return a diagnostic model_not_ready body. error stays
+        # "model_not_ready" so the app's existing handling is unchanged; the
+        # underlying load error (if any) is in error_traceback / GET /debug/state.
+        log.info("detect: model_not_ready -- state=%s", state)
+        _start_warmup_background()
         return JSONResponse(
-            {"error": "model_not_ready", "status": state["status"],
-             "entities": [], "poses": [], "backend": _active_backend()},
+            {
+                "error": "model_not_ready",
+                "status": state["status"],
+                "warmup_triggered": True,
+                "backend": state["backend"],
+                "model_loaded": state["model_loaded"],
+                "error_traceback": state["error_traceback"],
+                "warmup_started_at": state["warmup_started_at"],
+                "ready_at": state["ready_at"],
+                "entities": [],
+                "poses": [],
+            },
             status_code=503,
         )
 
