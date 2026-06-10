@@ -68,6 +68,63 @@ See `official_deimv2_loader.py` for the loader, preprocessing
 }
 ```
 
+## Build Mode (lightweight blueprint processing)
+
+Build Mode is a **CPU-only**, additive feature, **fully separate** from the
+EdgeCrafter `/detect` pipeline. It never loads a model, never triggers warmup,
+and never touches the GPU. MediaPipe hand tracking runs **client-side in the
+app**; the worker *consumes* the app's `handLandmarks` + `gesture` (it does not
+re-run hand tracking) and turns a selected-crop image into a lightweight,
+replayable blueprint:
+
+```
+selected crop -> grayscale -> blur -> Canny edges -> contours ->
+largest contour -> approxPolyDP outline -> normalized 0..1 points ->
+anchors -> hand landmarks (mapped to crop-local) -> step markers -> JSON frames
+```
+
+State is **in-memory JSON keyframes only** (no images, no video), with a
+per-session cap (240 frames) and TTL cleanup (~45 min). The image work runs in a
+worker thread, so it never blocks `/detect` or `/health`.
+
+### Build Mode routes
+
+| Method | Path | Notes |
+|--------|------|-------|
+| POST | `/build/session/start` | Open a session, returns `session_id` |
+| POST | `/build/session/lock` | Lock the selected region for the session |
+| POST | `/build/session/frame` | Process one selected-crop keyframe → `blueprint_frame` |
+| POST | `/build/session/finish` | Close the session, returns a replay id |
+| GET | `/build/session/{session_id}/replay` | Return the stored JSON keyframes |
+
+### `/build/session/frame` request (selected crop only)
+
+```json
+{
+  "sessionId": "build_...",
+  "frameId": "f-0",
+  "timestampMs": 1234,
+  "selectedRegion": { "x": 0.1, "y": 0.2, "w": 0.4, "h": 0.3 },
+  "image_b64": "<base64 JPEG/PNG of the selected crop>",
+  "handLandmarks": [{ "x": 0.42, "y": 0.55, "role": "index-tip" }],
+  "gesture": { "type": "pinch", "active": true, "strength": 0.8 }
+}
+```
+
+The response wraps a camelCase `blueprint_frame` (`outline`, `anchors`,
+`sparsePoints`, `handLandmarks`, `stepMarkers`, `gesture`). Hand landmarks and
+step markers are mapped into **selected-crop-local** coordinates
+(`local = (landmark - region_origin) / region_size`) so they line up with the
+outline. An active pinch/grab gesture adds a step marker at the index fingertip.
+
+Structured errors look like `{ "ok": false, "error": "<code>" }` — e.g.
+`missing_image_b64`, `invalid_base64`, `decode_failure`, `unknown_session`,
+`missing_session_id`, `invalid_selected_region`, `too_many_frames`,
+`payload_too_large`, `processing_failure`.
+
+Build Mode is **not** Gaussian splatting, a dense point cloud, a full 3D scan,
+server-side MediaPipe, or video storage (those are explicitly out of scope).
+
 ## Docker image
 
 Built and pushed to GitHub Container Registry on every push to `main`:

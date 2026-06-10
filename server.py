@@ -13,10 +13,18 @@ Routes
 GET  /health         -- returns immediately, no model required
 GET  /ping           -- alias for /health
 GET  /debug/startup  -- environment + torch diagnostics (?deep=true for imports)
+GET  /debug/state    -- worker state/config/checkpoints/GPU snapshot (no secrets)
+GET  /debug/stream   -- latest /ws/vision streaming-metrics snapshot
 POST /debug/model-load -- attempt model load only, return structured result
 POST /warmup         -- trigger background model load
 POST /detect         -- run inference (503 if model not ready)
 WS   /ws/echo        -- Phase 0 WebSocket connectivity probe (echoes JSON)
+WS   /ws/vision      -- streaming inference (frames in, vision + metrics out)
+POST /build/session/start  -- Build Mode: open a blueprint session
+POST /build/session/lock   -- Build Mode: lock the selected region
+POST /build/session/frame  -- Build Mode: process one selected-crop keyframe
+POST /build/session/finish -- Build Mode: close session, return replay id
+GET  /build/session/{id}/replay -- Build Mode: replay stored JSON keyframes
 """
 
 import asyncio
@@ -491,6 +499,63 @@ async def detect(payload: Dict[str, Any]):
              "entities": [], "poses": [], "backend": _active_backend()},
             status_code=500,
         )
+
+# -- Build Mode (lightweight blueprint processing; CPU-only, additive) --------
+#
+# Fully separate from EdgeCrafter / detect: Build Mode never loads a model,
+# never triggers warmup, and never touches the GPU. The CPU image work
+# (Pillow/OpenCV/NumPy) runs in a worker thread (asyncio.to_thread inside
+# build_blueprint) so it cannot block /detect or /health. State is lightweight
+# in-memory JSON keyframes only -- no images, no video -- with TTL + frame caps.
+# build_blueprint is imported lazily and every handler is guarded so Build Mode
+# can never break server boot or the existing routes above.
+
+def _build_error_response(exc):
+    from build_schema import BuildError
+    if isinstance(exc, BuildError):
+        return JSONResponse({"ok": False, "error": exc.code}, status_code=exc.status)
+    log.exception("build: unexpected error: %s", exc)
+    return JSONResponse({"ok": False, "error": "build_failed"}, status_code=500)
+
+@app.post("/build/session/start")
+async def build_session_start(payload: Dict[str, Any]):
+    try:
+        import build_blueprint
+        return JSONResponse(build_blueprint.start_session(payload))
+    except Exception as exc:  # noqa: BLE001
+        return _build_error_response(exc)
+
+@app.post("/build/session/lock")
+async def build_session_lock(payload: Dict[str, Any]):
+    try:
+        import build_blueprint
+        return JSONResponse(build_blueprint.lock_session(payload))
+    except Exception as exc:  # noqa: BLE001
+        return _build_error_response(exc)
+
+@app.post("/build/session/frame")
+async def build_session_frame(payload: Dict[str, Any]):
+    try:
+        import build_blueprint
+        return JSONResponse(await build_blueprint.process_frame_async(payload))
+    except Exception as exc:  # noqa: BLE001
+        return _build_error_response(exc)
+
+@app.post("/build/session/finish")
+async def build_session_finish(payload: Dict[str, Any]):
+    try:
+        import build_blueprint
+        return JSONResponse(build_blueprint.finish_session(payload))
+    except Exception as exc:  # noqa: BLE001
+        return _build_error_response(exc)
+
+@app.get("/build/session/{session_id}/replay")
+async def build_session_replay(session_id: str):
+    try:
+        import build_blueprint
+        return JSONResponse(build_blueprint.get_replay(session_id))
+    except Exception as exc:  # noqa: BLE001
+        return _build_error_response(exc)
 
 # -- Phase 0: WebSocket connectivity probe ------------------------------------
 

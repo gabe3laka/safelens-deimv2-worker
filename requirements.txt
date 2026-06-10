@@ -35,3 +35,7 @@ faster-coco-eval>=1.6.7
 PyYAML
 scipy
 pycocotools
+
+# ----- Build Mode (lightweight blueprint processing) -------------------------
+# CPU-only; NO new packages and NO GPU/model deps. Build Mode reuses Pillow and
+# numpy (above) plus opencv-python-headless (above) for edge/contour extraction.
