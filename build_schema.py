@@ -9,7 +9,7 @@ inside `blueprint_frame`.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -122,3 +122,9 @@ class BlueprintFrame(BaseModel):
 
     planSteps: List[PlanStep] = Field(default_factory=list)
     currentPlanStepIndex: Optional[int] = None
+
+    # Plan Mode visual guidance overlays. Kept as flexible dicts so the `arrow`
+    # type's nested `from`/`to` points pass through verbatim. Each item is:
+    #   {id, type, [x, y] | [from:{x,y}, to:{x,y}], label?, stepId?, confidence?}
+    # type in: arrow | target | ghost-position | highlight | warning-zone
+    planOverlays: List[Dict[str, Any]] = Field(default_factory=list)

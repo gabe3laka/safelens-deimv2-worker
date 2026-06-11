@@ -112,8 +112,10 @@ def start_session(payload: Dict[str, Any]) -> Dict[str, Any]:
         "source_asset": None,
         "plan_steps": None,
         "plan_index": 0,
+        "plan_key": None,
         "pinch_prev": False,
         "last_index": None,
+        "user_intent": payload.get("userIntent") or payload.get("user_intent"),
     }
     return {
         "ok": True,
@@ -142,6 +144,8 @@ def lock_session(payload: Dict[str, Any]) -> Dict[str, Any]:
     sess["locked"] = True
     if payload.get("workflowMode") or payload.get("workflow_mode"):
         sess["workflow_mode"] = _norm_mode(payload.get("workflowMode") or payload.get("workflow_mode"))
+    if payload.get("userIntent") or payload.get("user_intent"):
+        sess["user_intent"] = payload.get("userIntent") or payload.get("user_intent")
     sess["updated_at"] = time.time()
     return {
         "ok": True,
@@ -277,8 +281,9 @@ async def process_frame_async(payload: Dict[str, Any]) -> Dict[str, Any]:
     sess["last_index"] = _index_card(hand_landmarks)
 
     step_markers = _step_markers(index_local, gesture, frame_id, timestamp_ms)
+    user_intent = _intent_from(payload, sess)
     ai = make_ai_fields(workflow_mode, geom, hand_out, index_local, gesture,
-                        float(geom.get("confidence", 0.0)), frame_index, sess)
+                        float(geom.get("confidence", 0.0)), frame_index, sess, user_intent)
 
     mask_output = cfg["mask_output"]
     blueprint = {
@@ -311,6 +316,7 @@ async def process_frame_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         "importance": ai["importance"],
         "planSteps": ai["planSteps"],
         "currentPlanStepIndex": ai["currentPlanStepIndex"],
+        "planOverlays": ai["planOverlays"],
     }
 
     bp_frame = BlueprintFrame(**blueprint).model_dump()
@@ -545,8 +551,16 @@ def _step_markers(index_local, gesture, frame_id, timestamp_ms) -> List[Dict[str
 # -- Build/Plan rule-based notes + plan steps (event loop) --------------------
 
 def make_ai_fields(workflow_mode, geom, hand_out, index_local, gesture,
-                   confidence, frame_index, session) -> Dict[str, Any]:
-    """Rule-based, cautious notes/instructions. No ML, no exact procedures."""
+                   confidence, frame_index, session, user_intent=None) -> Dict[str, Any]:
+    """Rule-based, cautious notes/instructions. No ML, no exact procedures.
+
+    Plan mode is intent-driven (see _plan_fields): unconfirmed intent asks for
+    confirmation; confirmed intent returns task-specific guidance + planOverlays.
+    Build mode keeps documenting activity (planOverlays stays empty).
+    """
+    if workflow_mode == "plan":
+        return _plan_fields(user_intent, geom, index_local, gesture, confidence, frame_index, session)
+
     center = (geom or {}).get("center") or {"x": 0.5, "y": 0.5}
     cx, cy = center["x"], center["y"]
     hx, hy = index_local if index_local else (cx, cy)
@@ -558,74 +572,244 @@ def make_ai_fields(workflow_mode, geom, hand_out, index_local, gesture,
         notes.append({"id": f"note-{frame_index}-{nid}", "type": ntype, "text": text,
                       "x": _clamp(x), "y": _clamp(y), "timestampMs": 0, "confidence": conf})
 
-    if workflow_mode == "plan":
-        note("intent", "next-step", "The user may be trying to inspect this item.", cx, cy)
-        note("next", "next-step", "Possible next step: check the highlighted area.", hx, hy)
-        note("safety", "safety", "Before continuing, verify the item is safe to handle.", cx, cy)
-        note("quality", "quality", "Check that the area is clear before proceeding.", cx, cy)
-        if low_conf:
-            note("confirm", "intent",
-                 "What are you trying to do with this item? Inspect, repair, clean, install, remove, or other?",
-                 cx, cy, confidence)
-        plan_steps, current_index = _update_plan_steps(session, center, active)
-        fields = {
-            "instruction": "Guidance: inspect the highlighted area and confirm the task you want to perform.",
-            "nextAction": "Possible next step: check the highlighted area.",
-            "safetyWarning": "Verify the item is safe to handle before continuing.",
-            "qualityCheck": "Ensure the highlighted area is visible and unobstructed.",
+    note("obs", "observation", "The user appears to be working near this area.", hx, hy)
+    if active:
+        note("inspect", "observation", "Possible inspection point.", hx, hy)
+    note("quality", "quality", "Check this area before finishing.", cx, cy)
+    note("safety", "safety", "Safety reminder: verify the area is safe before continuing.", cx, cy)
+    if low_conf:
+        note("confirm", "intent",
+             "What are you trying to do with this item? Inspect, repair, clean, install, remove, or other?",
+             cx, cy, confidence)
+    return {
+        "instruction": "The user appears to be focusing on this selected object.",
+        "nextAction": "Pin the blueprint, then record or follow the next step.",
+        "safetyWarning": None,
+        "qualityCheck": "Keep the selected object clearly visible.",
+        "activityLabel": "Selected work area",
+        "detectedIntent": None,
+        "importance": "medium",
+        "planSteps": [],
+        "currentPlanStepIndex": None,
+        "aiNotes": notes,
+        "planOverlays": [],
+    }
+
+
+# -- Plan Mode: intent-driven guidance + visual overlays ----------------------
+
+_HIGH_RISK_WORDS = (
+    "electric", "electrical", "wire", "wiring", "circuit", "voltage", "volt",
+    "outlet", "socket", "mains", "breaker", "fuse", "live wire", "power line",
+    "high voltage", "transformer", "capacitor", "gas", "propane", "flammable",
+)
+_SYMPTOM_WORDS = (
+    "not working", "doesn't", "does not", "won't", "wont", "broken", "leak",
+    "leaking", "noise", "grinding", "error", "fault", "overheat", "stuck",
+    "fail", "smoke", "smell", "loose", "cracked", "no power", "dead",
+    "intermittent", "jammed", "rattle",
+)
+
+
+def _intent_from(payload, sess):
+    intent = payload.get("userIntent") or payload.get("user_intent") or sess.get("user_intent")
+    return intent if isinstance(intent, dict) else None
+
+
+def _norm_task(intent):
+    return str((intent or {}).get("taskType") or "").strip().lower()
+
+
+def _is_high_risk(intent):
+    blob = (_norm_task(intent) + " " + str((intent or {}).get("text") or "")).lower()
+    return any(w in blob for w in _HIGH_RISK_WORDS)
+
+
+def _has_symptom(intent):
+    return any(w in str((intent or {}).get("text") or "").lower() for w in _SYMPTOM_WORDS)
+
+
+def _describe_intent(task, text):
+    base = {
+        "build": "User wants to assemble or work on the selected item",
+        "assemble": "User wants to assemble or work on the selected item",
+        "inspect": "User wants to inspect the selected item or area",
+        "identify": "User wants to identify the selected item or area",
+        "repair": "User wants to repair or troubleshoot the selected item",
+        "troubleshoot": "User wants to repair or troubleshoot the selected item",
+    }.get(task, "User confirmed a task on the selected item")
+    text = (text or "").strip()
+    return base + (f' (stated goal: "{text[:120]}")' if text else "")
+
+
+def _safety(high_risk):
+    if high_risk:
+        return ("High-risk / electrical context: isolate and de-energize the equipment, "
+                "verify it is dead, and use qualified personnel. Do not work on live circuits.")
+    return "Verify the item is safe to handle before continuing."
+
+
+def _inspection_points(anchors, center, max_pts=4):
+    pts = [{"x": a["x"], "y": a["y"]} for a in (anchors or [])
+           if a.get("label") in ("contour", "corner")]
+    return (pts or [center])[:max_pts]
+
+
+def _ov_highlight(oid, x, y, label, step_id=None, conf=0.6):
+    return {"id": oid, "type": "highlight", "x": _clamp(x), "y": _clamp(y),
+            "label": label, "stepId": step_id, "confidence": conf}
+
+
+def _ov_target(oid, x, y, label, step_id=None, conf=0.6):
+    return {"id": oid, "type": "target", "x": _clamp(x), "y": _clamp(y),
+            "label": label, "stepId": step_id, "confidence": conf}
+
+
+def _ov_arrow(oid, fx, fy, tx, ty, label, step_id=None, conf=0.5):
+    return {"id": oid, "type": "arrow",
+            "from": {"x": _clamp(fx), "y": _clamp(fy)},
+            "to": {"x": _clamp(tx), "y": _clamp(ty)},
+            "label": label, "stepId": step_id, "confidence": conf}
+
+
+def _ov_warning_zone(oid, x, y, label, conf=0.7, radius=0.3):
+    return {"id": oid, "type": "warning-zone", "x": _clamp(x), "y": _clamp(y),
+            "radius": radius, "label": label, "stepId": None, "confidence": conf}
+
+
+def _ov_ghost(oid, x, y, label, step_id=None, conf=0.5):
+    return {"id": oid, "type": "ghost-position", "x": _clamp(x), "y": _clamp(y),
+            "label": label, "stepId": step_id, "confidence": conf}
+
+
+def _plan_fields(intent, geom, index_local, gesture, confidence, frame_index, session) -> Dict[str, Any]:
+    center = (geom or {}).get("center") or {"x": 0.5, "y": 0.5}
+    anchors = (geom or {}).get("anchors") or []
+    cx, cy = center["x"], center["y"]
+    hx, hy = index_local if index_local else (cx, cy)
+    active = bool(gesture.get("active")) if isinstance(gesture, dict) else False
+    task = _norm_task(intent)
+    text = str((intent or {}).get("text") or "").strip()
+    confirmed = bool(intent and intent.get("confirmed") is True)
+    high_risk = _is_high_risk(intent)
+    notes: List[Dict[str, Any]] = []
+    overlays: List[Dict[str, Any]] = []
+
+    def note(nid, ntype, txt, x, y, conf=None):
+        notes.append({"id": f"note-{frame_index}-{nid}", "type": ntype, "text": txt,
+                      "x": _clamp(x), "y": _clamp(y), "timestampMs": 0, "confidence": conf})
+
+    # Not confirmed -> ask the user to confirm; do not pretend to know the task.
+    if not confirmed:
+        note("confirm", "intent",
+             "What are you trying to do with this item? Identify, inspect, build/assemble, repair, or other?",
+             cx, cy, confidence)
+        overlays.append(_ov_highlight(f"highlight-{frame_index}-confirm", cx, cy,
+                                      "Confirm what you want to do", "step-1", 0.5))
+        steps, idx = _resolve_plan_steps(session, "confirm", False, high_risk, center, active)
+        return {
+            "detectedIntent": None,
+            "instruction": "I need the task goal to give specific steps. What are you trying to do with this item?",
+            "nextAction": "Confirm your task (identify, inspect, build/assemble, repair) to get step-by-step guidance.",
+            "safetyWarning": _safety(high_risk),
+            "qualityCheck": "Keep the selected item clearly visible.",
             "activityLabel": "Planning area",
-            "detectedIntent": None,
-            "importance": "medium",
-            "planSteps": plan_steps,
-            "currentPlanStepIndex": current_index,
+            "importance": "high" if high_risk else "medium",
+            "planSteps": steps, "currentPlanStepIndex": idx,
+            "aiNotes": notes, "planOverlays": overlays,
         }
-    else:  # build
-        note("obs", "observation", "The user appears to be working near this area.", hx, hy)
-        if active:
-            note("inspect", "observation", "Possible inspection point.", hx, hy)
-        note("quality", "quality", "Check this area before finishing.", cx, cy)
-        note("safety", "safety", "Safety reminder: verify the area is safe before continuing.", cx, cy)
-        if low_conf:
-            note("confirm", "intent",
-                 "What are you trying to do with this item? Inspect, repair, clean, install, remove, or other?",
-                 cx, cy, confidence)
-        fields = {
-            "instruction": "The user appears to be focusing on this selected object.",
-            "nextAction": "Pin the blueprint, then record or follow the next step.",
-            "safetyWarning": None,
-            "qualityCheck": "Keep the selected object clearly visible.",
-            "activityLabel": "Selected work area",
-            "detectedIntent": None,
-            "importance": "medium",
-            "planSteps": [],
-            "currentPlanStepIndex": None,
-        }
-    fields["aiNotes"] = notes
-    return fields
+
+    # Confirmed -> task-specific guidance.
+    if high_risk:
+        overlays.append(_ov_warning_zone(f"warn-{frame_index}", cx, cy,
+                                         "High-risk / electrical: isolate power first"))
+
+    if task in ("build", "assemble"):
+        quality = "Keep all parts visible in the selected area."
+        if confidence >= 0.5 and len(anchors) >= 3:  # enough visual evidence
+            instruction = "Step 1: confirm the parts and choose the starting point."
+            next_action = "Point at the first part or select the area you want to move."
+            note("next", "next-step", "Possible next step: select the first part to work with.", cx, cy, confidence)
+            overlays.append(_ov_target(f"target-{frame_index}", cx, cy, "Start here", "step-1", confidence))
+            if index_local:
+                overlays.append(_ov_arrow(f"arrow-{frame_index}", hx, hy, cx, cy, "Move/place here", "step-1", 0.5))
+            step_kind = "assemble"
+        else:  # weak evidence -> identify parts first
+            instruction = "I can't clearly see the parts yet. Identify the parts first."
+            next_action = "Point at each part so the assembly can be mapped."
+            note("identify", "next-step", "Check whether all parts are visible before assembling.", cx, cy, confidence)
+            overlays.append(_ov_highlight(f"highlight-{frame_index}", cx, cy, "Show me the parts", "step-1", 0.4))
+            step_kind = "assemble-weak"
+    elif task == "inspect":
+        quality = "Keep each inspection point clearly visible."
+        instruction = "Step 1: inspect the highlighted points in order."
+        next_action = "Move along the numbered inspection points and check each."
+        for i, p in enumerate(_inspection_points(anchors, center)):
+            overlays.append(_ov_target(f"inspect-{frame_index}-{i}", p["x"], p["y"], f"Inspect {i + 1}", "step-1", 0.6))
+            note(f"insp-{i}", "quality", f"Check whether inspection point {i + 1} shows wear or damage.", p["x"], p["y"], 0.6)
+        step_kind = "inspect"
+    elif task in ("repair", "troubleshoot"):
+        quality = "Keep the highlighted area clearly visible."
+        if not _has_symptom(intent):
+            instruction = "Before steps, describe the problem or symptom you are seeing."
+            next_action = "Tell me the symptom (e.g. not working, leak, noise) so I can suggest an inspection sequence."
+            note("symptom", "intent", "I need the symptom to suggest a safe inspection sequence.", cx, cy, confidence)
+            overlays.append(_ov_highlight(f"highlight-{frame_index}", cx, cy, "Where is the problem?", "step-1", 0.5))
+            step_kind = "repair-symptom"
+        else:
+            instruction = "Step 1: inspect the related points in sequence (no live operation)."
+            next_action = "Check the highlighted inspection points one by one before any repair."
+            for i, p in enumerate(_inspection_points(anchors, center)):
+                overlays.append(_ov_target(f"diag-{frame_index}-{i}", p["x"], p["y"], f"Check {i + 1}", "step-1", 0.6))
+            note("seq", "next-step", "Possible next step: inspect each highlighted point before acting.", cx, cy, confidence)
+            step_kind = "repair-seq"
+    elif task == "identify":
+        quality = "Keep the item centered and clearly visible."
+        instruction = "Possible: confirm what this item is before proceeding."
+        next_action = "Confirm the item, or point at a feature you want identified."
+        note("id", "observation", "The user appears to be focusing on this item.", cx, cy, confidence)
+        note("check", "observation", "Check whether this matches what you expect.", cx, cy, confidence)
+        overlays.append(_ov_highlight(f"highlight-{frame_index}", cx, cy, "Is this the item?", "step-1", confidence))
+        for i, p in enumerate(_inspection_points(anchors, center)[:3]):
+            overlays.append(_ov_highlight(f"feature-{frame_index}-{i}", p["x"], p["y"], "Key feature", "step-2", 0.5))
+        step_kind = "identify"
+    else:
+        quality = "Keep the highlighted area clearly visible."
+        instruction = "Step 1: confirm the area and choose the starting point."
+        next_action = "Point at the area you want to work on."
+        note("generic", "next-step", "Possible next step: confirm the starting point.", cx, cy, confidence)
+        overlays.append(_ov_highlight(f"highlight-{frame_index}", cx, cy, "Start here", "step-1", confidence))
+        step_kind = "generic"
+
+    if active and index_local:
+        overlays.append(_ov_ghost(f"ghost-{frame_index}", hx, hy, "Active work point", None, 0.5))
+
+    steps, idx = _resolve_plan_steps(session, step_kind, True, high_risk, center, active)
+    return {
+        "detectedIntent": _describe_intent(task, text),
+        "instruction": instruction,
+        "nextAction": next_action,
+        "safetyWarning": _safety(high_risk),
+        "qualityCheck": quality,
+        "activityLabel": "Planning area",
+        "importance": "high" if high_risk else "medium",
+        "planSteps": steps, "currentPlanStepIndex": idx,
+        "aiNotes": notes, "planOverlays": overlays,
+    }
 
 
-def _update_plan_steps(session, center, active) -> Tuple[List[Dict[str, Any]], int]:
-    """Create starter plan steps once, then advance the index on each pinch."""
-    steps = session.get("plan_steps")
-    if not steps:
-        steps = [
-            {"id": "step-1", "title": "Inspect selected area",
-             "instruction": "Check the highlighted area and confirm what task you want to perform.",
-             "status": "active", "x": center["x"], "y": center["y"],
-             "safetyNote": "Verify the item is safe to handle before continuing.",
-             "qualityCheck": "Ensure the area is visible and unobstructed."},
-            {"id": "step-2", "title": "Perform work",
-             "instruction": "Follow the next confirmed action while keeping the item in view.",
-             "status": "pending"},
-            {"id": "step-3", "title": "Final check",
-             "instruction": "Verify the result and inspect the highlighted points.",
-             "status": "pending"},
-        ]
-        session["plan_steps"] = steps
+def _resolve_plan_steps(session, step_kind, confirmed, high_risk, center, active) -> Tuple[List[Dict[str, Any]], int]:
+    """(Re)generate task-specific steps; advance the index on each pinch."""
+    key = (step_kind, confirmed, high_risk)
+    if session.get("plan_key") != key or not session.get("plan_steps"):
+        session["plan_steps"] = _steps_for(step_kind, confirmed, high_risk, center)
         session["plan_index"] = 0
+        session["plan_key"] = key
+        session["pinch_prev"] = False
 
+    steps = session["plan_steps"]
     idx = session.get("plan_index", 0)
-    if active and not session.get("pinch_prev", False):  # rising edge of a pinch
+    if confirmed and active and not session.get("pinch_prev", False):  # rising edge of a pinch
         idx = min(idx + 1, len(steps) - 1)
     session["pinch_prev"] = active
     session["plan_index"] = idx
@@ -636,6 +820,75 @@ def _update_plan_steps(session, center, active) -> Tuple[List[Dict[str, Any]], i
         s2["status"] = "completed" if i < idx else ("active" if i == idx else "pending")
         out.append(s2)
     return out, idx
+
+
+def _steps_for(step_kind, confirmed, high_risk, center) -> List[Dict[str, Any]]:
+    cx, cy = center["x"], center["y"]
+    if not confirmed:
+        return [{"id": "step-1", "title": "Confirm task and parts",
+                 "instruction": "Confirm what task you want to perform with this item.",
+                 "status": "active", "x": cx, "y": cy,
+                 "safetyNote": "Verify the item is safe to handle before continuing.",
+                 "qualityCheck": "Keep the item clearly visible."}]
+    if high_risk:
+        return [
+            {"id": "step-1", "title": "Isolate and verify safe",
+             "instruction": "Isolate/de-energize the equipment and verify it is safe before any work.",
+             "status": "active", "x": cx, "y": cy,
+             "safetyNote": "Do not work on live circuits. Use qualified personnel.",
+             "qualityCheck": "Confirm power is off and locked out."},
+            {"id": "step-2", "title": "Inspect (no live operation)",
+             "instruction": "Inspect the highlighted points without operating live components.",
+             "status": "pending"},
+            {"id": "step-3", "title": "Confirm and hand off",
+             "instruction": "Confirm findings; defer live work to a qualified person.",
+             "status": "pending"},
+        ]
+    table = {
+        "assemble": [
+            ("step-1", "Confirm task and parts", "Identify the parts you want to assemble."),
+            ("step-2", "Position the first part", "Place or move the first part to the start point."),
+            ("step-3", "Assemble and check fit", "Assemble step by step and verify the fit."),
+        ],
+        "assemble-weak": [
+            ("step-1", "Identify parts", "Point at each part so the parts can be mapped."),
+            ("step-2", "Confirm assembly order", "Confirm the order before assembling."),
+            ("step-3", "Assemble and check", "Assemble step by step and verify the fit."),
+        ],
+        "inspect": [
+            ("step-1", "Inspect point 1", "Check the first highlighted inspection point."),
+            ("step-2", "Inspect remaining points", "Check the remaining highlighted points."),
+            ("step-3", "Record findings", "Note anything that looks worn or damaged."),
+        ],
+        "repair-symptom": [
+            ("step-1", "Describe the symptom", "Describe the problem you are seeing."),
+            ("step-2", "Inspect related points", "Inspect the related points for the symptom."),
+            ("step-3", "Confirm and verify", "Confirm the likely cause and verify safely."),
+        ],
+        "repair-seq": [
+            ("step-1", "Inspect in sequence", "Inspect each highlighted point in order."),
+            ("step-2", "Narrow the cause", "Use the inspection to narrow the likely cause."),
+            ("step-3", "Verify safely", "Verify safely; avoid live operation."),
+        ],
+        "identify": [
+            ("step-1", "Confirm the item", "Confirm what this item is."),
+            ("step-2", "Highlight key features", "Point at key features to confirm."),
+            ("step-3", "Decide next task", "Decide what you want to do next."),
+        ],
+    }
+    rows = table.get(step_kind, [
+        ("step-1", "Confirm the area", "Confirm the area and starting point."),
+        ("step-2", "Perform work", "Follow the next confirmed action while keeping the item in view."),
+        ("step-3", "Final check", "Verify the result and inspect the highlighted points."),
+    ])
+    steps: List[Dict[str, Any]] = []
+    for i, (sid, title, instr) in enumerate(rows):
+        step = {"id": sid, "title": title, "instruction": instr,
+                "status": "active" if i == 0 else "pending"}
+        if i == 0:
+            step["x"], step["y"] = cx, cy
+        steps.append(step)
+    return steps
 
 
 # -- Normalization helpers ----------------------------------------------------

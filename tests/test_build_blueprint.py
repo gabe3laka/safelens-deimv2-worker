@@ -125,12 +125,90 @@ def test_build_mode_returns_ainotes_and_instruction():
 
 
 def test_plan_mode_returns_plansteps_and_next_action():
-    sid = bb.start_session({"workflowMode": "plan"})["session_id"]
-    bf = _frame(sid)["blueprint_frame"]
+    intent = {"taskType": "build", "text": "assemble these", "confirmed": True}
+    sid = bb.start_session({"workflowMode": "plan", "userIntent": intent})["session_id"]
+    bf = _frame(sid, extra={"userIntent": intent})["blueprint_frame"]
     assert bf["nextAction"]
     assert len(bf["planSteps"]) == 3
     assert bf["planSteps"][0]["id"] == "step-1"
     assert bf["currentPlanStepIndex"] is not None
+
+
+# -- Plan Mode: intent-driven guidance + overlays -----------------------------
+
+def _plan_frame(intent, gesture=None, fid="f-0", sid=None):
+    if sid is None:
+        sid = bb.start_session({"workflowMode": "plan", "userIntent": intent})["session_id"]
+    bf = _frame(sid, fid=fid, mode="plan", gesture=gesture, extra={"userIntent": intent})["blueprint_frame"]
+    return sid, bf
+
+
+def test_plan_unconfirmed_asks_to_confirm():
+    intent = {"taskType": "build", "text": "assemble these", "confirmed": False}
+    _, bf = _plan_frame(intent)
+    assert bf["detectedIntent"] is None
+    assert "task goal" in bf["instruction"].lower()
+    assert len(bf["planOverlays"]) >= 1  # acceptance #3 -- overlays even when confirming
+    assert any(o["type"] == "highlight" for o in bf["planOverlays"])
+
+
+def test_plan_confirmed_build_uses_intent_and_overlays():
+    intent = {"taskType": "build", "text": "I want to assemble these pieces", "confirmed": True}
+    _, bf = _plan_frame(intent)
+    assert bf["detectedIntent"] and "assemble" in bf["detectedIntent"].lower()  # acceptance #1
+    assert bf["nextAction"] and bf["instruction"]                                # acceptance #2
+    types = {o["type"] for o in bf["planOverlays"]}                              # acceptance #3/#4
+    assert "target" in types
+    assert any(o["type"] == "arrow" and "from" in o and "to" in o for o in bf["planOverlays"])
+
+
+def test_plan_overlay_types_supported():
+    intent = {"taskType": "inspect", "text": "inspect this", "confirmed": True}
+    _, bf = _plan_frame(intent)
+    allowed = {"arrow", "target", "ghost-position", "highlight", "warning-zone"}
+    assert bf["planOverlays"] and all(o["type"] in allowed for o in bf["planOverlays"])
+    assert any(o["type"] == "target" for o in bf["planOverlays"])  # numbered inspection points
+
+
+def test_plan_high_risk_is_safety_first():
+    intent = {"taskType": "repair", "text": "fix the electrical wiring outlet", "confirmed": True}
+    _, bf = _plan_frame(intent)
+    assert "isolate" in (bf["safetyWarning"] or "").lower()      # acceptance #7
+    assert bf["importance"] == "high"
+    assert any(o["type"] == "warning-zone" for o in bf["planOverlays"])
+    assert bf["planSteps"][0]["title"].lower().startswith("isolate")
+
+
+def test_plan_repair_without_symptom_asks_symptom():
+    intent = {"taskType": "repair", "text": "fix it", "confirmed": True}
+    _, bf = _plan_frame(intent)
+    assert "symptom" in bf["instruction"].lower() or "problem" in bf["instruction"].lower()
+
+
+def test_build_mode_has_no_plan_overlays():
+    sid = bb.start_session({"workflowMode": "build"})["session_id"]
+    bf = _frame(sid)["blueprint_frame"]
+    assert bf["planOverlays"] == []          # acceptance #5 -- build still documents
+    assert bf["detectedIntent"] is None
+    assert len(bf["aiNotes"]) >= 1
+
+
+def test_plan_intent_stored_at_start_used_per_frame():
+    intent = {"taskType": "inspect", "text": "look at this", "confirmed": True}
+    sid = bb.start_session({"workflowMode": "plan", "userIntent": intent})["session_id"]
+    # frame WITHOUT userIntent in the payload -> uses the session-stored intent
+    bf = asyncio.run(bb.process_frame_async(
+        {"sessionId": sid, "frameId": "f-0", "selectedRegion": REGION, "image_b64": _crop_b64(),
+         "workflowMode": "plan"}))["blueprint_frame"]
+    assert bf["detectedIntent"] and "inspect" in bf["detectedIntent"].lower()
+    assert any(o["type"] == "target" for o in bf["planOverlays"])
+
+
+def test_replay_includes_plan_overlays():
+    intent = {"taskType": "build", "text": "assemble", "confirmed": True}
+    sid, _ = _plan_frame(intent)
+    rep = bb.get_replay(sid)  # acceptance #6 -- replay still JSON keyframes
+    assert all("planOverlays" in f for f in rep["frames"])
 
 
 # -- SAM2 safe fallback -------------------------------------------------------

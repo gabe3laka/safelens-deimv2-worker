@@ -139,6 +139,24 @@ session (set at `start` / `lock`), defaulting to `"build"`:
 - **build** — the user is doing the work; the worker documents activity into notes.
 - **plan** — the user wants guidance; the worker returns suggested steps / next actions.
 
+**Plan Mode is intent-driven.** Send `userIntent` (on `start` / `lock` or per frame):
+
+```json
+{ "workflowMode": "plan", "userIntent": { "taskType": "build", "text": "...", "confirmed": true } }
+```
+
+If `confirmed` is false (or `userIntent` is missing) the worker asks the user to
+confirm rather than guessing the task. Once confirmed it returns `detectedIntent`,
+task-specific `planSteps` / `instruction` / `nextAction` / `safetyWarning` /
+`qualityCheck`, cautious `aiNotes`, and **`planOverlays`** — visual guidance the
+app can render: `arrow` (with `from`/`to`), `target`, `highlight`,
+`ghost-position`, `warning-zone`. `taskType`
+(`identify` | `inspect` | `build`/`assemble` | `repair`/`troubleshoot`) controls
+the guidance, and electrical / high-risk wording triggers safety-first warnings
+(isolate / de-energize, qualified handling) — never live-electrical instructions.
+This is rule-based (no VLM/LLM): mask center = main object, anchors = inspection
+points, hand/pinch = active work point, low confidence = ask for clarification.
+
 Segmentation is config-driven and CPU-only by default:
 
 | Env | Default | Notes |
