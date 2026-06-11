@@ -125,6 +125,33 @@ Structured errors look like `{ "ok": false, "error": "<code>" }` — e.g.
 Build Mode is **not** Gaussian splatting, a dense point cloud, a full 3D scan,
 server-side MediaPipe, or video storage (those are explicitly out of scope).
 
+### BlueprintFrame v2 (Build / Plan workflow)
+
+`/build/session/frame` returns a **BlueprintFrame v2**. All v1 fields are kept
+and every v2 field is optional, so the old app contract still works. New fields:
+`version`, `workflowMode` (`"build"` | `"plan"`, default `"build"`),
+`maskContour` + `maskSource`, `sourceAssetId`, rule-based `aiNotes` /
+`instruction` / `nextAction` / `safetyWarning` / `qualityCheck` /
+`activityLabel` / `importance`, and (Plan mode) `planSteps` +
+`currentPlanStepIndex`. `workflowMode` resolves from the payload, then the
+session (set at `start` / `lock`), defaulting to `"build"`:
+
+- **build** — the user is doing the work; the worker documents activity into notes.
+- **plan** — the user wants guidance; the worker returns suggested steps / next actions.
+
+Segmentation is config-driven and CPU-only by default:
+
+| Env | Default | Notes |
+|-----|---------|-------|
+| `BUILD_SEGMENTATION_BACKEND` | `fallback` | `none` \| `fallback` (Canny contour) \| `sam2` (optional, lazy) |
+| `BUILD_MASK_OUTPUT` | `contour` | `contour` \| `mask_thumbnail` \| `none` |
+| `BUILD_SEGMENT_ON_EXTRACT` | `true` | segment on extraction frames |
+| `BUILD_SEGMENT_EVERY_N` | `3` | otherwise segment every Nth frame and reuse the mask in between |
+
+SAM2 is **optional and never a hard dependency**: when `BUILD_SEGMENTATION_BACKEND=sam2`
+and SAM2 is unavailable, the worker logs and falls back to the contour pipeline.
+Keep SAM2 disabled until the fallback is proven stable.
+
 ## Docker image
 
 Built and pushed to GitHub Container Registry on every push to `main`:

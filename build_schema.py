@@ -60,6 +60,31 @@ class GestureOut(BaseModel):
     strength: Optional[float] = None
 
 
+class BlueprintNote(BaseModel):
+    """A single rule-based AI note placed at a normalized point on the crop."""
+
+    id: str
+    type: str  # instruction | safety | quality | observation | next-step | intent
+    text: str
+    x: float
+    y: float
+    timestampMs: int = 0
+    confidence: Optional[float] = None
+
+
+class PlanStep(BaseModel):
+    """A single suggested step for workflowMode == 'plan'."""
+
+    id: str
+    title: str
+    instruction: str
+    x: Optional[float] = None
+    y: Optional[float] = None
+    status: str = "pending"  # pending | active | completed | skipped
+    safetyNote: Optional[str] = None
+    qualityCheck: Optional[str] = None
+
+
 class BlueprintFrame(BaseModel):
     """The replayable per-frame blueprint returned inside `blueprint_frame`.
 
@@ -76,3 +101,24 @@ class BlueprintFrame(BaseModel):
     handLandmarks: List[Point] = Field(default_factory=list)
     stepMarkers: List[StepMarker] = Field(default_factory=list)
     gesture: GestureOut = Field(default_factory=GestureOut)
+
+    # -- v2 / Build-Plan fields (all optional -- old app contract still works) --
+    version: Optional[int] = 2
+    workflowMode: Optional[str] = "build"
+    sourceAssetId: Optional[str] = None
+
+    sourceMaskB64: Optional[str] = None
+    maskSource: Optional[str] = None
+    maskContour: List[Point] = Field(default_factory=list)
+
+    instruction: Optional[str] = None
+    aiNotes: List[BlueprintNote] = Field(default_factory=list)
+    nextAction: Optional[str] = None
+    safetyWarning: Optional[str] = None
+    qualityCheck: Optional[str] = None
+    activityLabel: Optional[str] = None
+    detectedIntent: Optional[str] = None
+    importance: Optional[str] = None
+
+    planSteps: List[PlanStep] = Field(default_factory=list)
+    currentPlanStepIndex: Optional[int] = None

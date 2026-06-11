@@ -114,6 +114,15 @@ ENV EDGECRAFTER_POSE_CONFIG="/opt/EdgeCrafter/ecpose/configs/ecpose/ecpose_s_coc
 ENV EDGECRAFTER_POSE_CHECKPOINT_URL="https://github.com/capsule2077/edgecrafter/releases/download/edgecrafterv1/ecpose_s.pth"
 ENV EDGECRAFTER_POSE_CHECKPOINT_PATH="/runpod-volume/models/edgecrafter/ecpose_s.pth"
 
+# ------- Build Mode (lightweight blueprint processing; CPU-only) -------------
+# Initial deployment uses the fallback contour pipeline so the image works
+# WITHOUT SAM2 installed. Switch BUILD_SEGMENTATION_BACKEND to "sam2" (and set
+# BUILD_SAM2_DEVICE / checkpoint) only after the fallback is proven stable.
+ENV BUILD_SEGMENTATION_BACKEND="fallback"
+ENV BUILD_MASK_OUTPUT="contour"
+ENV BUILD_SEGMENT_ON_EXTRACT="true"
+ENV BUILD_SEGMENT_EVERY_N="3"
+
 # ------- DEIMv2 (legacy fallback) configuration ------------------------------
 ENV DEIMV2_DEVICE="cuda"
 ENV DEIMV2_BACKEND="official-deimv2-hf"
