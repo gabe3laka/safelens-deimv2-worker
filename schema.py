@@ -106,6 +106,29 @@ class Pose(BaseModel):
     )
 
 
+class SegPoint(BaseModel):
+    """A single normalized contour point (0..1 on the original image)."""
+
+    x: float
+    y: float
+
+
+class Segment(BaseModel):
+    """Optional instance-segmentation contour (e.g. YOLO26 seg task).
+
+    Additive field -- the app may ignore it. Only populated when the active
+    backend has a seg task enabled.
+    """
+
+    label: str = Field("", description="COCO class name")
+    class_id: int = Field(-1, description="COCO class index")
+    confidence: float = Field(0.0, description="Instance confidence")
+    maskContour: List[SegPoint] = Field(
+        default_factory=list, description="Normalized 0..1 polygon points"
+    )
+    source: Optional[str] = Field(None, description="Producer tag, e.g. 'yolo26-seg'")
+
+
 class InferResponse(BaseModel):
     """Payload returned to Eagle Vision 2.
 
@@ -115,9 +138,13 @@ class InferResponse(BaseModel):
 
     entities: List[Entity] = Field(default_factory=list)
     poses: List[Pose] = Field(default_factory=list)
+    segments: List[Segment] = Field(
+        default_factory=list,
+        description="Optional instance-seg contours (additive; app may ignore).",
+    )
     inference_ms: float = Field(0.0, description="Wall-clock inference time in ms")
-    model: str = Field("", description="Model identifier, e.g. 'EdgeCrafter'")
-    backend: str = Field("", description="Active backend: 'edgecrafter' | 'deimv2'")
+    model: str = Field("", description="Model identifier, e.g. 'YOLO26' | 'EdgeCrafter'")
+    backend: str = Field("", description="Active backend: 'yolo26' | 'edgecrafter' | 'deimv2'")
     tasks: List[str] = Field(
         default_factory=list, description="Active tasks, e.g. ['det', 'pose']"
     )

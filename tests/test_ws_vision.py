@@ -347,6 +347,12 @@ def server_mod():
     os.environ["VISION_BACKEND"] = "edgecrafter"
     os.environ["EDGECRAFTER_TASKS"] = "det,pose"
     os.environ["WS_METRICS_INTERVAL_S"] = "0.2"
+    # Clear backend state left behind by other test files (e.g. legacy
+    # /debug/model-load tests can REALLY load yolo26 when ultralytics is
+    # installed locally), so this file's edgecrafter env actually applies.
+    import vision_backend
+    vision_backend._BACKEND_STATE.update(
+        requested=None, active=None, fallback_active=False, fallback_reason=None)
     if "server" in sys.modules:
         del sys.modules["server"]
     return importlib.import_module("server")

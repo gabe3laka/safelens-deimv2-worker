@@ -213,10 +213,20 @@ def test_replay_includes_plan_overlays():
 
 # -- SAM2 safe fallback -------------------------------------------------------
 
+def _force_sam2_unavailable(monkeypatch):
+    """Deterministically simulate 'SAM2 not installed' regardless of the local
+    environment (ultralytics may be installed in dev/CI sandboxes)."""
+    import build_segmentation
+    monkeypatch.setattr(build_segmentation, "_load_sam2", lambda: None)
+    monkeypatch.setitem(build_segmentation._SAM2_STATE, "loaded", False)
+    monkeypatch.setitem(build_segmentation._SAM2_STATE, "predictor", None)
+
+
 def test_sam2_unavailable_falls_back_safely(monkeypatch):
     monkeypatch.setenv("BUILD_SEGMENTATION_BACKEND", "sam2")
+    _force_sam2_unavailable(monkeypatch)
     sid = bb.start_session({})["session_id"]
-    bf = _frame(sid)["blueprint_frame"]  # SAM2 not installed -> must not crash
+    bf = _frame(sid)["blueprint_frame"]  # SAM2 unavailable -> must not crash
     assert bf["maskSource"] in ("fallback-contour", "none")
     assert bf["version"] == 2
 
@@ -257,7 +267,7 @@ def test_segment_crop_sam2_unavailable_returns_fallback(monkeypatch):
     import numpy as np
     import build_segmentation
     monkeypatch.setenv("BUILD_SEGMENTATION_BACKEND", "sam2")
-    build_segmentation._SAM2_STATE.update({"loaded": False, "predictor": None, "error": None})
+    _force_sam2_unavailable(monkeypatch)
     out = build_segmentation.segment_crop(np.zeros((64, 64, 3), dtype=np.uint8), frame_index=0)
     assert out["ok"] is False
     assert out["mask_source"] == "fallback-contour"
@@ -265,7 +275,8 @@ def test_segment_crop_sam2_unavailable_returns_fallback(monkeypatch):
 
 
 def test_frame_falls_back_when_sam2_missing(monkeypatch):
-    monkeypatch.setenv("BUILD_SEGMENTATION_BACKEND", "sam2")  # no package installed
+    monkeypatch.setenv("BUILD_SEGMENTATION_BACKEND", "sam2")
+    _force_sam2_unavailable(monkeypatch)
     sid = bb.start_session({})["session_id"]
     r = _frame(sid)
     assert r["ok"] is True                      # acceptance #5 -- never 500 on missing SAM2

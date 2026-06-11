@@ -5,8 +5,9 @@ Architecture: long-running HTTP server (RunPod load-balancing endpoint mode).
 Pattern: adapted from Kingo333/fluxrt-serverless.
 
 Backends (selected via VISION_BACKEND):
-    edgecrafter (default) -> EdgeCrafter ECDet-S boxes + optional ECPose-S poses
-    deimv2      (fallback) -> legacy DEIMv2 boxes only
+    yolo26      (default)  -> YOLO26 boxes + poses (+ optional seg)
+    edgecrafter (fallback) -> EdgeCrafter ECDet-S boxes + optional ECPose-S poses
+    deimv2      (legacy)   -> DEIMv2 boxes only (debug)
 
 Routes
 ------
@@ -58,7 +59,15 @@ WARMUP_TIMEOUT_S = int(os.getenv("WARMUP_TIMEOUT_S", "600"))
 STARTUP_LOG_PATH = Path(os.getenv("STARTUP_LOG", "/tmp/safelens_startup.log"))
 
 def _active_backend():
-    return os.getenv("VISION_BACKEND", "edgecrafter").strip().lower()
+    return os.getenv("VISION_BACKEND", "yolo26").strip().lower()
+
+def _backend_status_safe():
+    """vision_backend.backend_status(), guarded so debug routes never crash."""
+    try:
+        from vision_backend import backend_status
+        return backend_status()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": type(exc).__name__ + ": " + str(exc)}
 
 # -- State --------------------------------------------------------------------
 
@@ -352,6 +361,7 @@ async def debug_startup(deep: bool = Query(False)):
             info["diagnostics"] = _collect_import_diagnostics()
         except Exception as exc:
             info["diagnostics_error"] = type(exc).__name__ + ": " + str(exc)
+        info["backend_status"] = _backend_status_safe()
 
     return JSONResponse(info)
 
@@ -395,11 +405,22 @@ async def debug_state():
         "ok": True,
         "worker_version": WORKER_VERSION,
         "backend": _active_backend(),
+        "backend_status": _backend_status_safe(),
         "skip_warmup": SKIP_WARMUP,
         "auto_warmup": AUTO_WARMUP,
         "state": _public_state(),
         "env_subset": {
             "VISION_BACKEND": os.getenv("VISION_BACKEND", ""),
+            "FALLBACK_VISION_BACKEND": os.getenv("FALLBACK_VISION_BACKEND", ""),
+            "AUTO_BACKEND_FALLBACK": os.getenv("AUTO_BACKEND_FALLBACK", ""),
+            "YOLO26_MODEL_ID": os.getenv("YOLO26_MODEL_ID", ""),
+            "YOLO26_SEG_MODEL_ID": os.getenv("YOLO26_SEG_MODEL_ID", ""),
+            "YOLO26_POSE_MODEL_ID": os.getenv("YOLO26_POSE_MODEL_ID", ""),
+            "YOLO26_TASKS": os.getenv("YOLO26_TASKS", ""),
+            "YOLO26_DEVICE": os.getenv("YOLO26_DEVICE", ""),
+            "YOLO26_IMG_SIZE": os.getenv("YOLO26_IMG_SIZE", ""),
+            "YOLO26_CONF": os.getenv("YOLO26_CONF", ""),
+            "YOLO26_CACHE_DIR": os.getenv("YOLO26_CACHE_DIR", ""),
             "EDGECRAFTER_TASKS": os.getenv("EDGECRAFTER_TASKS", ""),
             "EDGECRAFTER_DEVICE": os.getenv("EDGECRAFTER_DEVICE", ""),
             "EDGECRAFTER_IMG_SIZE": os.getenv("EDGECRAFTER_IMG_SIZE", ""),
@@ -610,9 +631,24 @@ def _ws_run_inference(image_b64, conf, img_size, class_filter):
     )
 
 def _ws_active_tasks():
-    """Active EdgeCrafter tasks, with a torch-free fallback to the env parse."""
-    if _active_backend() == "deimv2":
+    """Active tasks for the SERVING backend, with torch-free env fallbacks."""
+    try:
+        from vision_backend import serving_backend
+        backend = serving_backend()
+    except Exception:
+        backend = _active_backend()
+    if backend == "deimv2":
         return ["det"]
+    if backend == "yolo26":
+        try:
+            import yolo26_loader
+            return (list(yolo26_loader._STATE.loaded_tasks)
+                    or yolo26_loader.parse_tasks())
+        except Exception:
+            raw = os.getenv("YOLO26_TASKS", "det,pose")
+            out = [t.strip().lower() for t in raw.split(",")
+                   if t.strip().lower() in ("det", "seg", "pose")]
+            return out or ["det"]
     try:
         import edgecrafter_loader as ec
         return list(ec._STATE.tasks) if ec._STATE.tasks else ec.parse_tasks()

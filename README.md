@@ -1,6 +1,31 @@
 # safelens-deimv2-worker
 
-SafeLens DEIMv2 detection worker for RunPod -- live HTTP server mode.
+SafeLens vision worker for RunPod -- live HTTP server mode.
+
+## Vision backends (YOLO26 default, EdgeCrafter fallback)
+
+| Backend | Role | Selected by |
+|---------|------|-------------|
+| **YOLO26** (Ultralytics) | **default** -- boxes + poses (+ optional seg) | `VISION_BACKEND=yolo26` (default) |
+| EdgeCrafter (ECDet-S / ECPose-S) | fallback | `VISION_BACKEND=edgecrafter` or automatic |
+| DEIMv2 | legacy / debug only | `VISION_BACKEND=deimv2` |
+
+If the requested backend fails to **load** and `AUTO_BACKEND_FALLBACK=true`
+(default), the worker automatically serves `FALLBACK_VISION_BACKEND`
+(default `edgecrafter`). The actually-serving backend is visible in
+`GET /debug/state` (`backend_status`) and in the `/detect` response
+(`backend` field + a `backend_fallback: ...` `warning`). The app-facing
+contract is unchanged: `entities` (normalized 0..1 `bbox` x/y/w/h), `poses`
+(COCO-17 keypoints), `backend`, `tasks`, `model`, `inference_ms`,
+`img_w`/`img_h` -- plus an optional additive `segments` list
+(`{maskContour, source: "yolo26-seg"}`) when the YOLO26 seg task is enabled.
+
+YOLO26 env: `YOLO26_MODEL_ID` / `YOLO26_SEG_MODEL_ID` / `YOLO26_POSE_MODEL_ID`
+(default `yolo26n*.pt`), `YOLO26_TASKS` (default `det,pose`; add `seg` to
+enable contours), `YOLO26_DEVICE`, `YOLO26_IMG_SIZE`, `YOLO26_CONF`,
+`YOLO26_CACHE_DIR` (default `/runpod-volume/models/yolo26`). Weights are
+best-effort pre-baked into `/app/models/yolo26` and otherwise resolved from the
+cache dir or auto-downloaded by Ultralytics into it.
 
 ## Architecture
 

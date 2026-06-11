@@ -2,12 +2,16 @@
 # safelens-deimv2-worker/Dockerfile
 # Builds the SafeLens vision live-server worker for RunPod load-balancing endpoints.
 #
-# Default backend: EdgeCrafter (ECDet-S boxes + optional ECPose-S poses).
-# Legacy fallback: DEIMv2 (VISION_BACKEND=deimv2).
+# Default backend:  YOLO26 (Ultralytics; boxes + poses, optional seg).
+# Fallback backend: EdgeCrafter (ECDet-S boxes + optional ECPose-S poses),
+#                   served automatically when YOLO26 fails to load and
+#                   AUTO_BACKEND_FALLBACK=true.
+# Legacy debug:     DEIMv2 (VISION_BACKEND=deimv2).
 #
 # Architecture: long-running FastAPI/uvicorn server (adapted from Kingo333/fluxrt-serverless).
-# Model weights are NOT baked in -- EdgeCrafter checkpoints are downloaded at
-# runtime into EDGECRAFTER_CACHE_DIR (a RunPod volume); DEIMv2 weights come from HF Hub.
+# YOLO26 weights are best-effort pre-baked into /app/models/yolo26 and otherwise
+# cached at runtime in YOLO26_CACHE_DIR (RunPod volume); EdgeCrafter checkpoints
+# download at runtime into EDGECRAFTER_CACHE_DIR; DEIMv2 weights come from HF Hub.
 #
 # RunPod endpoint type: HTTP (load-balancing), not serverless queue.
 # Health probe: GET /health or GET /ping (returns immediately, no model required).
@@ -71,20 +75,73 @@ assert Version("0.26.0") <= v < Version("1.0"), f"bad huggingface-hub version: {
 print("huggingface-hub OK:", v)
 PY
 
+# ---- YOLO26 (Ultralytics) -- default vision backend ---------------------------
+# Install pattern encodes the fb426cb / ddb143c lessons:
+#  * record the working baseline FIRST, then assert it is byte-for-byte
+#    unchanged after the install (never assert a hardcoded torch version -- the
+#    working stack is torch 2.5.1+cu124 after the upstream requirement installs)
+#  * NEVER uninstall/reinstall OpenCV (opencv-python and -headless share cv2/)
+# The fb426cb build log proved a full `pip install ultralytics` leaves
+# torch/cv2/numpy/huggingface-hub untouched (it only adds matplotlib/polars/
+# thop/etc.), and YOLO needs those extras importable at runtime.
+RUN python - <<'PY'
+import json
+import torch, torchvision, cv2, numpy, huggingface_hub
+baseline = {
+    "torch": torch.__version__,
+    "torchvision": torchvision.__version__,
+    "cv2": cv2.__version__,
+    "numpy": numpy.__version__,
+    "huggingface_hub": huggingface_hub.__version__,
+}
+with open("/opt/yolo_dep_baseline.json", "w") as fh:
+    json.dump(baseline, fh)
+print("dependency baseline recorded:", baseline)
+PY
+RUN pip install --no-cache-dir ultralytics
+RUN python - <<'PY'
+import json, sys
+import torch, torchvision, cv2, numpy, huggingface_hub
+baseline = json.load(open("/opt/yolo_dep_baseline.json"))
+current = {
+    "torch": torch.__version__,
+    "torchvision": torchvision.__version__,
+    "cv2": cv2.__version__,
+    "numpy": numpy.__version__,
+    "huggingface_hub": huggingface_hub.__version__,
+}
+assert current == baseline, f"ultralytics changed the stack: {baseline} -> {current}"
+import ultralytics  # noqa: F401
+# EdgeCrafter fallback must still import after the YOLO install.
+sys.path.insert(0, "/opt/EdgeCrafter/ecdetseg")
+from engine.core import YAMLConfig  # noqa: F401
+print("stack preserved + ultralytics", ultralytics.__version__,
+      "+ EdgeCrafter engine import OK")
+PY
+
+# Best-effort: pre-bake YOLO26 weights so RunPod cold starts need no download
+# (runtime falls back to YOLO26_CACHE_DIR on the volume, then auto-download).
+# Never fails the build -- the worker degrades per task and can auto-fall back
+# to EdgeCrafter via AUTO_BACKEND_FALLBACK.
+RUN mkdir -p /app/models/yolo26 && cd /app/models/yolo26 && python - <<'PY'
+from ultralytics import YOLO
+for mid in ("yolo26n.pt", "yolo26n-pose.pt"):
+    try:
+        YOLO(mid)  # bare ids download into CWD (/app/models/yolo26)
+        print("YOLO26 weights baked:", mid)
+    except Exception as e:  # noqa: BLE001
+        print("WARN: could not pre-bake", mid, "->", type(e).__name__, e)
+PY
+
 # ---- Optional SAM2 runtime support ------------------------------------------
-# SAM2 code paths exist in build_segmentation.py, but SAM2 dependencies are NOT
-# installed in the main production image (two failed attempts: fb426cb broke
-# cv2 via an OpenCV uninstall; ddb143c's verify step exposed that the upstream
-# EdgeCrafter/DEIMv2 requirement installs leave torch at 2.5.1+cu124, so a
-# "torch unchanged" assertion can never hold here). This keeps the fallback
-# image stable. Use a separate experimental SAM2 image later. The
-# BUILD_SAM2_DEVICE / BUILD_SAM2_WEIGHTS env defaults live in the Build Mode
-# env block below; with no SAM2 package installed, build_segmentation degrades
-# to ok=False / "fallback-contour" and Build/Plan keeps working.
+# SAM2 code paths exist in build_segmentation.py, but dedicated SAM2 weights /
+# packages are NOT part of this image's contract; Build Mode defaults to the
+# fallback contour pipeline (BUILD_SEGMENTATION_BACKEND=fallback below).
 
 # Copy worker code
 COPY schema.py /app/schema.py
 COPY edgecrafter_loader.py /app/edgecrafter_loader.py
+COPY yolo26_loader.py /app/yolo26_loader.py
 COPY vision_backend.py /app/vision_backend.py
 COPY deimv2_infer.py /app/deimv2_infer.py
 COPY official_deimv2_loader.py /app/official_deimv2_loader.py
@@ -113,8 +170,29 @@ ENV WARMUP_TIMEOUT_S="600"
 ENV STARTUP_LOG="/tmp/safelens_startup.log"
 
 # ------- Vision backend selection --------------------------------------------
+# yolo26 (default) | edgecrafter (fallback) | deimv2 (legacy debug). If the
+# requested backend fails to LOAD and AUTO_BACKEND_FALLBACK=true, the worker
+# automatically serves FALLBACK_VISION_BACKEND instead (visible in /debug/state
+# and the /detect `warning` field).
+ENV FALLBACK_VISION_BACKEND="edgecrafter"
+ENV AUTO_BACKEND_FALLBACK="true"
+
+# ------- YOLO26 configuration --------------------------------------------------
+ENV YOLO26_MODEL_ID="yolo26n.pt"
+ENV YOLO26_SEG_MODEL_ID="yolo26n-seg.pt"
+ENV YOLO26_POSE_MODEL_ID="yolo26n-pose.pt"
+ENV YOLO26_TASKS="det,pose"
+ENV YOLO26_DEVICE="cuda"
+ENV YOLO26_IMG_SIZE="640"
+ENV YOLO26_CONF="0.25"
+ENV YOLO26_CACHE_DIR="/runpod-volume/models/yolo26"
+# Ultralytics container hardening: writable config dir; never pip at runtime.
+ENV YOLO_CONFIG_DIR="/tmp/Ultralytics"
+ENV YOLO_AUTOINSTALL="false"
+
+# ------- (legacy comment) ------------------------------------------------------
 # edgecrafter (default) | deimv2 (legacy fallback)
-ENV VISION_BACKEND="edgecrafter"
+ENV VISION_BACKEND="yolo26"
 
 # ------- EdgeCrafter configuration -------------------------------------------
 ENV EDGECRAFTER_TASKS="det,pose"
