@@ -82,6 +82,11 @@ COPY ws_vision.py /app/ws_vision.py
 COPY bootstrap.py /app/bootstrap.py
 COPY handler.py /app/handler.py
 
+# Build Mode (Build/Plan v2) modules -- required by server.py's /build routes.
+COPY build_schema.py /app/build_schema.py
+COPY build_blueprint.py /app/build_blueprint.py
+COPY build_segmentation.py /app/build_segmentation.py
+
 # Worker code + upstream engine packages on PYTHONPATH. The EdgeCrafter ecdetseg
 # and ecpose subtrees each ship their own engine package; edgecrafter_loader.py
 # manages which one is active at import time, so we only add /app + /opt/DEIMv2
