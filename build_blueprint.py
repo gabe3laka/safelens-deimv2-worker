@@ -116,6 +116,9 @@ def start_session(payload: Dict[str, Any]) -> Dict[str, Any]:
         "pinch_prev": False,
         "last_index": None,
         "user_intent": payload.get("userIntent") or payload.get("user_intent"),
+        "last_mask_contour": None,
+        "last_mask_source": None,
+        "last_mask_frame": None,
     }
     return {
         "ok": True,
@@ -260,12 +263,8 @@ async def process_frame_async(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     if should_segment:
-        prompt_point = [
-            _clamp(index_local[0]) if index_local else 0.5,
-            _clamp(index_local[1]) if index_local else 0.5,
-        ]
         try:
-            geom = await asyncio.to_thread(_segment_geometry, image_bytes, region, cfg, prompt_point)
+            geom = await asyncio.to_thread(_segment_geometry, image_bytes, region, cfg, frame_index)
         except BuildError:
             raise
         except Exception as exc:  # noqa: BLE001 -- a bad frame must not crash the worker
@@ -274,6 +273,10 @@ async def process_frame_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         geom["id"] = payload.get("sourceAssetId") or (prior or {}).get("id") or ("asset_" + uuid.uuid4().hex[:12])
         geom["updatedAtFrame"] = frame_id
         sess["source_asset"] = geom
+        # Lightweight per-session mask memory (JSON only, never an image).
+        sess["last_mask_contour"] = geom.get("maskContour", [])
+        sess["last_mask_source"] = geom.get("maskSource", "none")
+        sess["last_mask_frame"] = frame_id
     else:
         geom = prior  # reuse the previous mask/geometry (JSON, no image work)
 
@@ -334,7 +337,7 @@ async def process_frame_async(payload: Dict[str, Any]) -> Dict[str, Any]:
 # -- Geometry / segmentation (runs in a worker thread) ------------------------
 
 def _segment_geometry(image_bytes: bytes, region: Dict[str, float], cfg: Dict[str, Any],
-                      prompt_point: List[float]) -> Dict[str, Any]:
+                      frame_index: int = 0) -> Dict[str, Any]:
     """Decode + segment the crop. SAM2 if enabled+available, else Canny contour."""
     import cv2
     import numpy as np
@@ -378,10 +381,15 @@ def _segment_geometry(image_bytes: bytes, region: Dict[str, float], cfg: Dict[st
 
     backend = cfg["backend"]
     if backend == "sam2":
+        # Use the Canny bbox (pixels) as a SAM2 box prompt when available.
+        prompt_box = None
+        if best is not None:
+            bx0, by0, bw0, bh0 = cv2.boundingRect(best)
+            prompt_box = [bx0, by0, bx0 + bw0, by0 + bh0]
         seg = {"ok": False}
         try:
             import build_segmentation
-            seg = build_segmentation.segment_crop(img, prompt={"point": prompt_point})
+            seg = build_segmentation.segment_crop(img, prompt_box=prompt_box, frame_index=frame_index)
         except Exception as exc:  # noqa: BLE001 -- SAM2 must never break the frame
             log.warning("build: sam2 call failed, using fallback: %s", exc)
         if seg.get("ok") and seg.get("mask_contour"):

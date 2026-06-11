@@ -234,3 +234,76 @@ def test_replay_returns_v2_frames():
     assert rep["frames"][0]["workflowMode"] == "plan"
     # JSON only -- no raw image bytes stored in replay frames.
     assert "image_b64" not in rep["frames"][0]
+
+
+# -- SAM2 segmentation (optional; safe fallback) ------------------------------
+
+def _fake_sam2_ok(image_bgr, *, prompt_box=None, session=None, frame_index=0):
+    return {"ok": True, "mask_source": "sam2", "mask_b64": None, "confidence": 0.85,
+            "error": None, "mask_contour": [
+                {"x": 0.20, "y": 0.30}, {"x": 0.55, "y": 0.28},
+                {"x": 0.58, "y": 0.70}, {"x": 0.24, "y": 0.72}]}
+
+
+def test_segment_crop_disabled_returns_fallback(monkeypatch):
+    import numpy as np
+    import build_segmentation
+    monkeypatch.setenv("BUILD_SEGMENTATION_BACKEND", "fallback")
+    out = build_segmentation.segment_crop(np.zeros((64, 64, 3), dtype=np.uint8))
+    assert out["ok"] is False and out["mask_source"] == "fallback-contour"
+
+
+def test_segment_crop_sam2_unavailable_returns_fallback(monkeypatch):
+    import numpy as np
+    import build_segmentation
+    monkeypatch.setenv("BUILD_SEGMENTATION_BACKEND", "sam2")
+    build_segmentation._SAM2_STATE.update({"loaded": False, "predictor": None, "error": None})
+    out = build_segmentation.segment_crop(np.zeros((64, 64, 3), dtype=np.uint8), frame_index=0)
+    assert out["ok"] is False
+    assert out["mask_source"] == "fallback-contour"
+    assert out["error"]  # e.g. "sam2_unavailable"
+
+
+def test_frame_falls_back_when_sam2_missing(monkeypatch):
+    monkeypatch.setenv("BUILD_SEGMENTATION_BACKEND", "sam2")  # no package installed
+    sid = bb.start_session({})["session_id"]
+    r = _frame(sid)
+    assert r["ok"] is True                      # acceptance #5 -- never 500 on missing SAM2
+    bf = r["blueprint_frame"]
+    assert bf["version"] == 2
+    assert bf["maskSource"] in ("fallback-contour", "none")
+
+
+def test_sam2_success_sets_masksource_contour_and_outline(monkeypatch):
+    import build_segmentation
+    monkeypatch.setenv("BUILD_SEGMENTATION_BACKEND", "sam2")
+    monkeypatch.setattr(build_segmentation, "segment_crop", _fake_sam2_ok)
+    sid = bb.start_session({})["session_id"]
+    bf = _frame(sid)["blueprint_frame"]
+    assert bf["maskSource"] == "sam2"                         # acceptance #6
+    assert len(bf["maskContour"]) >= 3                         # acceptance #7
+    for p in bf["maskContour"]:                                # normalized 0..1
+        assert 0.0 <= p["x"] <= 1.0 and 0.0 <= p["y"] <= 1.0
+    assert bf["outline"] == bf["maskContour"]                  # outline uses the mask
+    assert len(bf["anchors"]) >= 1                             # anchors from mask geometry
+
+
+def test_sam2_plan_mode_still_guides(monkeypatch):
+    import build_segmentation
+    monkeypatch.setenv("BUILD_SEGMENTATION_BACKEND", "sam2")
+    monkeypatch.setattr(build_segmentation, "segment_crop", _fake_sam2_ok)
+    intent = {"taskType": "inspect", "text": "inspect this", "confirmed": True}
+    sid = bb.start_session({"workflowMode": "plan", "userIntent": intent})["session_id"]
+    bf = _frame(sid, mode="plan", extra={"userIntent": intent})["blueprint_frame"]
+    assert bf["maskSource"] == "sam2"
+    assert len(bf["planSteps"]) >= 1 and bf["planOverlays"]    # acceptance #8/#10
+
+
+def test_detect_unaffected_by_build_mode():
+    from fastapi.testclient import TestClient
+    import server
+    server._start_warmup_background = lambda: None  # avoid spawning a warmup thread
+    client = TestClient(server.app)
+    img = base64.b64encode(b"\xff\xd8\xff\xe0jpg").decode()
+    r = client.post("/detect", json={"image_b64": img})
+    assert r.status_code == 503 and r.json()["error"] == "model_not_ready"  # acceptance #1
