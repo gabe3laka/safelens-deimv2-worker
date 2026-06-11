@@ -1,33 +1,37 @@
 """
 yolo26_loader.py -- YOLO26 (Ultralytics) backend adapter for the SafeLens worker.
 
-Default vision backend as of the yolo26 migration:
+Default vision backend, used in TASK-BASED MODES (never one heavy model doing
+everything on every frame):
 
-    VISION_BACKEND=yolo26 (default) -> this adapter
-    VISION_BACKEND=edgecrafter      -> EdgeCrafter fallback (unchanged)
-    VISION_BACKEND=deimv2           -> legacy debug fallback (unchanged)
+    live  (/detect HSE loop)        -> YOLO26_LIVE_TASKS  (default: det)
+    build (/build/session/frame)    -> YOLO26_BUILD_TASKS (default: det,seg)
+    plan  (/build/session/frame)    -> YOLO26_PLAN_TASKS  (default: det,seg)
+    pose                            -> opt-in only (YOLO26_POSE_ENABLED=true or
+                                       an explicit 'pose' in a task list)
 
-The adapter keeps the exact app-facing output contract used by /detect:
-entities (normalized 0..1 bbox x/y/w/h), poses (COCO-17 keypoints, normalized),
-plus an OPTIONAL `segments` list ({maskContour, source: "yolo26-seg"}) when the
-seg task is enabled -- additive only, the app may ignore it.
+Loading strategy: warmup loads ONLY the live-task models (det by default).
+seg/pose models are lazy-loaded the first time a mode needs them and cached in
+memory. A seg/pose load failure drops that task gracefully; a det load failure
+raises so vision_backend can auto-fall back to EdgeCrafter.
 
-Model ids are env-configurable so the same adapter keeps working whether the
-installed Ultralytics ships true YOLO26 weights or only an earlier YOLO family
-(set YOLO26_MODEL_ID etc. to any available .pt). Weights are resolved from:
+The app-facing /detect contract is unchanged: entities (normalized 0..1 bbox
+x/y/w/h), poses (COCO-17), backend/tasks/model/inference_ms/img_w/img_h.
+Optional additive fields only (source, segments/maskContour).
+
+Model ids are env-configurable (YOLO26_DET_MODEL_ID / _SEG_ / _POSE_; legacy
+YOLO26_MODEL_ID still honored) so compatible Ultralytics ids can be used while
+keeping the backend name "yolo26". Weights resolve from:
   1. YOLO26_CACHE_DIR/<model_id>     (RunPod volume cache)
   2. /app/models/yolo26/<model_id>   (baked into the image, optional)
   3. bare model id                   (Ultralytics auto-download into the cache)
-
-Failure policy: the 'det' model is required -- a det load failure raises so
-vision_backend can auto-fall back to EdgeCrafter. 'seg'/'pose' failures only
-drop that task (recorded in the load summary) and never sink the backend.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -49,22 +53,48 @@ def _model_id(task):
         return _env("YOLO26_SEG_MODEL_ID", "yolo26n-seg.pt")
     if task == "pose":
         return _env("YOLO26_POSE_MODEL_ID", "yolo26n-pose.pt")
-    return _env("YOLO26_MODEL_ID", "yolo26n.pt")
+    # det: new name first, legacy YOLO26_MODEL_ID still honored.
+    return _env("YOLO26_DET_MODEL_ID", "") or _env("YOLO26_MODEL_ID", "yolo26n.pt")
 
 
-def parse_tasks(value=None):
-    """Parse YOLO26_TASKS into an ordered, de-duplicated task list.
+def pose_enabled():
+    return _env("YOLO26_POSE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
-    Supports det, seg, pose. Defaults to "det,pose" -- boxes and poses are the
-    required first outputs; seg is opt-in (YOLO26_TASKS=det,seg,pose).
-    """
-    raw = value if value is not None else _env("YOLO26_TASKS", "det,pose")
+
+def _parse_task_list(raw, default):
     out = []
-    for tok in raw.split(","):
+    for tok in (raw or default).split(","):
         t = tok.strip().lower()
         if t in ("det", "seg", "pose") and t not in out:
             out.append(t)
     return out or ["det"]
+
+
+def mode_tasks(mode="live"):
+    """Task list for a mode. pose only with YOLO26_POSE_ENABLED or explicit."""
+    if mode == "build":
+        tasks = _parse_task_list(_env("YOLO26_BUILD_TASKS"), "det,seg")
+    elif mode == "plan":
+        tasks = _parse_task_list(_env("YOLO26_PLAN_TASKS"), "det,seg")
+    else:  # live -- legacy YOLO26_TASKS honored as an alias
+        tasks = _parse_task_list(_env("YOLO26_LIVE_TASKS") or _env("YOLO26_TASKS"), "det")
+        if pose_enabled() and "pose" not in tasks:
+            tasks.append("pose")
+    if "pose" in tasks and not pose_enabled():
+        # explicit 'pose' in the env list counts as opting in for that mode
+        explicit = "pose" in (_env({"build": "YOLO26_BUILD_TASKS",
+                                    "plan": "YOLO26_PLAN_TASKS"}.get(mode, "YOLO26_LIVE_TASKS"), "")
+                              or _env("YOLO26_TASKS", "")).lower()
+        if not explicit:
+            tasks = [t for t in tasks if t != "pose"]
+    return tasks
+
+
+def parse_tasks(value=None):
+    """Back-compat helper: live-mode tasks (or parse an explicit value)."""
+    if value is not None:
+        return _parse_task_list(value, "det")
+    return mode_tasks("live")
 
 
 def resolve_device(pref=None):
@@ -201,13 +231,13 @@ def resolve_weights(model_id):
 class _YoloState:
     def __init__(self):
         self.device = None
-        self.tasks = []            # requested tasks
-        self.loaded_tasks = []     # tasks whose model actually loaded
-        self.models = {}           # task -> YOLO model
+        self.models = {}           # task -> YOLO model (lazy-filled)
+        self.failed = {}           # task -> error string (lazy-load failures)
         self.warnings = []
-        self.loaded = False
+        self.loaded = False        # live (det) warmup completed
 
 _STATE = _YoloState()
+_LOAD_LOCK = threading.Lock()
 
 
 def _load_one(task):
@@ -230,33 +260,56 @@ def _load_one(task):
     return model
 
 
+def ensure_task(task):
+    """Lazily load (and cache) one task's model. Returns it, or None on failure.
+
+    Used so seg/pose only load the first time Build/Plan (or pose opt-in)
+    actually needs them. Failures are recorded once and not retried per frame.
+    """
+    if task in _STATE.models:
+        return _STATE.models[task]
+    if task in _STATE.failed:
+        return None
+    with _LOAD_LOCK:
+        if task in _STATE.models:
+            return _STATE.models[task]
+        if task in _STATE.failed:
+            return None
+        try:
+            if _STATE.device is None:
+                _STATE.device = resolve_device()
+            _STATE.models[task] = _load_one(task)
+            return _STATE.models[task]
+        except Exception as exc:  # noqa: BLE001
+            msg = f"{type(exc).__name__}: {exc}"
+            _STATE.failed[task] = msg
+            _STATE.warnings.append(f"{task} model load failed: {msg}")
+            log.warning("[yolo26] lazy %s load failed: %s", task, msg)
+            return None
+
+
 def load(tasks=None, device=None):
-    """Load YOLO models for the enabled tasks. Idempotent.
+    """Warmup: load ONLY the live-task models (det by default). Idempotent.
 
     'det' is required and re-raises on failure (so the dispatcher can fall back
-    to EdgeCrafter). 'seg'/'pose' failures drop the task with a warning.
+    to EdgeCrafter). Other live tasks (e.g. opt-in pose) degrade with a warning.
+    seg/pose for Build/Plan stay lazy until first use.
     """
     if _STATE.loaded:
         return model_summary()
 
-    _STATE.tasks = tasks or parse_tasks()
+    live = tasks or mode_tasks("live")
     _STATE.device = device or resolve_device()
-    log.info("[yolo26] loading tasks=%s device=%s", _STATE.tasks, _STATE.device)
+    log.info("[yolo26] warmup: live tasks=%s device=%s (seg/pose lazy)", live, _STATE.device)
 
-    for task in _STATE.tasks:
-        try:
-            _STATE.models[task] = _load_one(task)
-            _STATE.loaded_tasks.append(task)
-        except Exception as exc:  # noqa: BLE001
-            msg = f"{task} model load failed: {type(exc).__name__}: {exc}"
-            if task == "det":
-                log.error("[yolo26] %s", msg)
-                raise
-            _STATE.warnings.append(msg)
-            log.warning("[yolo26] %s -- continuing without %s", msg, task)
+    for task in live:
+        if task == "det":
+            _STATE.models["det"] = _load_one("det")  # required -- raises on failure
+        elif ensure_task(task) is None:
+            log.warning("[yolo26] continuing without optional live task %s", task)
 
-    if not _STATE.loaded_tasks:
-        raise RuntimeError("yolo26: no models loaded")
+    if "det" not in _STATE.models:
+        raise RuntimeError("yolo26: det model not loaded")
     _STATE.loaded = True
     return model_summary()
 
@@ -264,11 +317,29 @@ def load(tasks=None, device=None):
 def model_summary():
     return {
         "backend": "yolo26",
-        "tasks_loaded": list(_STATE.loaded_tasks),
+        "tasks_loaded": sorted(_STATE.models.keys()),
         "model_classes": {t: type(m).__name__ for t, m in _STATE.models.items()},
-        "model_ids": {t: _model_id(t) for t in _STATE.tasks},
+        "model_ids": {t: _model_id(t) for t in ("det", "seg", "pose")},
         "device": _STATE.device,
         "warnings": list(_STATE.warnings),
+    }
+
+
+def status():
+    """Mode/task + per-model load status block for /debug/state (no secrets)."""
+    return {
+        "det_loaded": "det" in _STATE.models,
+        "seg_loaded": "seg" in _STATE.models,
+        "pose_loaded": "pose" in _STATE.models,
+        "load_failures": dict(_STATE.failed),
+        "live_tasks": mode_tasks("live"),
+        "build_tasks": mode_tasks("build"),
+        "plan_tasks": mode_tasks("plan"),
+        "pose_enabled": pose_enabled(),
+        "det_model_id": _model_id("det"),
+        "seg_model_id": _model_id("seg"),
+        "pose_model_id": _model_id("pose"),
+        "device": _STATE.device,
     }
 
 
@@ -286,17 +357,24 @@ def _predict(task, pil_img, conf, img_size):
     return results[0]
 
 
-def infer(pil_img, conf, class_filter=None):
-    """Run all enabled tasks; return normalized entities/poses/segments."""
+def infer(pil_img, conf, class_filter=None, tasks=None):
+    """Run the given tasks (default: LIVE tasks) on a frame.
+
+    /detect speed protection: by default only det runs (and pose only when
+    opted in); seg never runs here unless explicitly listed in the live tasks.
+    """
     img_w, img_h = pil_img.size
     img_size = int(float(_env("YOLO26_IMG_SIZE", "640")))
+    run_tasks = list(tasks) if tasks else mode_tasks("live")
     t0 = time.perf_counter()
     entities: List[Dict[str, Any]] = []
     poses: List[Dict[str, Any]] = []
     segments: List[Dict[str, Any]] = []
+    ran: List[str] = []
 
-    if "det" in _STATE.models:
+    if "det" in run_tasks and "det" in _STATE.models:
         res = _predict("det", pil_img, conf, img_size)
+        ran.append("det")
         if res.boxes is not None and len(res.boxes):
             entities = normalize_detections(
                 res.boxes.xyxy.cpu().numpy(),
@@ -306,8 +384,9 @@ def infer(pil_img, conf, class_filter=None):
                 img_w, img_h, class_filter, source="yolo26",
             )
 
-    if "pose" in _STATE.models:
+    if "pose" in run_tasks and ensure_task("pose") is not None:
         res = _predict("pose", pil_img, conf, img_size)
+        ran.append("pose")
         kpts = getattr(res, "keypoints", None)
         if kpts is not None and kpts.xy is not None and len(kpts.xy):
             person_scores = None
@@ -319,8 +398,9 @@ def infer(pil_img, conf, class_filter=None):
                 img_w, img_h, source="yolo26-pose",
             )
 
-    if "seg" in _STATE.models:
+    if "seg" in run_tasks and ensure_task("seg") is not None:
         res = _predict("seg", pil_img, conf, img_size)
+        ran.append("seg")
         masks = getattr(res, "masks", None)
         if masks is not None and masks.xy:
             cls = res.boxes.cls.cpu().numpy() if res.boxes is not None else None
@@ -336,6 +416,60 @@ def infer(pil_img, conf, class_filter=None):
         "poses": poses,
         "segments": segments,
         "inference_ms": round(ms, 2),
-        "tasks": list(_STATE.loaded_tasks),
+        "tasks": ran,
         "model": "YOLO26",
     }
+
+
+# -- Selected-crop analysis for Build/Plan Mode -----------------------------------
+
+def crop_analysis(pil_img, conf, mode="build"):
+    """Run the mode's tasks on a SELECTED CROP only (never the live frame).
+
+    Returns {ok, mask_contour, mask_source, confidence, parts}:
+      mask_contour -- normalized contour of the largest seg instance (or [])
+      parts        -- detected objects in the crop (normalized bboxes) for
+                      Plan Mode visual grounding.
+    Never raises: any failure returns ok=False so Build Mode's fallback
+    contour pipeline takes over.
+    """
+    out = {"ok": False, "mask_contour": [], "mask_source": "none",
+           "confidence": 0.0, "parts": []}
+    try:
+        if not _STATE.loaded:
+            return out  # only piggyback on an already-warmed yolo26 backend
+        img_w, img_h = pil_img.size
+        img_size = int(float(_env("YOLO26_IMG_SIZE", "640")))
+        tasks = mode_tasks("build" if mode == "build" else "plan")
+
+        if "det" in tasks and "det" in _STATE.models:
+            res = _predict("det", pil_img, conf, img_size)
+            if res.boxes is not None and len(res.boxes):
+                out["parts"] = normalize_detections(
+                    res.boxes.xyxy.cpu().numpy(),
+                    res.boxes.cls.cpu().numpy(),
+                    res.boxes.conf.cpu().numpy(),
+                    getattr(res, "names", {}) or {},
+                    img_w, img_h, None, source="yolo26",
+                )
+
+        if "seg" in tasks and ensure_task("seg") is not None:
+            res = _predict("seg", pil_img, conf, img_size)
+            masks = getattr(res, "masks", None)
+            if masks is not None and masks.xy:
+                cls = res.boxes.cls.cpu().numpy() if res.boxes is not None else None
+                scs = res.boxes.conf.cpu().numpy() if res.boxes is not None else None
+                segs = normalize_segments(masks.xy, cls, scs,
+                                          getattr(res, "names", {}) or {},
+                                          img_w, img_h, source="yolo26-seg")
+                if segs:
+                    best = max(segs, key=lambda s: s["confidence"])
+                    out["mask_contour"] = best["maskContour"]
+                    out["mask_source"] = "yolo26-seg"
+                    out["confidence"] = best["confidence"]
+
+        out["ok"] = bool(out["mask_contour"] or out["parts"])
+        return out
+    except Exception as exc:  # noqa: BLE001 -- crop analysis must never break a frame
+        log.warning("[yolo26] crop_analysis failed: %s", exc)
+        return out

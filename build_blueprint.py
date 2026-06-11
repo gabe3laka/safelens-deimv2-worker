@@ -59,7 +59,10 @@ def _seg_config() -> Dict[str, Any]:
     return {
         "backend": os.getenv("BUILD_SEGMENTATION_BACKEND", "fallback").strip().lower(),
         "mask_output": os.getenv("BUILD_MASK_OUTPUT", "contour").strip().lower(),
-        "every_n": _safe_int(os.getenv("BUILD_SEGMENT_EVERY_N", "3"), 3),
+        # YOLO26_SEG_EVERY_N governs crop-segmentation cadence; legacy
+        # BUILD_SEGMENT_EVERY_N still honored as the fallback default.
+        "every_n": _safe_int(os.getenv("YOLO26_SEG_EVERY_N")
+                             or os.getenv("BUILD_SEGMENT_EVERY_N", "3"), 3),
         "on_extract": os.getenv("BUILD_SEGMENT_ON_EXTRACT", "true").strip().lower()
         in ("1", "true", "yes", "on"),
     }
@@ -264,7 +267,8 @@ async def process_frame_async(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if should_segment:
         try:
-            geom = await asyncio.to_thread(_segment_geometry, image_bytes, region, cfg, frame_index)
+            geom = await asyncio.to_thread(_segment_geometry, image_bytes, region, cfg,
+                                           frame_index, workflow_mode)
         except BuildError:
             raise
         except Exception as exc:  # noqa: BLE001 -- a bad frame must not crash the worker
@@ -336,9 +340,39 @@ async def process_frame_async(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 # -- Geometry / segmentation (runs in a worker thread) ------------------------
 
+def _try_yolo26_crop(img_bgr, workflow_mode: str) -> Optional[Dict[str, Any]]:
+    """Run YOLO26 crop analysis (seg + det grounding) on the SELECTED CROP only.
+
+    Only piggybacks on an already-warmed yolo26 backend; never loads anything
+    eagerly here beyond the lazy seg model, and never raises into the frame.
+    Returns None when yolo26 is not serving / not ready / produced nothing.
+    """
+    try:
+        import vision_backend
+        if vision_backend.serving_backend() != "yolo26":
+            return None
+        import yolo26_loader
+        if not yolo26_loader.is_ready():
+            return None
+        import cv2
+        from PIL import Image
+        pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+        conf = float(os.getenv("YOLO26_CONF", "0.25"))
+        result = yolo26_loader.crop_analysis(pil, conf, mode=workflow_mode)
+        return result if result.get("ok") else None
+    except Exception as exc:  # noqa: BLE001 -- crop grounding must never break a frame
+        log.warning("build: yolo26 crop analysis failed, using fallback: %s", exc)
+        return None
+
+
 def _segment_geometry(image_bytes: bytes, region: Dict[str, float], cfg: Dict[str, Any],
-                      frame_index: int = 0) -> Dict[str, Any]:
-    """Decode + segment the crop. SAM2 if enabled+available, else Canny contour."""
+                      frame_index: int = 0, workflow_mode: str = "build") -> Dict[str, Any]:
+    """Decode + segment the crop.
+
+    Mask priority: YOLO26 seg on the selected crop (when the yolo26 backend is
+    warmed and the mode's tasks include seg) -> SAM2 (only if configured) ->
+    Canny fallback contour. A segmentation failure NEVER fails the frame.
+    """
     import cv2
     import numpy as np
 
@@ -373,14 +407,27 @@ def _segment_geometry(image_bytes: bytes, region: Dict[str, float], cfg: Dict[st
         canny_contour = [{"x": _n(px, w), "y": _n(py, h)} for px, py in approx]
         full_pts = best.reshape(-1, 2)
 
-    # Decide the mask (Step 4 fallback first; Step 5 optional SAM2).
+    # Decide the mask. YOLO26 crop segmentation first (task-based modes),
+    # then the configured BUILD_SEGMENTATION_BACKEND (sam2/fallback/none).
     mask_contour: List[Dict[str, float]] = []
     mask_source = "none"
     confidence = 0.0
     chosen = None  # contour used for `outline`
+    detected_parts: List[Dict[str, Any]] = []
+
+    yolo = _try_yolo26_crop(img, workflow_mode)
+    if yolo:
+        detected_parts = yolo.get("parts", [])
+        if yolo.get("mask_contour"):
+            mask_contour = yolo["mask_contour"]
+            mask_source = "yolo26-seg"
+            confidence = float(yolo.get("confidence", 0.7))
+            chosen = mask_contour
 
     backend = cfg["backend"]
-    if backend == "sam2":
+    if chosen is not None:
+        pass  # YOLO26 mask won; skip the sam2/fallback mask decision below
+    elif backend == "sam2":
         # Use the Canny bbox (pixels) as a SAM2 box prompt when available.
         prompt_box = None
         if best is not None:
@@ -457,6 +504,8 @@ def _segment_geometry(image_bytes: bytes, region: Dict[str, float], cfg: Dict[st
         "maskSource": mask_source,
         "confidence": confidence,
         "center": center,
+        # YOLO26 det results on the crop -- used by Plan Mode visual grounding.
+        "detected_parts": detected_parts,
     }
 
 
@@ -583,6 +632,12 @@ def make_ai_fields(workflow_mode, geom, hand_out, index_local, gesture,
     note("obs", "observation", "The user appears to be working near this area.", hx, hy)
     if active:
         note("inspect", "observation", "Possible inspection point.", hx, hy)
+    parts = (geom or {}).get("detected_parts") or []
+    if parts:
+        top = max(parts, key=lambda p: p.get("confidence", 0.0))
+        note("part", "observation",
+             f"Detected near the work area: {top.get('label', 'object')}.",
+             cx, cy, float(top.get("confidence", 0.5)))
     note("quality", "quality", "Check this area before finishing.", cx, cy)
     note("safety", "safety", "Safety reminder: verify the area is safe before continuing.", cx, cy)
     if low_conf:
@@ -690,6 +745,41 @@ def _ov_ghost(oid, x, y, label, step_id=None, conf=0.5):
             "label": label, "stepId": step_id, "confidence": conf}
 
 
+def _ov_callout(oid, x, y, label, step_id=None, conf=0.6):
+    return {"id": oid, "type": "callout", "x": _clamp(x), "y": _clamp(y),
+            "label": label, "stepId": step_id, "confidence": conf}
+
+
+def _ov_step_marker(oid, x, y, label, step_id=None, conf=0.8):
+    return {"id": oid, "type": "step-marker", "x": _clamp(x), "y": _clamp(y),
+            "label": label, "stepId": step_id, "confidence": conf}
+
+
+def _ground_with_parts(overlays, notes_fn, parts, frame_index, cx, cy):
+    """Plan Mode visual grounding from YOLO26 crop detections (not AI text).
+
+    Highlights the most confident detected part, labels it with a callout, and
+    draws an arrow from the part to the current plan target.
+    """
+    if not parts:
+        return
+    top = max(parts, key=lambda p: p.get("confidence", 0.0))
+    bb = top.get("bbox") or {}
+    px = _clamp(bb.get("x", 0.5) + bb.get("w", 0.0) / 2.0)
+    py = _clamp(bb.get("y", 0.5) + bb.get("h", 0.0) / 2.0)
+    conf = float(top.get("confidence", 0.5))
+    label = str(top.get("label", "object"))
+    overlays.append(_ov_highlight(f"part-{frame_index}", px, py,
+                                  f"Detected: {label}", "step-1", conf))
+    overlays.append(_ov_callout(f"callout-{frame_index}", px, py, label, "step-1", conf))
+    if abs(px - cx) + abs(py - cy) > 0.02:
+        overlays.append(_ov_arrow(f"ground-arrow-{frame_index}", px, py, cx, cy,
+                                  "Move/inspect here", "step-1", min(conf, 0.6)))
+    notes_fn("part", "observation",
+             f"The selected area appears to contain: {label}. Check whether this matches your task.",
+             px, py, conf)
+
+
 def _plan_fields(intent, geom, index_local, gesture, confidence, frame_index, session) -> Dict[str, Any]:
     center = (geom or {}).get("center") or {"x": 0.5, "y": 0.5}
     anchors = (geom or {}).get("anchors") or []
@@ -792,7 +882,18 @@ def _plan_fields(intent, geom, index_local, gesture, confidence, frame_index, se
     if active and index_local:
         overlays.append(_ov_ghost(f"ghost-{frame_index}", hx, hy, "Active work point", None, 0.5))
 
+    # YOLO26 visual grounding: anchor the plan to actually-detected crop parts.
+    _ground_with_parts(overlays, note, (geom or {}).get("detected_parts") or [],
+                       frame_index, cx, cy)
+
     steps, idx = _resolve_plan_steps(session, step_kind, True, high_risk, center, active)
+    active_step = steps[idx] if 0 <= idx < len(steps) else None
+    if active_step:
+        overlays.append(_ov_step_marker(
+            f"stepmark-{frame_index}",
+            active_step.get("x", cx) if active_step.get("x") is not None else cx,
+            active_step.get("y", cy) if active_step.get("y") is not None else cy,
+            active_step.get("title", "Current step"), active_step.get("id")))
     return {
         "detectedIntent": _describe_intent(task, text),
         "instruction": instruction,

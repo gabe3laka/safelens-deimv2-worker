@@ -20,12 +20,31 @@ contract is unchanged: `entities` (normalized 0..1 `bbox` x/y/w/h), `poses`
 `img_w`/`img_h` -- plus an optional additive `segments` list
 (`{maskContour, source: "yolo26-seg"}`) when the YOLO26 seg task is enabled.
 
-YOLO26 env: `YOLO26_MODEL_ID` / `YOLO26_SEG_MODEL_ID` / `YOLO26_POSE_MODEL_ID`
-(default `yolo26n*.pt`), `YOLO26_TASKS` (default `det,pose`; add `seg` to
-enable contours), `YOLO26_DEVICE`, `YOLO26_IMG_SIZE`, `YOLO26_CONF`,
-`YOLO26_CACHE_DIR` (default `/runpod-volume/models/yolo26`). Weights are
-best-effort pre-baked into `/app/models/yolo26` and otherwise resolved from the
-cache dir or auto-downloaded by Ultralytics into it.
+**YOLO26 runs in task-based modes** (never det+seg+pose on every frame):
+
+| Mode | Used by | Tasks (env, default) |
+|------|---------|----------------------|
+| live | `POST /detect` HSE loop | `YOLO26_LIVE_TASKS=det` (fast boxes only) |
+| build | `/build/session/frame`, `workflowMode=build` | `YOLO26_BUILD_TASKS=det,seg` (selected crop only) |
+| plan | `/build/session/frame`, `workflowMode=plan` | `YOLO26_PLAN_TASKS=det,seg` (crop grounding for planOverlays) |
+
+Pose is **opt-in** (`YOLO26_POSE_ENABLED=true` or an explicit `pose` in a task
+list) and never runs on every frame by default. Warmup loads only the det
+model; the seg model lazy-loads the first time a Build/Plan crop needs it (and
+re-runs only on extraction frames / crop changes / every `YOLO26_SEG_EVERY_N`
+frames). Crop segmentation produces `maskSource: "yolo26-seg"` +
+`maskContour` (used as the blueprint `outline`); on any failure the existing
+fallback contour takes over and the frame is still returned. Plan Mode uses the
+crop detections for visual grounding (`highlight`/`callout`/`arrow`/`target`/
+`ghost-position`/`warning-zone`/`step-marker` overlays, all normalized 0..1).
+
+Other YOLO26 env: `YOLO26_DET_MODEL_ID` / `YOLO26_SEG_MODEL_ID` /
+`YOLO26_POSE_MODEL_ID` (default `yolo26n*.pt`; legacy `YOLO26_MODEL_ID` still
+honored), `YOLO26_DEVICE`, `YOLO26_IMG_SIZE`, `YOLO26_CONF`, `YOLO26_CACHE_DIR`
+(default `/runpod-volume/models/yolo26`). det+seg weights are best-effort
+pre-baked into `/app/models/yolo26` and otherwise resolved from the cache dir
+or auto-downloaded by Ultralytics into it. Model-load status per task is in
+`GET /debug/state` under `backend_status.yolo26`.
 
 ## Architecture
 

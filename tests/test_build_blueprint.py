@@ -165,9 +165,11 @@ def test_plan_confirmed_build_uses_intent_and_overlays():
 def test_plan_overlay_types_supported():
     intent = {"taskType": "inspect", "text": "inspect this", "confirmed": True}
     _, bf = _plan_frame(intent)
-    allowed = {"arrow", "target", "ghost-position", "highlight", "warning-zone"}
+    allowed = {"arrow", "target", "ghost-position", "highlight", "warning-zone",
+               "callout", "step-marker"}
     assert bf["planOverlays"] and all(o["type"] in allowed for o in bf["planOverlays"])
     assert any(o["type"] == "target" for o in bf["planOverlays"])  # numbered inspection points
+    assert any(o["type"] == "step-marker" for o in bf["planOverlays"])  # active step marker
 
 
 def test_plan_high_risk_is_safety_first():

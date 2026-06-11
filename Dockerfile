@@ -125,7 +125,9 @@ PY
 # to EdgeCrafter via AUTO_BACKEND_FALLBACK.
 RUN mkdir -p /app/models/yolo26 && cd /app/models/yolo26 && python - <<'PY'
 from ultralytics import YOLO
-for mid in ("yolo26n.pt", "yolo26n-pose.pt"):
+# det (live loop) + seg (Build/Plan crops). pose is opt-in and not baked --
+# enabling YOLO26_POSE_ENABLED downloads it into the volume cache at runtime.
+for mid in ("yolo26n.pt", "yolo26n-seg.pt"):
     try:
         YOLO(mid)  # bare ids download into CWD (/app/models/yolo26)
         print("YOLO26 weights baked:", mid)
@@ -177,11 +179,18 @@ ENV STARTUP_LOG="/tmp/safelens_startup.log"
 ENV FALLBACK_VISION_BACKEND="edgecrafter"
 ENV AUTO_BACKEND_FALLBACK="true"
 
-# ------- YOLO26 configuration --------------------------------------------------
-ENV YOLO26_MODEL_ID="yolo26n.pt"
+# ------- YOLO26 configuration (task-based modes) -------------------------------
+# Live /detect runs DETECTION ONLY for speed; segmentation runs only on
+# selected Build/Plan crops (lazy-loaded); pose is opt-in (YOLO26_POSE_ENABLED
+# or an explicit 'pose' in a task list).
+ENV YOLO26_DET_MODEL_ID="yolo26n.pt"
 ENV YOLO26_SEG_MODEL_ID="yolo26n-seg.pt"
 ENV YOLO26_POSE_MODEL_ID="yolo26n-pose.pt"
-ENV YOLO26_TASKS="det,pose"
+ENV YOLO26_LIVE_TASKS="det"
+ENV YOLO26_BUILD_TASKS="det,seg"
+ENV YOLO26_PLAN_TASKS="det,seg"
+ENV YOLO26_POSE_ENABLED="false"
+ENV YOLO26_SEG_EVERY_N="3"
 ENV YOLO26_DEVICE="cuda"
 ENV YOLO26_IMG_SIZE="640"
 ENV YOLO26_CONF="0.25"

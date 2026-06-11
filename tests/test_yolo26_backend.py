@@ -295,6 +295,184 @@ def test_detect_contract_unchanged(server_mod, monkeypatch):
             server_mod._STATE["status"] = "cold"
 
 
+# -- Task-based modes (live det-only; lazy seg/pose) ----------------------------
+
+def _fresh_yolo_state(monkeypatch):
+    state = yolo26_loader._YoloState()
+    monkeypatch.setattr(yolo26_loader, "_STATE", state)
+    return state
+
+
+def test_live_tasks_default_det_only(monkeypatch):
+    monkeypatch.delenv("YOLO26_LIVE_TASKS", raising=False)
+    monkeypatch.delenv("YOLO26_TASKS", raising=False)
+    monkeypatch.delenv("YOLO26_POSE_ENABLED", raising=False)
+    assert yolo26_loader.mode_tasks("live") == ["det"]
+    assert yolo26_loader.mode_tasks("build") == ["det", "seg"]
+    assert yolo26_loader.mode_tasks("plan") == ["det", "seg"]
+
+
+def test_pose_only_when_enabled_or_explicit(monkeypatch):
+    monkeypatch.delenv("YOLO26_LIVE_TASKS", raising=False)
+    monkeypatch.delenv("YOLO26_TASKS", raising=False)
+    monkeypatch.setenv("YOLO26_POSE_ENABLED", "true")
+    assert yolo26_loader.mode_tasks("live") == ["det", "pose"]
+    monkeypatch.setenv("YOLO26_POSE_ENABLED", "false")
+    monkeypatch.setenv("YOLO26_LIVE_TASKS", "det,pose")  # explicit opt-in
+    assert "pose" in yolo26_loader.mode_tasks("live")
+    monkeypatch.setenv("YOLO26_LIVE_TASKS", "det")
+    assert yolo26_loader.mode_tasks("live") == ["det"]
+
+
+def test_warmup_loads_det_only_no_seg_no_pose(monkeypatch):
+    state = _fresh_yolo_state(monkeypatch)
+    monkeypatch.delenv("YOLO26_LIVE_TASKS", raising=False)
+    monkeypatch.delenv("YOLO26_TASKS", raising=False)
+    monkeypatch.delenv("YOLO26_POSE_ENABLED", raising=False)
+    monkeypatch.setattr(yolo26_loader, "_load_one", lambda task: f"model-{task}")
+    yolo26_loader.load()
+    assert "det" in state.models           # 1/2/3: det loaded...
+    assert "seg" not in state.models       # ...seg NOT loaded by default
+    assert "pose" not in state.models      # ...pose NOT loaded unless enabled
+    st = yolo26_loader.status()
+    assert st["det_loaded"] and not st["seg_loaded"] and not st["pose_loaded"]
+    assert st["live_tasks"] == ["det"]
+
+
+def test_live_infer_runs_det_only(monkeypatch):
+    from PIL import Image
+    state = _fresh_yolo_state(monkeypatch)
+    monkeypatch.delenv("YOLO26_LIVE_TASKS", raising=False)
+    monkeypatch.delenv("YOLO26_TASKS", raising=False)
+    monkeypatch.delenv("YOLO26_POSE_ENABLED", raising=False)
+    state.models["det"] = object()
+    state.loaded = True
+    ran = []
+
+    class _Res:
+        boxes = None
+        names = {}
+
+    monkeypatch.setattr(yolo26_loader, "_predict",
+                        lambda task, *a, **k: ran.append(task) or _Res())
+    # ensure_task must NOT be invoked for seg/pose in live mode
+    monkeypatch.setattr(yolo26_loader, "ensure_task",
+                        lambda task: (_ for _ in ()).throw(AssertionError("lazy-loaded " + task)))
+    out = yolo26_loader.infer(Image.new("RGB", (64, 64)), 0.25)
+    assert ran == ["det"]
+    assert out["tasks"] == ["det"]
+    assert out["poses"] == [] and out["segments"] == []
+
+
+def test_lazy_seg_failure_drops_task(monkeypatch):
+    state = _fresh_yolo_state(monkeypatch)
+
+    def _boom_load(task):
+        raise RuntimeError("no seg weights")
+
+    monkeypatch.setattr(yolo26_loader, "_load_one", _boom_load)
+    assert yolo26_loader.ensure_task("seg") is None
+    assert "seg" in state.failed
+    # failure is cached -- not retried per frame
+    monkeypatch.setattr(yolo26_loader, "_load_one",
+                        lambda task: (_ for _ in ()).throw(AssertionError("retried")))
+    assert yolo26_loader.ensure_task("seg") is None
+
+
+# -- Build/Plan crop integration -------------------------------------------------
+
+def _crop_b64():
+    import io
+    from PIL import Image, ImageDraw
+    im = Image.new("RGB", (200, 150), (245, 245, 245))
+    d = ImageDraw.Draw(im)
+    d.rectangle([40, 30, 160, 120], fill=(20, 20, 20))
+    buf = io.BytesIO(); im.save(buf, format="JPEG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+_REGION = {"x": 0.1, "y": 0.2, "w": 0.4, "h": 0.3}
+
+_YOLO_CROP = {
+    "ok": True, "mask_source": "yolo26-seg", "confidence": 0.9,
+    "mask_contour": [{"x": 0.22, "y": 0.31}, {"x": 0.6, "y": 0.3},
+                     {"x": 0.62, "y": 0.72}, {"x": 0.24, "y": 0.74}],
+    "parts": [{"label": "box", "class_id": 73, "confidence": 0.81,
+               "bbox": {"x": 0.2, "y": 0.3, "w": 0.4, "h": 0.4}, "source": "yolo26"}],
+}
+
+
+def _run_frame(monkeypatch, crop_result, workflow="build", intent=None):
+    import asyncio
+    import build_blueprint as bb
+    bb.BUILD_SESSIONS.clear()
+    monkeypatch.setattr(bb, "_try_yolo26_crop",
+                        lambda img, mode: crop_result)
+    start = {"workflowMode": workflow}
+    if intent:
+        start["userIntent"] = intent
+    sid = bb.start_session(start)["session_id"]
+    payload = {"sessionId": sid, "frameId": "f-0", "selectedRegion": _REGION,
+               "image_b64": _crop_b64(), "workflowMode": workflow,
+               "handLandmarks": [{"role": "index-tip", "x": 0.3, "y": 0.35}],
+               "gesture": {"type": "pinch", "active": True}}
+    if intent:
+        payload["userIntent"] = intent
+    return asyncio.run(bb.process_frame_async(payload))["blueprint_frame"]
+
+
+def test_build_crop_uses_yolo26_segmentation(monkeypatch):
+    bf = _run_frame(monkeypatch, _YOLO_CROP, workflow="build")
+    assert bf["maskSource"] == "yolo26-seg"
+    assert bf["maskContour"] == _YOLO_CROP["mask_contour"]
+    assert bf["outline"] == bf["maskContour"]
+    for p in bf["maskContour"]:
+        assert 0.0 <= p["x"] <= 1.0 and 0.0 <= p["y"] <= 1.0
+
+
+def test_build_falls_back_when_yolo_seg_fails(monkeypatch):
+    bf = _run_frame(monkeypatch, None, workflow="build")  # yolo produced nothing
+    assert bf["maskSource"] in ("fallback-contour", "none")
+    assert bf["version"] == 2  # frame still returned -- never 500
+
+
+def test_plan_overlays_grounded_on_detected_parts(monkeypatch):
+    intent = {"taskType": "inspect", "text": "inspect this part", "confirmed": True}
+    bf = _run_frame(monkeypatch, _YOLO_CROP, workflow="plan", intent=intent)
+    types = [o["type"] for o in bf["planOverlays"]]
+    assert "highlight" in types and "callout" in types
+    grounded = [o for o in bf["planOverlays"] if o.get("label") == "box"
+                or "box" in str(o.get("label", ""))]
+    assert grounded, bf["planOverlays"]
+    allowed = {"arrow", "target", "ghost-position", "highlight", "warning-zone",
+               "callout", "step-marker"}
+    assert all(o["type"] in allowed for o in bf["planOverlays"])
+    for o in bf["planOverlays"]:
+        if "x" in o and o["x"] is not None:
+            assert 0.0 <= o["x"] <= 1.0 and 0.0 <= o["y"] <= 1.0
+        if "from" in o:
+            assert 0.0 <= o["from"]["x"] <= 1.0 and 0.0 <= o["to"]["x"] <= 1.0
+
+
+def test_fallback_fields_exposed(monkeypatch):
+    import edgecrafter_loader as ec
+    monkeypatch.setattr(yolo26_loader, "load", _boom)
+    monkeypatch.setattr(ec, "load", _ec_ok)
+    vision_backend.load_models()
+    monkeypatch.setattr(ec, "infer", _fake_ec_infer)
+    monkeypatch.setattr(ec._STATE, "tasks", ["det", "pose"], raising=False)
+    body = vision_backend.run_inference(image_b64=_tiny_jpeg_b64(), conf=0.25).model_dump()
+    assert body["fallbackUsed"] is True
+    assert "yolo26_load_failed" in body["fallbackReason"]
+
+
+def test_health_works_without_models(server_mod):
+    from fastapi.testclient import TestClient
+    with TestClient(server_mod.app) as c:
+        r = c.get("/health")
+        assert r.status_code == 200 and r.json()["ok"] is True
+
+
 def test_build_and_plan_still_work(server_mod):
     import io
     from PIL import Image, ImageDraw

@@ -414,9 +414,15 @@ async def debug_state():
             "FALLBACK_VISION_BACKEND": os.getenv("FALLBACK_VISION_BACKEND", ""),
             "AUTO_BACKEND_FALLBACK": os.getenv("AUTO_BACKEND_FALLBACK", ""),
             "YOLO26_MODEL_ID": os.getenv("YOLO26_MODEL_ID", ""),
+            "YOLO26_DET_MODEL_ID": os.getenv("YOLO26_DET_MODEL_ID", ""),
             "YOLO26_SEG_MODEL_ID": os.getenv("YOLO26_SEG_MODEL_ID", ""),
             "YOLO26_POSE_MODEL_ID": os.getenv("YOLO26_POSE_MODEL_ID", ""),
             "YOLO26_TASKS": os.getenv("YOLO26_TASKS", ""),
+            "YOLO26_LIVE_TASKS": os.getenv("YOLO26_LIVE_TASKS", ""),
+            "YOLO26_BUILD_TASKS": os.getenv("YOLO26_BUILD_TASKS", ""),
+            "YOLO26_PLAN_TASKS": os.getenv("YOLO26_PLAN_TASKS", ""),
+            "YOLO26_POSE_ENABLED": os.getenv("YOLO26_POSE_ENABLED", ""),
+            "YOLO26_SEG_EVERY_N": os.getenv("YOLO26_SEG_EVERY_N", ""),
             "YOLO26_DEVICE": os.getenv("YOLO26_DEVICE", ""),
             "YOLO26_IMG_SIZE": os.getenv("YOLO26_IMG_SIZE", ""),
             "YOLO26_CONF": os.getenv("YOLO26_CONF", ""),
@@ -642,10 +648,9 @@ def _ws_active_tasks():
     if backend == "yolo26":
         try:
             import yolo26_loader
-            return (list(yolo26_loader._STATE.loaded_tasks)
-                    or yolo26_loader.parse_tasks())
+            return yolo26_loader.mode_tasks("live")
         except Exception:
-            raw = os.getenv("YOLO26_TASKS", "det,pose")
+            raw = os.getenv("YOLO26_LIVE_TASKS") or os.getenv("YOLO26_TASKS") or "det"
             out = [t.strip().lower() for t in raw.split(",")
                    if t.strip().lower() in ("det", "seg", "pose")]
             return out or ["det"]

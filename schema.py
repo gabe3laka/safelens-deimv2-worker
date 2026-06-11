@@ -161,3 +161,9 @@ class InferResponse(BaseModel):
     warning: Optional[str] = Field(
         None, description="Non-fatal warning (e.g. class filter matched nothing)."
     )
+    fallbackUsed: Optional[bool] = Field(
+        None, description="True when the serving backend is the auto-fallback."
+    )
+    fallbackReason: Optional[str] = Field(
+        None, description="Why the requested backend was not used, e.g. 'yolo26_load_failed'."
+    )

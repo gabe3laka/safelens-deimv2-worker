@@ -160,9 +160,10 @@ def backend_status() -> Dict[str, Any]:
     try:
         import yolo26_loader
         yolo_loaded = yolo26_loader.is_ready()
-        yolo_tasks = list(yolo26_loader._STATE.loaded_tasks) or yolo26_loader.parse_tasks()
+        yolo_status = yolo26_loader.status()
+        yolo_tasks = yolo_status["live_tasks"]
     except Exception:  # noqa: BLE001
-        yolo_loaded, yolo_tasks = False, []
+        yolo_loaded, yolo_tasks, yolo_status = False, [], {}
     try:
         import edgecrafter_loader as ec
         ec_loaded = ec.is_ready()
@@ -178,6 +179,7 @@ def backend_status() -> Dict[str, Any]:
         "fallback_reason": _BACKEND_STATE["fallback_reason"],
         "yolo26_model_loaded": yolo_loaded,
         "yolo26_tasks": yolo_tasks,
+        "yolo26": yolo_status,
         "edgecrafter_available": ec_available,
         "edgecrafter_model_loaded": ec_loaded,
     }
@@ -278,7 +280,11 @@ def run_inference(image_b64: str, conf: float = 0.25, img_size: int = 640,
         resp = _edgecrafter_response(image_b64, conf, class_filter)
     if not resp.inference_ms:
         resp.inference_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-    if _BACKEND_STATE["fallback_active"] and not resp.warning:
-        resp.warning = ("backend_fallback: " + str(_BACKEND_STATE["requested"]) +
-                        " -> " + backend + " (" + str(_BACKEND_STATE["fallback_reason"]) + ")")
+    if _BACKEND_STATE["fallback_active"]:
+        resp.fallbackUsed = True
+        resp.fallbackReason = (str(_BACKEND_STATE["requested"]) + "_load_failed: " +
+                               str(_BACKEND_STATE["fallback_reason"]))
+        if not resp.warning:
+            resp.warning = ("backend_fallback: " + str(_BACKEND_STATE["requested"]) +
+                            " -> " + backend + " (" + str(_BACKEND_STATE["fallback_reason"]) + ")")
     return resp
