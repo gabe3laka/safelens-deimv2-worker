@@ -1,0 +1,119 @@
+# Dockerfile.sam2 -- EXPERIMENTAL SafeLens worker image with real SAM2 segmentation.
+#
+# Layers Ultralytics SAM2 on top of the already-green production image, so the
+# stable Dockerfile / main branch are never at risk. Built ONLY by
+# .github/workflows/build-sam2-experimental.yml (branch: sam2-experimental) as
+#   ghcr.io/gabe3laka/safelens-deimv2-worker:sam2-experimental
+#
+# Lessons encoded from the two failed in-main attempts:
+#   * fb426cb: NEVER uninstall/reinstall OpenCV (opencv-python and
+#     opencv-python-headless share cv2/ files; uninstalling one breaks both).
+#   * ddb143c: NEVER assert "torch == 2.6"; the working production stack is
+#     torch 2.5.1+cu124 (upstream EdgeCrafter/DEIMv2 requirement installs).
+#     Instead: record the baseline BEFORE installing SAM2 deps and assert it is
+#     UNCHANGED after (and that cv2 still imports).
+#
+# The full-deps `pip install ultralytics` is used deliberately: the fb426cb
+# build log proved it leaves torch/cv2/numpy/huggingface-hub untouched (it only
+# adds matplotlib/polars/thop/etc.), and SAM2 needs those extras importable at
+# runtime. The baseline assertion below fails the build if a future ultralytics
+# release ever changes that.
+
+ARG BASE_IMAGE=ghcr.io/gabe3laka/safelens-deimv2-worker:latest
+FROM ${BASE_IMAGE}
+
+WORKDIR /app
+
+# -- 1. Record the currently working dependency baseline ----------------------
+RUN python - <<'PY'
+import json
+import torch, torchvision, cv2, numpy, huggingface_hub
+baseline = {
+    "torch": torch.__version__,
+    "torchvision": torchvision.__version__,
+    "cv2": cv2.__version__,
+    "numpy": numpy.__version__,
+    "huggingface_hub": huggingface_hub.__version__,
+}
+with open("/opt/sam2_dep_baseline.json", "w") as fh:
+    json.dump(baseline, fh)
+print("dependency baseline recorded:", baseline)
+PY
+
+# -- 2. Install Ultralytics (full deps; proven not to touch the baseline) -----
+RUN pip install --no-cache-dir ultralytics
+
+# -- 3. Verify the detection stack is byte-for-byte unchanged ------------------
+RUN python - <<'PY'
+import json
+import torch, torchvision, cv2, numpy, huggingface_hub
+baseline = json.load(open("/opt/sam2_dep_baseline.json"))
+current = {
+    "torch": torch.__version__,
+    "torchvision": torchvision.__version__,
+    "cv2": cv2.__version__,
+    "numpy": numpy.__version__,
+    "huggingface_hub": huggingface_hub.__version__,
+}
+assert current == baseline, f"SAM2 deps changed the stack: {baseline} -> {current}"
+from ultralytics import SAM  # noqa: F401 -- runtime import must work
+print("detection stack preserved after ultralytics install:", current)
+PY
+
+# -- 4. Bake SAM2 weights into the image (REQUIRED for this experimental tag) --
+ARG SAM2_WEIGHTS_URL="https://github.com/ultralytics/assets/releases/download/v8.3.0/sam2_b.pt"
+RUN mkdir -p /app/models && python - <<'PY'
+import os, urllib.request
+url = os.environ.get("SAM2_WEIGHTS_URL") or \
+    "https://github.com/ultralytics/assets/releases/download/v8.3.0/sam2_b.pt"
+dst = "/app/models/sam2_b.pt"
+urllib.request.urlretrieve(url, dst)
+size = os.path.getsize(dst)
+assert size > 50_000_000, f"sam2_b.pt looks truncated: {size} bytes"
+print(f"SAM2 weights downloaded -> {dst} ({size} bytes)")
+PY
+
+# -- 5. Re-copy worker code so branch-side changes always win over the base ----
+COPY schema.py /app/schema.py
+COPY edgecrafter_loader.py /app/edgecrafter_loader.py
+COPY vision_backend.py /app/vision_backend.py
+COPY deimv2_infer.py /app/deimv2_infer.py
+COPY official_deimv2_loader.py /app/official_deimv2_loader.py
+COPY server.py /app/server.py
+COPY ws_vision.py /app/ws_vision.py
+COPY bootstrap.py /app/bootstrap.py
+COPY handler.py /app/handler.py
+COPY build_schema.py /app/build_schema.py
+COPY build_blueprint.py /app/build_blueprint.py
+COPY build_segmentation.py /app/build_segmentation.py
+
+# -- 6. SAM2 enabled by default in THIS image only -----------------------------
+# (Code still falls back to fallback-contour if SAM2 ever fails at runtime.)
+ENV BUILD_SEGMENTATION_BACKEND="sam2"
+ENV BUILD_SAM2_DEVICE="cuda"
+ENV BUILD_SAM2_WEIGHTS="/app/models/sam2_b.pt"
+ENV BUILD_MASK_OUTPUT="contour"
+ENV BUILD_SEGMENT_ON_EXTRACT="true"
+ENV BUILD_SEGMENT_EVERY_N="3"
+# Container hardening: writable config dir; never pip-install at runtime.
+ENV YOLO_CONFIG_DIR="/tmp/Ultralytics"
+ENV YOLO_AUTOINSTALL="false"
+
+# -- 7. Build-time smoke test: the shipped image must actually run SAM2 --------
+# CPU here (no GPU at build time); RunPod uses BUILD_SAM2_DEVICE=cuda at runtime.
+RUN BUILD_SEGMENTATION_BACKEND=sam2 BUILD_SAM2_DEVICE=cpu python - <<'PY'
+import numpy as np
+from build_segmentation import segment_crop
+img = np.zeros((256, 256, 3), dtype=np.uint8)
+img[60:180, 80:200] = 255
+out = segment_crop(img, prompt_box=[80, 60, 200, 180], frame_index=0)
+assert out["ok"] is True, f"SAM2 smoke failed: {out}"
+assert out["mask_source"] == "sam2", out
+assert len(out["mask_contour"]) >= 3, out
+assert all(0.0 <= p["x"] <= 1.0 and 0.0 <= p["y"] <= 1.0 for p in out["mask_contour"]), out
+print("SAM2 build-time smoke OK:", out["mask_source"],
+      f"{len(out['mask_contour'])} contour pts, confidence={out['confidence']}")
+PY
+
+# Port, entrypoint, health routes, EdgeCrafter/DEIMv2 config: inherited from the
+# stable base image (PORT=8000, bootstrap.py).

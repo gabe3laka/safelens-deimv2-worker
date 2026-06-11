@@ -170,6 +170,25 @@ SAM2 is **optional and never a hard dependency**: when `BUILD_SEGMENTATION_BACKE
 and SAM2 is unavailable, the worker logs and falls back to the contour pipeline.
 Keep SAM2 disabled until the fallback is proven stable.
 
+### SAM2 experimental image (separate from production)
+
+The production image ships **no** SAM2 dependencies. Real SAM2 lives on the
+`sam2-experimental` branch, which builds `Dockerfile.sam2` (layered on top of
+the stable `:latest` image) via its own workflow
+(`.github/workflows/build-sam2-experimental.yml`) into:
+
+```
+ghcr.io/gabe3laka/safelens-deimv2-worker:sam2-experimental   (+ :sam2-<short-sha>)
+```
+
+That image installs Ultralytics (with a build-time assertion that
+torch/torchvision/cv2/numpy/huggingface-hub are byte-for-byte unchanged), bakes
+`sam2_b.pt` into `/app/models/`, defaults `BUILD_SEGMENTATION_BACKEND=sam2`,
+and runs a build-time `segment_crop` smoke test that must return
+`mask_source="sam2"`. The same fallback-contour behavior remains if SAM2 ever
+fails at runtime. Test it on a **separate** RunPod endpoint; do not merge
+`sam2-experimental` into `main` until proven stable there.
+
 ## Docker image
 
 Built and pushed to GitHub Container Registry on every push to `main`:
