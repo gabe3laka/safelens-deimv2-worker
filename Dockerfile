@@ -71,49 +71,16 @@ assert Version("0.26.0") <= v < Version("1.0"), f"bad huggingface-hub version: {
 print("huggingface-hub OK:", v)
 PY
 
-# ---- Optional SAM2 / Ultralytics support ------------------------------------
-# Must not break the base worker image. SAM2 is optional and off by default.
-#
-# Constraint learned from the fb426cb build failure: NEVER uninstall/reinstall
-# OpenCV here. opencv-python (pulled by upstream EdgeCrafter/DEIMv2 reqs) and
-# opencv-python-headless share the same cv2/ files; uninstalling one deletes
-# them while the other's metadata still says "already satisfied", leaving no
-# importable cv2. Install ultralytics with --no-deps instead, so the existing
-# torch/hub/OpenCV/NumPy stack cannot be changed at all.
-RUN python -m pip install --no-cache-dir --no-deps ultralytics \
-    || echo "WARN: ultralytics install failed; SAM2 unavailable, fallback still works"
-
-# Optional helper dependency used by Ultralytics. Also no-deps to avoid drift.
-RUN python -m pip install --no-cache-dir --no-deps ultralytics-thop \
-    || echo "WARN: ultralytics-thop install failed; SAM2 may fall back"
-
-# Verify the base runtime was not changed (fails the build if it was).
-RUN python - <<'PY'
-import torch, cv2, huggingface_hub
-from packaging.version import Version
-
-assert torch.__version__.startswith("2.6"), f"torch changed: {torch.__version__}"
-hv = Version(huggingface_hub.__version__)
-assert Version("0.26.0") <= hv < Version("1.0"), f"bad huggingface-hub: {hv}"
-
-print("runtime preserved after optional SAM2 deps:", torch.__version__, cv2.__version__, hv)
-PY
-# Best-effort: pre-fetch SAM2 weights into /app/models so runtime needs no
-# download. Plain URL fetch (does NOT import ultralytics, which may lack its
-# optional deps under --no-deps). If the fetch fails the build still succeeds
-# (the engine can fetch at runtime, or the worker stays in fallback mode).
-ARG SAM2_WEIGHTS_URL="https://github.com/ultralytics/assets/releases/download/v8.3.0/sam2_b.pt"
-RUN mkdir -p /app/models && python - <<'PY'
-import os, urllib.request
-url = os.environ.get("SAM2_WEIGHTS_URL") or \
-    "https://github.com/ultralytics/assets/releases/download/v8.3.0/sam2_b.pt"
-dst = "/app/models/sam2_b.pt"
-try:
-    urllib.request.urlretrieve(url, dst)
-    print("SAM2 weights baked at", dst, os.path.getsize(dst), "bytes")
-except Exception as e:  # noqa: BLE001
-    print("WARN: could not pre-fetch SAM2 weights:", type(e).__name__, e)
-PY
+# ---- Optional SAM2 runtime support ------------------------------------------
+# SAM2 code paths exist in build_segmentation.py, but SAM2 dependencies are NOT
+# installed in the main production image (two failed attempts: fb426cb broke
+# cv2 via an OpenCV uninstall; ddb143c's verify step exposed that the upstream
+# EdgeCrafter/DEIMv2 requirement installs leave torch at 2.5.1+cu124, so a
+# "torch unchanged" assertion can never hold here). This keeps the fallback
+# image stable. Use a separate experimental SAM2 image later. The
+# BUILD_SAM2_DEVICE / BUILD_SAM2_WEIGHTS env defaults live in the Build Mode
+# env block below; with no SAM2 package installed, build_segmentation degrades
+# to ok=False / "fallback-contour" and Build/Plan keeps working.
 
 # Copy worker code
 COPY schema.py /app/schema.py
