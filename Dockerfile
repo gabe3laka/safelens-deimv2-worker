@@ -71,40 +71,46 @@ assert Version("0.26.0") <= v < Version("1.0"), f"bad huggingface-hub version: {
 print("huggingface-hub OK:", v)
 PY
 
-# ---- Optional SAM2 (Ultralytics) for Build Mode segmentation ----------------
-# SAM2 stays OFF by default (BUILD_SEGMENTATION_BACKEND=fallback); these deps
-# only matter when it is set to "sam2".
+# ---- Optional SAM2 / Ultralytics support ------------------------------------
+# Must not break the base worker image. SAM2 is optional and off by default.
 #
-# Install is best-effort: a failure here must NOT block the (fallback) image --
-# SAM2 simply stays unavailable and Build Mode uses the contour path. We then
-# keep a single clean headless OpenCV (ultralytics may pull the GUI build) and
-# assert torch + huggingface-hub are UNCHANGED, so a breaking dependency change
-# fails the build instead of shipping a broken EdgeCrafter / DEIMv2.
-RUN pip install --no-cache-dir ultralytics \
+# Constraint learned from the fb426cb build failure: NEVER uninstall/reinstall
+# OpenCV here. opencv-python (pulled by upstream EdgeCrafter/DEIMv2 reqs) and
+# opencv-python-headless share the same cv2/ files; uninstalling one deletes
+# them while the other's metadata still says "already satisfied", leaving no
+# importable cv2. Install ultralytics with --no-deps instead, so the existing
+# torch/hub/OpenCV/NumPy stack cannot be changed at all.
+RUN python -m pip install --no-cache-dir --no-deps ultralytics \
     || echo "WARN: ultralytics install failed; SAM2 unavailable, fallback still works"
-RUN (pip uninstall -y opencv-python >/dev/null 2>&1 || true) \
-    && pip install --no-cache-dir "opencv-python-headless>=4.10.0.84"
+
+# Optional helper dependency used by Ultralytics. Also no-deps to avoid drift.
+RUN python -m pip install --no-cache-dir --no-deps ultralytics-thop \
+    || echo "WARN: ultralytics-thop install failed; SAM2 may fall back"
+
+# Verify the base runtime was not changed (fails the build if it was).
 RUN python - <<'PY'
 import torch, cv2, huggingface_hub
 from packaging.version import Version
+
 assert torch.__version__.startswith("2.6"), f"torch changed: {torch.__version__}"
 hv = Version(huggingface_hub.__version__)
 assert Version("0.26.0") <= hv < Version("1.0"), f"bad huggingface-hub: {hv}"
-print("env OK after SAM2 deps: torch", torch.__version__, "cv2", cv2.__version__, "hub", hv)
+
+print("runtime preserved after optional SAM2 deps:", torch.__version__, cv2.__version__, hv)
 PY
 # Best-effort: pre-fetch SAM2 weights into /app/models so runtime needs no
-# download. If the fetch fails the build still succeeds (engine can fetch at
-# runtime, or stay in fallback mode).
+# download. Plain URL fetch (does NOT import ultralytics, which may lack its
+# optional deps under --no-deps). If the fetch fails the build still succeeds
+# (the engine can fetch at runtime, or the worker stays in fallback mode).
+ARG SAM2_WEIGHTS_URL="https://github.com/ultralytics/assets/releases/download/v8.3.0/sam2_b.pt"
 RUN mkdir -p /app/models && python - <<'PY'
+import os, urllib.request
+url = os.environ.get("SAM2_WEIGHTS_URL") or \
+    "https://github.com/ultralytics/assets/releases/download/v8.3.0/sam2_b.pt"
+dst = "/app/models/sam2_b.pt"
 try:
-    import os, shutil
-    from ultralytics import SAM
-    SAM("sam2_b.pt")  # downloads to CWD on first construction
-    if os.path.exists("sam2_b.pt"):
-        shutil.move("sam2_b.pt", "/app/models/sam2_b.pt")
-        print("SAM2 weights baked at /app/models/sam2_b.pt")
-    else:
-        print("WARN: sam2_b.pt not present after load; runtime will fetch")
+    urllib.request.urlretrieve(url, dst)
+    print("SAM2 weights baked at", dst, os.path.getsize(dst), "bytes")
 except Exception as e:  # noqa: BLE001
     print("WARN: could not pre-fetch SAM2 weights:", type(e).__name__, e)
 PY
