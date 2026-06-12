@@ -156,6 +156,7 @@ COPY handler.py /app/handler.py
 COPY build_schema.py /app/build_schema.py
 COPY build_blueprint.py /app/build_blueprint.py
 COPY build_segmentation.py /app/build_segmentation.py
+COPY plan_context.py /app/plan_context.py
 
 # Worker code + upstream engine packages on PYTHONPATH. The EdgeCrafter ecdetseg
 # and ecpose subtrees each ship their own engine package; edgecrafter_loader.py
@@ -227,6 +228,28 @@ ENV BUILD_SEGMENT_ON_EXTRACT="true"
 ENV BUILD_SEGMENT_EVERY_N="3"
 ENV BUILD_SAM2_DEVICE="cuda"
 ENV BUILD_SAM2_WEIGHTS="/app/models/sam2_b.pt"
+
+# ------- Plan Mode selected-crop context -------------------------------------
+# Rule-based crop context + virtualBlueprintPoints are ON by default and need no
+# extra models. Depth / open-vocab / known-part-pose / assembly-state are
+# OPTIONAL, DISABLED safe stubs (no extra deps in this image; they degrade to a
+# clear "unavailable" signal if enabled without a backend). Point-E is never run.
+ENV PLAN_CONTEXT_ENABLED="true"
+ENV PLAN_DEPTH_ENABLED="false"
+ENV PLAN_DEPTH_BACKEND="none"
+ENV PLAN_DEPTH_SAMPLE_POINTS="120"
+ENV PLAN_DEPTH_MAX_RES="384"
+ENV PLAN_DEPTH_EVERY_N="3"
+ENV PLAN_DEPTH_CACHE_TTL_MS="1500"
+ENV PLAN_OPEN_VOCAB_ENABLED="false"
+ENV PLAN_OPEN_VOCAB_BACKEND="none"
+ENV PLAN_OPEN_VOCAB_PROMPTS="pcb board,cable,connector,screw,tool,battery,wire,arduino board"
+ENV PLAN_KNOWN_PART_POSE_ENABLED="false"
+ENV PLAN_KNOWN_PART_POSE_BACKEND="none"
+ENV PLAN_ASSEMBLY_STATE_ENABLED="false"
+ENV DEPTH_MODEL_ID="depth-anything-v2-small"
+ENV DEPTH_DEVICE="cuda"
+ENV DEPTH_CACHE_DIR="/runpod-volume/models/depth"
 
 # ------- DEIMv2 (legacy fallback) configuration ------------------------------
 ENV DEIMV2_DEVICE="cuda"

@@ -85,6 +85,64 @@ class PlanStep(BaseModel):
     qualityCheck: Optional[str] = None
 
 
+class CropEntity(BaseModel):
+    """A YOLO26 detection on the SELECTED CROP (normalized to crop 0..1)."""
+
+    label: str
+    class_id: int
+    confidence: float
+    bbox: Dict[str, float] = Field(default_factory=dict)  # {x, y, w, h}
+    source: Optional[str] = None
+
+
+class CropSegment(BaseModel):
+    """A YOLO26 instance segment on the selected crop (normalized contour)."""
+
+    label: str = ""
+    class_id: int = -1
+    confidence: float = 0.0
+    maskContour: List[Point] = Field(default_factory=list)
+    source: Optional[str] = None
+
+
+class VirtualBlueprintPoint(BaseModel):
+    """A rule-based (or reasoning-enriched) virtual blueprint point.
+
+    role in: anchor | alignment-point | target-position | connection-point
+             | inspection-point | warning-point
+    x/y normalized 0..1 in selected-crop coords; z optional pseudo-depth 0..1.
+    """
+
+    id: str
+    role: str
+    x: float
+    y: float
+    z: Optional[float] = None
+    label: Optional[str] = None
+    instruction: Optional[str] = None
+    linkedStepId: Optional[str] = None
+
+
+class DepthPoint(BaseModel):
+    """A sparse pseudo-depth sample (x/y crop 0..1, z relative depth 0..1)."""
+
+    x: float
+    y: float
+    z: float
+    confidence: Optional[float] = None
+
+
+class PlanContext(BaseModel):
+    """Compact context summary the app/DeepSeek can reason over."""
+
+    selectedLabel: Optional[str] = None
+    objectCount: Optional[int] = None
+    hasMultipleParts: Optional[bool] = None
+    likelyUse: Optional[str] = None  # identify|inspect|assemble|repair|troubleshoot|unknown
+    contextSource: str = "rules"     # yolo26|rules|depth|open-vocab|known-part-pose
+    warnings: List[str] = Field(default_factory=list)
+
+
 class BlueprintFrame(BaseModel):
     """The replayable per-frame blueprint returned inside `blueprint_frame`.
 
@@ -126,5 +184,24 @@ class BlueprintFrame(BaseModel):
     # Plan Mode visual guidance overlays. Kept as flexible dicts so the `arrow`
     # type's nested `from`/`to` points pass through verbatim. Each item is:
     #   {id, type, [x, y] | [from:{x,y}, to:{x,y}], label?, stepId?, confidence?}
-    # type in: arrow | target | ghost-position | highlight | warning-zone
+    # type in: arrow | target | ghost-position | highlight | warning-zone | callout | step-marker
     planOverlays: List[Dict[str, Any]] = Field(default_factory=list)
+
+    # -- Plan-context fields (all optional; geometry/context for the app + DeepSeek) --
+    selectedLabel: Optional[str] = None
+    cropEntities: List[CropEntity] = Field(default_factory=list)
+    cropSegments: List[CropSegment] = Field(default_factory=list)
+    suggestedGoals: List[str] = Field(default_factory=list)
+    virtualBlueprintPoints: List[VirtualBlueprintPoint] = Field(default_factory=list)
+    reasoningSource: Optional[str] = None   # "rules" here; app may set "deepseek"
+
+    depthPoints: List[DepthPoint] = Field(default_factory=list)
+    depthSource: Optional[str] = None
+    depthConfidence: Optional[float] = None
+    depthWarning: Optional[str] = None
+
+    planContext: Optional[PlanContext] = None
+
+    # Optional future adapters -- disabled stubs return None (never required).
+    knownPartPose: Optional[Dict[str, Any]] = None
+    assemblyState: Optional[Dict[str, Any]] = None

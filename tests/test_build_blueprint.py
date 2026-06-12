@@ -146,8 +146,9 @@ def _plan_frame(intent, gesture=None, fid="f-0", sid=None):
 def test_plan_unconfirmed_asks_to_confirm():
     intent = {"taskType": "build", "text": "assemble these", "confirmed": False}
     _, bf = _plan_frame(intent)
-    assert bf["detectedIntent"] is None
+    assert bf["detectedIntent"] == "Waiting for goal"
     assert "task goal" in bf["instruction"].lower()
+    assert "tell me" in bf["nextAction"].lower()
     assert len(bf["planOverlays"]) >= 1  # acceptance #3 -- overlays even when confirming
     assert any(o["type"] == "highlight" for o in bf["planOverlays"])
 

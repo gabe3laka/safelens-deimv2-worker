@@ -292,6 +292,22 @@ async def process_frame_async(payload: Dict[str, Any]) -> Dict[str, Any]:
     ai = make_ai_fields(workflow_mode, geom, hand_out, index_local, gesture,
                         float(geom.get("confidence", 0.0)), frame_index, sess, user_intent)
 
+    # Selected-crop Plan context (rule-based geometry / labels / goals / points).
+    # Plan Mode gets the full block; Build Mode gets only the cheap selectedLabel
+    # (no depth / open-vocab / pose / assembly per the speed-protection rules).
+    plan_extra: Dict[str, Any] = {}
+    payload_label = payload.get("selectedLabel") or sess.get("selected_label")
+    try:
+        import plan_context
+        if workflow_mode == "plan":
+            plan_extra = plan_context.build(geom, region, user_intent, payload_label)
+        elif geom.get("detected_parts"):
+            plan_extra = {"selectedLabel": plan_context.selected_label(
+                geom.get("detected_parts") or [], payload_label, geom.get("maskSource"))}
+    except Exception as exc:  # noqa: BLE001 -- plan context must never break a frame
+        log.warning("build: plan context failed: %s", exc)
+        plan_extra = {}
+
     mask_output = cfg["mask_output"]
     blueprint = {
         "version": 2,
@@ -325,6 +341,12 @@ async def process_frame_async(payload: Dict[str, Any]) -> Dict[str, Any]:
         "currentPlanStepIndex": ai["currentPlanStepIndex"],
         "planOverlays": ai["planOverlays"],
     }
+
+    # Merge the optional Plan-context fields (additive, backward compatible).
+    electronics_safety = plan_extra.pop("electronicsSafety", None)
+    blueprint.update(plan_extra)
+    if electronics_safety and not blueprint.get("safetyWarning"):
+        blueprint["safetyWarning"] = electronics_safety
 
     bp_frame = BlueprintFrame(**blueprint).model_dump()
     sess["frames"].append(bp_frame)
@@ -806,9 +828,9 @@ def _plan_fields(intent, geom, index_local, gesture, confidence, frame_index, se
                                       "Confirm what you want to do", "step-1", 0.5))
         steps, idx = _resolve_plan_steps(session, "confirm", False, high_risk, center, active)
         return {
-            "detectedIntent": None,
+            "detectedIntent": "Waiting for goal",
             "instruction": "I need the task goal to give specific steps. What are you trying to do with this item?",
-            "nextAction": "Confirm your task (identify, inspect, build/assemble, repair) to get step-by-step guidance.",
+            "nextAction": "Tell me what you want to build, inspect, repair, or understand.",
             "safetyWarning": _safety(high_risk),
             "qualityCheck": "Keep the selected item clearly visible.",
             "activityLabel": "Planning area",

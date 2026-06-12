@@ -214,6 +214,35 @@ SAM2 is **optional and never a hard dependency**: when `BUILD_SEGMENTATION_BACKE
 and SAM2 is unavailable, the worker logs and falls back to the contour pipeline.
 Keep SAM2 disabled until the fallback is proven stable.
 
+### Plan Mode selected-crop context (geometry first, reasoning on the app side)
+
+For `/build/session/frame` with `workflowMode: "plan"`, the worker returns
+richer **selected-crop** context so the app + its Supabase/DeepSeek Edge Function
+can reason (the worker never calls DeepSeek). All fields are optional/additive:
+`selectedLabel`, `cropEntities`, `cropSegments`, `suggestedGoals`,
+`virtualBlueprintPoints` (rule-based 2D points -- roles `anchor` /
+`alignment-point` / `target-position` / `connection-point` / `inspection-point`
+/ `warning-point`, capped at 12, all x/y clamped 0..1), `planContext`
+(`selectedLabel`/`objectCount`/`hasMultipleParts`/`likelyUse`/`contextSource`/
+`warnings`), and optional `depthPoints` / `knownPartPose` / `assemblyState`.
+Electronics/PCB scenes get connector/edge points + an "ensure unpowered" safety
+hint. `/detect` stays det-only and fast; segmentation runs only on selected
+Build/Plan crops (lazy-loaded). Build Mode is unchanged (only a cheap
+`selectedLabel`).
+
+Optional adapters are **disabled safe stubs** by default and degrade to a clear
+signal if enabled without a backend (no extra image deps; Point-E is never run):
+
+| Env | Default | Role |
+|-----|---------|------|
+| `PLAN_CONTEXT_ENABLED` | `true` | rule-based crop context (above) |
+| `PLAN_DEPTH_ENABLED` / `PLAN_DEPTH_BACKEND` | `false` / `none` | Depth Anything pseudo-depth on the crop only |
+| `PLAN_OPEN_VOCAB_ENABLED` | `false` | GroundingDINO/Grounded-SAM inspection path |
+| `PLAN_KNOWN_PART_POSE_ENABLED` | `false` | FoundationPose/MegaPose for known parts |
+| `PLAN_ASSEMBLY_STATE_ENABLED` | `false` | IndustReal/ASDF step-state |
+
+`/debug/state` reports a `plan_context` block with all of these.
+
 ## Docker image
 
 Built and pushed to GitHub Container Registry on every push to `main`:

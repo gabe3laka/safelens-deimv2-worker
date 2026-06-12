@@ -69,6 +69,14 @@ def _backend_status_safe():
     except Exception as exc:  # noqa: BLE001
         return {"error": type(exc).__name__ + ": " + str(exc)}
 
+def _plan_context_safe():
+    """plan_context.config(), guarded so debug routes never crash."""
+    try:
+        import plan_context
+        return plan_context.config()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": type(exc).__name__ + ": " + str(exc)}
+
 # -- State --------------------------------------------------------------------
 
 _STATE_LOCK = threading.RLock()
@@ -362,6 +370,7 @@ async def debug_startup(deep: bool = Query(False)):
         except Exception as exc:
             info["diagnostics_error"] = type(exc).__name__ + ": " + str(exc)
         info["backend_status"] = _backend_status_safe()
+        info["plan_context"] = _plan_context_safe()
 
     return JSONResponse(info)
 
@@ -406,6 +415,7 @@ async def debug_state():
         "worker_version": WORKER_VERSION,
         "backend": _active_backend(),
         "backend_status": _backend_status_safe(),
+        "plan_context": _plan_context_safe(),
         "skip_warmup": SKIP_WARMUP,
         "auto_warmup": AUTO_WARMUP,
         "state": _public_state(),
