@@ -17,7 +17,9 @@ All tests run on CPU with mocks (no ultralytics, no GPU, no weights):
 from __future__ import annotations
 
 import base64
+import importlib.util
 import sys
+import types
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -37,12 +39,29 @@ _B64 = base64.b64encode(b"\xff\xd8\xff\xe0fake-jpeg").decode()
 
 @pytest.fixture(autouse=True)
 def _reset_backend_state(monkeypatch):
+    if importlib.util.find_spec("torch") is None:
+        fake_ec = types.ModuleType("edgecrafter_loader")
+        fake_ec._STATE = types.SimpleNamespace(tasks=[], loaded=False)
+        fake_ec.load = lambda: {
+            "backend": "edgecrafter",
+            "tasks_loaded": [],
+            "model_classes": {},
+            "checkpoint_paths": {},
+            "device": "cpu",
+        }
+        fake_ec.infer = lambda pil, conf, class_filter=None: {
+            "entities": [], "poses": [], "inference_ms": 0.0}
+        fake_ec.is_ready = lambda: fake_ec._STATE.loaded
+        monkeypatch.setitem(sys.modules, "edgecrafter_loader", fake_ec)
+
     monkeypatch.setenv("VISION_BACKEND", "yolo26")
     monkeypatch.setenv("FALLBACK_VISION_BACKEND", "edgecrafter")
     monkeypatch.setenv("AUTO_BACKEND_FALLBACK", "true")
+    vision_backend.last_detect_effective_config = None
     vision_backend._BACKEND_STATE.update(
         requested=None, active=None, fallback_active=False, fallback_reason=None)
     yield
+    vision_backend.last_detect_effective_config = None
     vision_backend._BACKEND_STATE.update(
         requested=None, active=None, fallback_active=False, fallback_reason=None)
 
@@ -204,7 +223,7 @@ def test_fallback_detect_shape_and_warning(monkeypatch):
 def test_yolo26_response_shape(monkeypatch):
     monkeypatch.setattr(
         yolo26_loader, "infer",
-        lambda pil, conf, class_filter=None: {
+        lambda pil, conf, class_filter=None, **kwargs: {
             "entities": [{"label": "person", "class_id": 0, "confidence": 0.92,
                           "bbox": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4},
                           "source": "yolo26"}],
@@ -226,6 +245,138 @@ def test_yolo26_response_shape(monkeypatch):
     assert body["segments"][0]["source"] == "yolo26-seg"
     assert len(body["segments"][0]["maskContour"]) == 3
     assert body["warning"] is None
+
+
+# -- Backend-specific effective config ----------------------------------------
+
+def _empty_yolo_infer(called):
+    def _infer(pil, conf, class_filter=None, tasks=None, img_size=None,
+               iou=None, max_det=None):
+        called.update(
+            conf=conf,
+            img_size=img_size,
+            iou=iou,
+            max_det=max_det,
+            class_filter=class_filter,
+        )
+        return {
+            "entities": [],
+            "poses": [],
+            "segments": [],
+            "inference_ms": 1.0,
+            "tasks": ["det"],
+            "model": "YOLO26",
+        }
+    return _infer
+
+
+def test_yolo_uses_yolo_specific_env_config(monkeypatch):
+    called = {}
+    monkeypatch.setenv("YOLO26_CONF", "0.31")
+    monkeypatch.setenv("YOLO26_IMG_SIZE", "832")
+    monkeypatch.setenv("YOLO26_IOU", "0.47")
+    monkeypatch.setenv("YOLO26_MAX_DETECTIONS", "91")
+    monkeypatch.setenv("EDGECRAFTER_CONF", "0.99")
+    monkeypatch.setenv("EDGECRAFTER_IMG_SIZE", "123")
+    monkeypatch.setattr(yolo26_loader, "infer", _empty_yolo_infer(called))
+    vision_backend._BACKEND_STATE.update(requested="yolo26", active="yolo26")
+
+    vision_backend.run_inference(image_b64=_tiny_jpeg_b64(), payload={})
+
+    assert called == {
+        "conf": pytest.approx(0.31),
+        "img_size": 832,
+        "iou": pytest.approx(0.47),
+        "max_det": 91,
+        "class_filter": None,
+    }
+    assert vision_backend.get_last_detect_config()["backend"] == "yolo26"
+
+
+def test_edgecrafter_uses_edgecrafter_specific_env_config(monkeypatch):
+    import edgecrafter_loader as ec
+    called = {}
+    monkeypatch.setenv("EDGECRAFTER_CONF", "0.42")
+    monkeypatch.setenv("EDGECRAFTER_IMG_SIZE", "704")
+    monkeypatch.setenv("YOLO26_CONF", "0.91")
+    monkeypatch.setenv("YOLO26_IMG_SIZE", "1280")
+    monkeypatch.setenv("YOLO26_IOU", "0.19")
+    monkeypatch.setenv("YOLO26_MAX_DETECTIONS", "999")
+
+    def _infer(pil, conf, class_filter=None):
+        called.update(conf=conf, class_filter=class_filter)
+        return {"entities": [], "poses": [], "inference_ms": 1.0}
+
+    monkeypatch.setattr(ec, "infer", _infer)
+    monkeypatch.setattr(ec._STATE, "tasks", ["det"], raising=False)
+    vision_backend._BACKEND_STATE.update(
+        requested="edgecrafter", active="edgecrafter")
+
+    vision_backend.run_inference(image_b64=_tiny_jpeg_b64(), payload={})
+
+    assert called == {"conf": pytest.approx(0.42), "class_filter": None}
+    effective = vision_backend.get_last_detect_config()
+    assert effective["backend"] == "edgecrafter"
+    assert effective["img_size"] == 704
+    assert effective["iou"] is None
+    assert effective["max_det"] is None
+
+
+def test_payload_conf_and_img_size_override_yolo_env(monkeypatch):
+    called = {}
+    monkeypatch.setenv("YOLO26_CONF", "0.31")
+    monkeypatch.setenv("YOLO26_IMG_SIZE", "832")
+    monkeypatch.setattr(yolo26_loader, "infer", _empty_yolo_infer(called))
+    vision_backend._BACKEND_STATE.update(requested="yolo26", active="yolo26")
+
+    vision_backend.run_inference(
+        image_b64=_tiny_jpeg_b64(),
+        payload={"conf": 0.63, "img_size": 512},
+    )
+
+    assert called["conf"] == pytest.approx(0.63)
+    assert called["img_size"] == 512
+    effective = vision_backend.get_last_detect_config()
+    assert effective["conf_source"] == "payload.conf"
+    assert effective["img_size_source"] == "payload.img_size"
+
+
+def test_fallback_recomputes_edgecrafter_config(monkeypatch):
+    import edgecrafter_loader as ec
+    resolved_backends = []
+    called = {}
+    real_resolve = vision_backend.resolve_effective_inference_config
+    monkeypatch.setenv("YOLO26_CONF", "0.11")
+    monkeypatch.setenv("YOLO26_IMG_SIZE", "1280")
+    monkeypatch.setenv("EDGECRAFTER_CONF", "0.44")
+    monkeypatch.setenv("EDGECRAFTER_IMG_SIZE", "608")
+
+    def _track_resolve(backend, payload=None):
+        resolved_backends.append(backend)
+        return real_resolve(backend, payload)
+
+    def _infer(pil, conf, class_filter=None):
+        called["conf"] = conf
+        return {"entities": [], "poses": [], "inference_ms": 1.0}
+
+    monkeypatch.setattr(
+        vision_backend, "resolve_effective_inference_config", _track_resolve)
+    monkeypatch.setattr(ec, "infer", _infer)
+    monkeypatch.setattr(ec._STATE, "tasks", ["det"], raising=False)
+    vision_backend._BACKEND_STATE.update(
+        requested="yolo26",
+        active="edgecrafter",
+        fallback_active=True,
+        fallback_reason="simulated load failure",
+    )
+
+    vision_backend.run_inference(image_b64=_tiny_jpeg_b64(), payload={})
+
+    assert resolved_backends == ["yolo26", "edgecrafter"]
+    assert called["conf"] == pytest.approx(0.44)
+    effective = vision_backend.get_last_detect_config()
+    assert effective["backend"] == "edgecrafter"
+    assert effective["img_size"] == 608
 
 
 # -- 7-10. routes + Build/Plan unchanged ----------------------------------------
@@ -266,6 +417,8 @@ def test_debug_state_includes_backend_status(server_mod):
                     "AUTO_BACKEND_FALLBACK", "YOLO26_MODEL_ID", "YOLO26_TASKS",
                     "YOLO26_DEVICE"):
             assert key in body["env_subset"], key
+        assert "effective_config" in body
+        assert body["last_detect_effective_config"] is None
 
 
 def test_detect_contract_unchanged(server_mod, monkeypatch):
@@ -362,6 +515,34 @@ def test_live_infer_runs_det_only(monkeypatch):
     assert ran == ["det"]
     assert out["tasks"] == ["det"]
     assert out["poses"] == [] and out["segments"] == []
+
+
+def test_predict_passes_iou_and_max_det_to_ultralytics(monkeypatch):
+    from PIL import Image
+    state = _fresh_yolo_state(monkeypatch)
+    called = {}
+    result = object()
+
+    class _Model:
+        def __call__(self, image, **kwargs):
+            called.update(kwargs)
+            return [result]
+
+    state.models["det"] = _Model()
+    state.device = "cpu"
+
+    actual = yolo26_loader._predict(
+        "det", Image.new("RGB", (64, 64)), 0.28, 736, 0.46, 87)
+
+    assert actual is result
+    assert called == {
+        "conf": pytest.approx(0.28),
+        "imgsz": 736,
+        "device": "cpu",
+        "iou": pytest.approx(0.46),
+        "max_det": 87,
+        "verbose": False,
+    }
 
 
 def test_lazy_seg_failure_drops_task(monkeypatch):
