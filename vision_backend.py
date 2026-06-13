@@ -188,11 +188,15 @@ def backend_status() -> Dict[str, Any]:
 # -- Inference ----------------------------------------------------------------
 
 def _yolo26_response(image_b64: str, conf: float,
-                     class_filter: Optional[List[int]]) -> InferResponse:
+                     class_filter: Optional[List[int]],
+                     img_size: Optional[int] = None,
+                     iou: Optional[float] = None,
+                     max_det: Optional[int] = None) -> InferResponse:
     import yolo26_loader
     pil = decode_image(image_b64)
     img_w, img_h = pil.size
-    raw = yolo26_loader.infer(pil, conf, class_filter)
+    raw = yolo26_loader.infer(pil, conf, class_filter,
+                              img_size=img_size, iou=iou, max_det=max_det)
 
     entities = [
         Entity(label=d["label"], class_id=d["class_id"], confidence=d["confidence"],
@@ -268,14 +272,21 @@ def _deimv2_response(image_b64: str, conf: float, img_size: int,
 
 
 def run_inference(image_b64: str, conf: float = 0.25, img_size: int = 640,
-                  class_filter: Optional[List[int]] = None) -> InferResponse:
-    """Dispatch inference to the ACTIVE backend and return a unified response."""
+                  class_filter: Optional[List[int]] = None,
+                  iou: Optional[float] = None,
+                  max_det: Optional[int] = None) -> InferResponse:
+    """Dispatch inference to the ACTIVE backend and return a unified response.
+
+    iou / max_det apply to YOLO26 only (EdgeCrafter and DEIMv2 read their own
+    config internally); when None, yolo26_loader resolves them from YOLO26_*.
+    """
     backend = serving_backend()
     t0 = time.perf_counter()
     if backend == "deimv2":
         resp = _deimv2_response(image_b64, conf, img_size, class_filter)
     elif backend == "yolo26":
-        resp = _yolo26_response(image_b64, conf, class_filter)
+        resp = _yolo26_response(image_b64, conf, class_filter,
+                                img_size=img_size, iou=iou, max_det=max_det)
     else:
         resp = _edgecrafter_response(image_b64, conf, class_filter)
     if not resp.inference_ms:

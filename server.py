@@ -77,6 +77,23 @@ def _plan_context_safe():
     except Exception as exc:  # noqa: BLE001
         return {"error": type(exc).__name__ + ": " + str(exc)}
 
+def _effective_config_safe():
+    """Effective inference config for the actual serving backend (no secrets).
+
+    Mirrors what /detect resolves (with an empty payload), so the actual
+    backend/conf/img_size/iou/max_det can be verified from GET /debug/state.
+    """
+    try:
+        import config_resolver
+        try:
+            from vision_backend import serving_backend
+            backend = serving_backend()
+        except Exception:  # noqa: BLE001
+            backend = _active_backend()
+        return config_resolver.resolve_effective_inference_config(backend, {})
+    except Exception as exc:  # noqa: BLE001
+        return {"error": type(exc).__name__ + ": " + str(exc)}
+
 # -- State --------------------------------------------------------------------
 
 _STATE_LOCK = threading.RLock()
@@ -415,6 +432,7 @@ async def debug_state():
         "worker_version": WORKER_VERSION,
         "backend": _active_backend(),
         "backend_status": _backend_status_safe(),
+        "effective_config": _effective_config_safe(),
         "plan_context": _plan_context_safe(),
         "skip_warmup": SKIP_WARMUP,
         "auto_warmup": AUTO_WARMUP,
@@ -520,13 +538,16 @@ async def detect(payload: Dict[str, Any]):
         )
 
     try:
-        from vision_backend import run_inference
-        conf = float(os.getenv("EDGECRAFTER_CONF", payload.get("conf", 0.25)))
-        img_size = int(os.getenv("EDGECRAFTER_IMG_SIZE", payload.get("img_size", 640)))
+        import config_resolver
+        from vision_backend import run_inference, serving_backend
+        # Resolve conf/img_size/iou/max_det for the ACTUAL serving backend
+        # (post auto-fallback): YOLO26 uses YOLO26_*, EdgeCrafter uses
+        # EDGECRAFTER_* -- never reuse one backend's values for the other.
+        cfg = config_resolver.resolve_effective_inference_config(serving_backend(), payload)
         class_filter = payload.get("classes")
         resp = run_inference(
-            image_b64=image_b64, conf=conf,
-            img_size=img_size, class_filter=class_filter,
+            image_b64=image_b64, conf=cfg["conf"], img_size=cfg["img_size"],
+            iou=cfg["iou"], max_det=cfg["max_det"], class_filter=class_filter,
         )
         return JSONResponse(resp.model_dump())
     except Exception as exc:

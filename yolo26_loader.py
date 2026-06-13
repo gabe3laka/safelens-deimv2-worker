@@ -43,6 +43,20 @@ log = logging.getLogger(__name__)
 def _env(name, default=""):
     return os.environ.get(name, default)
 
+def _env_float(name, default):
+    """Parse a float env var, falling back safely on missing/invalid values."""
+    try:
+        return float(_env(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+def _env_int(name, default):
+    """Parse an int env var (via float, so '300.0' works), safe on invalid."""
+    try:
+        return int(float(_env(name, str(default))))
+    except (TypeError, ValueError):
+        return int(default)
+
 def _cache_dir():
     return _env("YOLO26_CACHE_DIR", "/runpod-volume/models/yolo26")
 
@@ -349,22 +363,34 @@ def is_ready():
 
 # -- Inference --------------------------------------------------------------------
 
-def _predict(task, pil_img, conf, img_size):
-    """Run one task model on a PIL image (RGB-safe) and return the Result."""
+def _predict(task, pil_img, conf, img_size, iou=None, max_det=None):
+    """Run one task model on a PIL image (RGB-safe) and return the Result.
+
+    iou / max_det fall back to YOLO26_IOU / YOLO26_MAX_DETECTIONS when not
+    provided, so the Ultralytics call always gets concrete NMS parameters.
+    """
     model = _STATE.models[task]
-    results = model(pil_img, conf=conf, imgsz=img_size, device=_STATE.device,
-                    verbose=False)
+    if iou is None:
+        iou = _env_float("YOLO26_IOU", 0.45)
+    if max_det is None:
+        max_det = _env_int("YOLO26_MAX_DETECTIONS", 300)
+    results = model(pil_img, conf=conf, imgsz=img_size, iou=iou, max_det=max_det,
+                    device=_STATE.device, verbose=False)
     return results[0]
 
 
-def infer(pil_img, conf, class_filter=None, tasks=None):
+def infer(pil_img, conf, class_filter=None, tasks=None,
+          img_size=None, iou=None, max_det=None):
     """Run the given tasks (default: LIVE tasks) on a frame.
 
     /detect speed protection: by default only det runs (and pose only when
     opted in); seg never runs here unless explicitly listed in the live tasks.
+    img_size / iou / max_det come from the resolved /detect config; each falls
+    back to its YOLO26_* env var when None.
     """
     img_w, img_h = pil_img.size
-    img_size = int(float(_env("YOLO26_IMG_SIZE", "640")))
+    if img_size is None:
+        img_size = _env_int("YOLO26_IMG_SIZE", 640)
     run_tasks = list(tasks) if tasks else mode_tasks("live")
     t0 = time.perf_counter()
     entities: List[Dict[str, Any]] = []
@@ -373,7 +399,7 @@ def infer(pil_img, conf, class_filter=None, tasks=None):
     ran: List[str] = []
 
     if "det" in run_tasks and "det" in _STATE.models:
-        res = _predict("det", pil_img, conf, img_size)
+        res = _predict("det", pil_img, conf, img_size, iou=iou, max_det=max_det)
         ran.append("det")
         if res.boxes is not None and len(res.boxes):
             entities = normalize_detections(
@@ -385,7 +411,7 @@ def infer(pil_img, conf, class_filter=None, tasks=None):
             )
 
     if "pose" in run_tasks and ensure_task("pose") is not None:
-        res = _predict("pose", pil_img, conf, img_size)
+        res = _predict("pose", pil_img, conf, img_size, iou=iou, max_det=max_det)
         ran.append("pose")
         kpts = getattr(res, "keypoints", None)
         if kpts is not None and kpts.xy is not None and len(kpts.xy):
@@ -399,7 +425,7 @@ def infer(pil_img, conf, class_filter=None, tasks=None):
             )
 
     if "seg" in run_tasks and ensure_task("seg") is not None:
-        res = _predict("seg", pil_img, conf, img_size)
+        res = _predict("seg", pil_img, conf, img_size, iou=iou, max_det=max_det)
         ran.append("seg")
         masks = getattr(res, "masks", None)
         if masks is not None and masks.xy:
@@ -439,7 +465,7 @@ def crop_analysis(pil_img, conf, mode="build"):
         if not _STATE.loaded:
             return out  # only piggyback on an already-warmed yolo26 backend
         img_w, img_h = pil_img.size
-        img_size = int(float(_env("YOLO26_IMG_SIZE", "640")))
+        img_size = _env_int("YOLO26_IMG_SIZE", 640)
         tasks = mode_tasks("build" if mode == "build" else "plan")
 
         if "det" in tasks and "det" in _STATE.models:
