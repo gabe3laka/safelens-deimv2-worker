@@ -156,6 +156,23 @@ def _ready_state():
              and detail["config_valid"] and detail["accepting_frames"])
     return ready, detail
 
+def _effective_config_safe():
+    """Effective inference config for the actual serving backend (no secrets).
+
+    Mirrors what /detect resolves (with an empty payload), so the actual
+    backend/conf/img_size/iou/max_det can be verified from GET /debug/state.
+    """
+    try:
+        import config_resolver
+        try:
+            from vision_backend import serving_backend
+            backend = serving_backend()
+        except Exception:  # noqa: BLE001
+            backend = _active_backend()
+        return config_resolver.resolve_effective_inference_config(backend, {})
+    except Exception as exc:  # noqa: BLE001
+        return {"error": type(exc).__name__ + ": " + str(exc)}
+
 # -- State --------------------------------------------------------------------
 
 _STATE_LOCK = threading.RLock()
@@ -587,6 +604,7 @@ async def debug_state():
         "worker_version": WORKER_VERSION,
         "backend": _active_backend(),
         "backend_status": _backend_status_safe(),
+        "effective_config": _effective_config_safe(),
         "plan_context": _plan_context_safe(),
         "risk_engine": _risk_config_safe(),
         "reasoner": _reasoner_status_safe(),

@@ -43,6 +43,20 @@ log = logging.getLogger(__name__)
 def _env(name, default=""):
     return os.environ.get(name, default)
 
+def _env_float(name, default):
+    """Parse a float env var, falling back safely on missing/invalid values."""
+    try:
+        return float(_env(name, str(default)))
+    except (TypeError, ValueError):
+        return float(default)
+
+def _env_int(name, default):
+    """Parse an int env var (via float, so '300.0' works), safe on invalid."""
+    try:
+        return int(float(_env(name, str(default))))
+    except (TypeError, ValueError):
+        return int(default)
+
 def _cache_dir():
     return _env("YOLO26_CACHE_DIR", "/runpod-volume/models/yolo26")
 
@@ -365,6 +379,8 @@ def infer(pil_img, conf, class_filter=None, tasks=None, img_size=None,
 
     /detect speed protection: by default only det runs (and pose only when
     opted in); seg never runs here unless explicitly listed in the live tasks.
+    img_size / iou / max_det come from the resolved /detect config; each falls
+    back to its YOLO26_* env var when None.
     """
     img_w, img_h = pil_img.size
     img_size = int(img_size if img_size is not None

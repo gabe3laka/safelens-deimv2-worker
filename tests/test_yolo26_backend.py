@@ -223,7 +223,7 @@ def test_fallback_detect_shape_and_warning(monkeypatch):
 def test_yolo26_response_shape(monkeypatch):
     monkeypatch.setattr(
         yolo26_loader, "infer",
-        lambda pil, conf, class_filter=None, **kwargs: {
+        lambda pil, conf, class_filter=None, **kw: {
             "entities": [{"label": "person", "class_id": 0, "confidence": 0.92,
                           "bbox": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4},
                           "source": "yolo26"}],
