@@ -406,10 +406,14 @@ async def debug_model_load():
 async def debug_state():
     """Non-sensitive snapshot of worker state, config, checkpoints and GPU.
 
-    Surfaces only the EdgeCrafter config env vars listed below -- never
+    Surfaces only the config env vars listed below -- never
     secrets, API keys, or tokens (e.g. HF_TOKEN is deliberately excluded).
     """
+    from config_resolver import get_effective_config_summary
+    from vision_backend import get_last_detect_config
+    
     cuda_available, gpu_name = _torch_cuda_info()
+    
     return JSONResponse({
         "ok": True,
         "worker_version": WORKER_VERSION,
@@ -419,6 +423,8 @@ async def debug_state():
         "skip_warmup": SKIP_WARMUP,
         "auto_warmup": AUTO_WARMUP,
         "state": _public_state(),
+        "effective_config": get_effective_config_summary(),
+        "last_detect_effective_config": get_last_detect_config(),
         "env_subset": {
             "VISION_BACKEND": os.getenv("VISION_BACKEND", ""),
             "FALLBACK_VISION_BACKEND": os.getenv("FALLBACK_VISION_BACKEND", ""),
@@ -436,6 +442,8 @@ async def debug_state():
             "YOLO26_DEVICE": os.getenv("YOLO26_DEVICE", ""),
             "YOLO26_IMG_SIZE": os.getenv("YOLO26_IMG_SIZE", ""),
             "YOLO26_CONF": os.getenv("YOLO26_CONF", ""),
+            "YOLO26_IOU": os.getenv("YOLO26_IOU", ""),
+            "YOLO26_MAX_DETECTIONS": os.getenv("YOLO26_MAX_DETECTIONS", ""),
             "YOLO26_CACHE_DIR": os.getenv("YOLO26_CACHE_DIR", ""),
             "EDGECRAFTER_TASKS": os.getenv("EDGECRAFTER_TASKS", ""),
             "EDGECRAFTER_DEVICE": os.getenv("EDGECRAFTER_DEVICE", ""),
@@ -521,12 +529,11 @@ async def detect(payload: Dict[str, Any]):
 
     try:
         from vision_backend import run_inference
-        conf = float(os.getenv("EDGECRAFTER_CONF", payload.get("conf", 0.25)))
-        img_size = int(os.getenv("EDGECRAFTER_IMG_SIZE", payload.get("img_size", 640)))
         class_filter = payload.get("classes")
         resp = run_inference(
-            image_b64=image_b64, conf=conf,
-            img_size=img_size, class_filter=class_filter,
+            image_b64=image_b64,
+            class_filter=class_filter,
+            payload=payload,  # Pass payload so config_resolver can extract conf/img_size
         )
         return JSONResponse(resp.model_dump())
     except Exception as exc:
