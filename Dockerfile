@@ -145,6 +145,7 @@ COPY schema.py /app/schema.py
 COPY edgecrafter_loader.py /app/edgecrafter_loader.py
 COPY yolo26_loader.py /app/yolo26_loader.py
 COPY vision_backend.py /app/vision_backend.py
+COPY config_resolver.py /app/config_resolver.py
 COPY deimv2_infer.py /app/deimv2_infer.py
 COPY official_deimv2_loader.py /app/official_deimv2_loader.py
 COPY server.py /app/server.py
@@ -195,6 +196,8 @@ ENV YOLO26_SEG_EVERY_N="3"
 ENV YOLO26_DEVICE="cuda"
 ENV YOLO26_IMG_SIZE="640"
 ENV YOLO26_CONF="0.25"
+ENV YOLO26_IOU="0.50"
+ENV YOLO26_MAX_DETECTIONS="170"
 ENV YOLO26_CACHE_DIR="/runpod-volume/models/yolo26"
 # Ultralytics container hardening: writable config dir; never pip at runtime.
 ENV YOLO_CONFIG_DIR="/tmp/Ultralytics"

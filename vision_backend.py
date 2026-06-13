@@ -28,10 +28,12 @@ import io
 import logging
 import os
 import time
+from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
 from PIL import Image
 
+from config_resolver import resolve_effective_inference_config
 from schema import BBox, Entity, Keypoint, Pose, Segment, InferResponse
 
 log = logging.getLogger(__name__)
@@ -43,6 +45,7 @@ _BACKEND_STATE: Dict[str, Any] = {
     "fallback_active": False,
     "fallback_reason": None,
 }
+last_detect_effective_config: Optional[Dict[str, Any]] = None
 
 
 def active_backend() -> str:
@@ -62,6 +65,13 @@ def auto_fallback_enabled() -> bool:
 def serving_backend() -> str:
     """The backend that actually serves /detect (post-fallback)."""
     return _BACKEND_STATE["active"] or active_backend()
+
+
+def get_last_detect_config() -> Optional[Dict[str, Any]]:
+    """Return a JSON-safe snapshot of the config used by the last /detect."""
+    if last_detect_effective_config is None:
+        return None
+    return dict(last_detect_effective_config)
 
 
 def decode_image(image_b64: str) -> "Image.Image":
@@ -187,12 +197,20 @@ def backend_status() -> Dict[str, Any]:
 
 # -- Inference ----------------------------------------------------------------
 
-def _yolo26_response(image_b64: str, conf: float,
+def _yolo26_response(image_b64: str, conf: float, img_size: int,
+                     iou: float, max_det: int,
                      class_filter: Optional[List[int]]) -> InferResponse:
     import yolo26_loader
     pil = decode_image(image_b64)
     img_w, img_h = pil.size
-    raw = yolo26_loader.infer(pil, conf, class_filter)
+    raw = yolo26_loader.infer(
+        pil,
+        conf,
+        class_filter,
+        img_size=img_size,
+        iou=iou,
+        max_det=max_det,
+    )
 
     entities = [
         Entity(label=d["label"], class_id=d["class_id"], confidence=d["confidence"],
@@ -267,17 +285,43 @@ def _deimv2_response(image_b64: str, conf: float, img_size: int,
     return legacy
 
 
-def run_inference(image_b64: str, conf: float = 0.25, img_size: int = 640,
-                  class_filter: Optional[List[int]] = None) -> InferResponse:
-    """Dispatch inference to the ACTIVE backend and return a unified response."""
+def run_inference(image_b64: str, conf: Optional[float] = None,
+                  img_size: Optional[int] = None,
+                  class_filter: Optional[List[int]] = None,
+                  payload: Optional[Dict[str, Any]] = None) -> InferResponse:
+    """Resolve backend-specific config and dispatch to the active backend."""
+    global last_detect_effective_config
+
+    config_payload = dict(payload or {})
+    if conf is not None:
+        config_payload.setdefault("conf", conf)
+    if img_size is not None:
+        config_payload.setdefault("img_size", img_size)
+
+    requested = _BACKEND_STATE["requested"] or active_backend()
     backend = serving_backend()
+    effective = resolve_effective_inference_config(requested, config_payload)
+    if backend != requested:
+        # A load fallback must never inherit the failed backend's settings.
+        effective = resolve_effective_inference_config(backend, config_payload)
+    last_detect_effective_config = asdict(effective)
+
     t0 = time.perf_counter()
     if backend == "deimv2":
-        resp = _deimv2_response(image_b64, conf, img_size, class_filter)
+        resp = _deimv2_response(
+            image_b64, effective.conf, effective.img_size, class_filter)
     elif backend == "yolo26":
-        resp = _yolo26_response(image_b64, conf, class_filter)
+        resp = _yolo26_response(
+            image_b64,
+            effective.conf,
+            effective.img_size,
+            effective.iou if effective.iou is not None else 0.50,
+            effective.max_det if effective.max_det is not None else 170,
+            class_filter,
+        )
     else:
-        resp = _edgecrafter_response(image_b64, conf, class_filter)
+        resp = _edgecrafter_response(
+            image_b64, effective.conf, class_filter)
     if not resp.inference_ms:
         resp.inference_ms = round((time.perf_counter() - t0) * 1000.0, 2)
     if _BACKEND_STATE["fallback_active"]:
