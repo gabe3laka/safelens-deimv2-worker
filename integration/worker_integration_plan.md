@@ -7,7 +7,7 @@ to `/detect`, `/ws/vision`, or `/build/*`.
 
 ## Current Draft State
 
-`draft-branch/agentic_hse/` contains the canonical graph, six node
+`agentic_hse/` contains the canonical graph, six node
 implementations, typed models, reasoning client, approval helpers, and FastAPI
 router. `server.py` mounts the router under `/agentic`.
 

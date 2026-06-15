@@ -2,6 +2,22 @@
 
 SafeLens vision worker for RunPod -- live HTTP server mode.
 
+## Agentic HSE bundle
+
+The `feat/agentic-hse-draft` branch also contains the complete SafeLens Agentic
+HSE handoff, not only the worker runtime:
+
+- `agentic_hse/` and `agents/`: LangGraph orchestration and Agent 1-6 contracts
+- `schemas/`, `integration/`, `db/`, `checkpointer/`: API, data, SQL, and HITL support
+- `runpod_reasoning/` and `runpod_training/`: GPU service/training handoffs
+- `datasets/` and `rag/`: safe-source catalogs and local indexing/preparation tools
+- `training-materials/`: anonymized HSE learning templates
+- `report.md`, `INDEX.md`, and `DATASET_COLLECTION_PROMPT.md`: delivery documentation
+
+Raw datasets, private training candidates, source documents, generated indexes,
+model weights, credentials, and checkpoint database files are intentionally not
+committed.
+
 ## Vision backends (YOLO26 default, EdgeCrafter fallback)
 
 | Backend | Role | Selected by |

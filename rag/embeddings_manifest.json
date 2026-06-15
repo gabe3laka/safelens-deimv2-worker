@@ -1,0 +1,19 @@
+{
+  "status": "awaiting_documents",
+  "generated_at": "2026-06-15T17:37:13.612031+00:00",
+  "model": {
+    "name": "sentence-transformers/all-MiniLM-L6-v2",
+    "license": "Apache-2.0"
+  },
+  "dimensions": {
+    "native": 384,
+    "pgvector_export": 384
+  },
+  "chunking": {
+    "strategy": "character_window",
+    "size": 1800,
+    "overlap": 250
+  },
+  "index_backend": "faiss",
+  "source_documents": []
+}

@@ -16,7 +16,7 @@ from agentic_hse.nodes.observation_agent import _fallback
 from agentic_hse.nodes.risk_assessment_agent import run_risk_assessment_agent
 from agentic_hse.nodes.vision_improvement_agent import run_vision_improvement_agent
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_score_boundaries_and_invalid_values():
@@ -192,7 +192,7 @@ def test_dataset_split_keeps_groups_together(tmp_path):
 
 def test_rag_export_and_loader_contract_match():
     builder = (ROOT / "rag" / "build_local_index.py").read_text(encoding="utf-8")
-    loader = (ROOT / "draft-branch" / "db" / "pgvector_loader.sql").read_text(encoding="utf-8")
+    loader = (ROOT / "db" / "pgvector_loader.sql").read_text(encoding="utf-8")
     assert '"embedding_json"' in builder
     assert "documents_export.csv" in builder
     assert "chunks_export.csv" in builder
@@ -204,7 +204,7 @@ def test_json_artifacts_and_openapi_contract():
     for path in ROOT.rglob("*.json"):
         if "__pycache__" not in path.parts:
             json.loads(path.read_text(encoding="utf-8"))
-    openapi = (ROOT / "draft-branch" / "integration" / "openapi-agentic-hse.yaml").read_text(encoding="utf-8")
+    openapi = (ROOT / "integration" / "openapi-agentic-hse.yaml").read_text(encoding="utf-8")
     assert "reasoning_url" not in openapi
     assert "thread_id" in openapi
     assert "revised_payload" in openapi

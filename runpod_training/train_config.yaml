@@ -1,0 +1,108 @@
+model:
+  family: deimv2
+  license: Apache-2.0
+  base_checkpoint: replace-with-reviewed-checkpoint
+  num_classes: 25
+
+experiment:
+  name: safelens-agentic-hse-deimv2-baseline
+  seed: 20260615
+  output_dir: ./outputs
+  auto_deploy: false
+  promotion_requires_human_approval: true
+
+data:
+  source_manifest: ../datasets/dataset_manifest.json
+  source_manifest_role: license-and-acquisition-catalog
+  prepared_root: ./prepared
+  coco_train: ./prepared/annotations/train.json
+  coco_val: ./prepared/annotations/val.json
+  coco_test: ./prepared/annotations/test.json
+  yolo_yaml: ./prepared/data.yaml
+  private_candidate_dir: ../datasets/training-candidates
+  split:
+    train: 0.80
+    val: 0.10
+    test: 0.10
+  classes:
+    - person
+    - hardhat
+    - no_hardhat
+    - safety_vest
+    - no_safety_vest
+    - gloves
+    - no_gloves
+    - goggles
+    - no_goggles
+    - mask
+    - no_mask
+    - ladder
+    - scaffold
+    - safety_cone
+    - forklift
+    - suspended_load
+    - fire
+    - smoke
+    - spill
+    - trailing_cable
+    - open_hole
+    - open_panel
+    - extinguisher
+    - blocked_exit
+    - gas_cylinder
+
+training:
+  image_size: 640
+  epochs: 80
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  precision: amp
+  optimizer: adamw
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  warmup_epochs: 3
+  early_stopping_patience: 12
+  num_workers: 8
+  save_best_metric: map_50_95
+
+augmentation:
+  horizontal_flip: 0.5
+  color_jitter: 0.2
+  random_scale: [0.8, 1.2]
+  copy_paste: 0.15
+  note: Use only approved commercial-safe source images and cutouts.
+
+evaluation:
+  incumbent: yolo26
+  metrics:
+    - map_50
+    - map_50_95
+    - precision
+    - recall
+    - false_negative_rate
+    - latency_ms
+    - vram_mb
+  critical_classes:
+    - no_hardhat
+    - no_safety_vest
+    - forklift
+    - suspended_load
+    - fire
+    - smoke
+    - open_hole
+    - open_panel
+    - blocked_exit
+  slices:
+    - site
+    - camera
+    - lighting
+    - occlusion
+    - distance
+  reject_on_critical_recall_regression: true
+
+registry:
+  file: ../schemas/model_registry.json
+  candidate_status: pending_approval
+  require_weights_sha256: true
+  require_dataset_hash: true
+  require_approval_record: true

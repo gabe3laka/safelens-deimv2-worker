@@ -47,6 +47,13 @@ results/
 checkpointer/pgdata/
 runpod_training/prepared/
 datasets/raw/
+datasets/training-candidates/*
+!datasets/training-candidates/README.md
+rag/index/
+rag/source-documents/*
+!rag/source-documents/.gitkeep
+rag/documents_export.*
+rag/chunks_export.*
 *.jpg
 *.jpeg
 *.png

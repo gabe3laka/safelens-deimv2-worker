@@ -1,0 +1,14 @@
+[
+  {"pair_id":"cup_edge_context","safe":{"object":"cup","location":"center_table"},"unsafe":{"object":"cup","location":"edge_table","people_below":true}},
+  {"pair_id":"spill_traffic_context","safe":{"object":"spill","location":"unused_room"},"unsafe":{"object":"spill","location":"stair_base","traffic":"high"}},
+  {"pair_id":"loose_bracket_height_context","safe":{"object":"loose_bracket","height":"ground"},"unsafe":{"object":"loose_bracket","height":"over_walkway","people_below":true}},
+  {"pair_id":"ladder_access_context","safe":{"object":"ladder","secured":true,"access":"closed"},"unsafe":{"object":"ladder","secured":false,"worker_on_ladder":true}},
+  {"pair_id":"open_hole_barrier_context","safe":{"object":"floor_opening","covered":true,"cover_rated":true},"unsafe":{"object":"floor_opening","covered":false,"walkway":"active"}},
+  {"pair_id":"forklift_separation_context","safe":{"object":"forklift","pedestrian_route":"segregated"},"unsafe":{"object":"forklift","pedestrian_route":"shared","blind_corner":true}},
+  {"pair_id":"suspended_load_context","safe":{"object":"suspended_load","exclusion_zone":true},"unsafe":{"object":"suspended_load","people_below":true}},
+  {"pair_id":"electrical_panel_context","safe":{"object":"panel","closed":true,"dry":true},"unsafe":{"object":"panel","open":true,"water_nearby":true}},
+  {"pair_id":"hot_work_context","safe":{"object":"hot_work","permit":true,"combustibles_removed":true},"unsafe":{"object":"hot_work","permit":false,"combustibles_nearby":true}},
+  {"pair_id":"gas_cylinder_context","safe":{"object":"gas_cylinder","upright":true,"secured":true},"unsafe":{"object":"gas_cylinder","horizontal":true,"valve_unprotected":true}},
+  {"pair_id":"blocked_exit_context","safe":{"object":"exit","clear":true},"unsafe":{"object":"exit","blocked":true,"occupied_area":true}},
+  {"pair_id":"scaffold_edge_context","safe":{"object":"scaffold","guardrails":true,"inspection_current":true},"unsafe":{"object":"scaffold","guardrails":false,"worker_at_height":true}}
+]
