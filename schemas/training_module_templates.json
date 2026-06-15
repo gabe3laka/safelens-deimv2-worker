@@ -1,0 +1,35 @@
+{
+  "version": "2026-06-15",
+  "templates": [
+    {
+      "id": "toolbox_talk",
+      "sections": [
+        "topic",
+        "why_it_matters",
+        "what_went_wrong",
+        "controls",
+        "worker_questions",
+        "supervisor_checks"
+      ]
+    },
+    {
+      "id": "micro_learning",
+      "sections": [
+        "scenario",
+        "hazard",
+        "correct_behavior",
+        "quiz",
+        "escalation_rule"
+      ]
+    },
+    {
+      "id": "incident_refresher",
+      "sections": [
+        "case_summary",
+        "root_causes",
+        "controls",
+        "verification"
+      ]
+    }
+  ]
+}

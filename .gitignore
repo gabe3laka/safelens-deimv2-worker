@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.env
+.venv/
+venv/
+env/
+
+# Model weights & checkpoints — never commit these
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.trt
+*.engine
+ckpts/
+weights/
+checkpoints/
+models/
+
+# DEIMv2 source (cloned at Docker build time, not committed)
+/opt/DEIMv2/
+DEIMv2/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test outputs
+output/
+results/
+*.jpg
+*.jpeg
+*.png
+*.mp4
+
+# Logs
+*.log
+logs/
+
+# Docker
+.dockerignore

@@ -1,0 +1,29 @@
+{
+  "version": "2026-06-15",
+  "templates": [
+    {
+      "id": "site_observation",
+      "fields": [
+        "observation",
+        "objective_evidence",
+        "risk_rating",
+        "standard_reference",
+        "corrective_action",
+        "preventive_action",
+        "responsible_role",
+        "due_date",
+        "verification_method"
+      ]
+    },
+    {
+      "id": "permit_nonconformance",
+      "fields": [
+        "permit_type",
+        "gap",
+        "evidence",
+        "immediate_action",
+        "closeout_requirement"
+      ]
+    }
+  ]
+}

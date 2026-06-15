@@ -1,0 +1,41 @@
+# RunPod serverless SDK (kept for backward compatibility with handler.py)
+runpod>=1.7.0
+
+# FastAPI live-server (live-server mode -- server.py / bootstrap.py)
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Image decoding
+Pillow>=10.0.0
+
+# HTTP / schema validation
+requests>=2.31.0
+pydantic>=2.0.0
+
+# Numerical
+numpy>=1.24.0
+
+# ----- Pinned ML runtime deps ------------------------------------------------
+# torch / torchvision pinned to the CUDA base image build (pytorch 2.6.0).
+# EdgeCrafter (default backend) requires torch >= 2.6.0, so do NOT downgrade.
+torch==2.6.0
+torchvision==0.21.0
+
+# Transformers stack (used by the DEIMv2 legacy fallback backend).
+transformers>=4.46.0,<4.50.0
+huggingface-hub>=0.26.0
+safetensors>=0.4.5
+tokenizers>=0.20.0
+accelerate>=1.0.0
+timm>=1.0.11
+opencv-python-headless>=4.10.0.84
+
+# EdgeCrafter / DEIMv2 upstream extras
+faster-coco-eval>=1.6.7
+PyYAML
+scipy
+pycocotools
+
+# ----- Build Mode (lightweight blueprint processing) -------------------------
+# CPU-only; NO new packages and NO GPU/model deps. Build Mode reuses Pillow and
+# numpy (above) plus opencv-python-headless (above) for edge/contour extraction.

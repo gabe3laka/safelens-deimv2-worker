@@ -1,0 +1,57 @@
+{
+  "version": "2026-06-15",
+  "tools": [
+    {
+      "name": "search_company_docs",
+      "input": [
+        "query",
+        "site_id"
+      ],
+      "output": "rag_result[]"
+    },
+    {
+      "name": "reason_over_hazard",
+      "input": [
+        "detections",
+        "frame_ref",
+        "company_profile",
+        "zone_context"
+      ],
+      "output": "reasoning_schema"
+    },
+    {
+      "name": "create_risk_assessment_draft",
+      "input": [
+        "reasoning_record",
+        "risk_matrix_config"
+      ],
+      "output": "risk_assessment_draft"
+    },
+    {
+      "name": "draft_audit_observation",
+      "input": [
+        "reasoning_record",
+        "checklist_context"
+      ],
+      "output": "audit_observation_draft"
+    },
+    {
+      "name": "queue_training_candidate",
+      "input": [
+        "frame_ref",
+        "hazard_tags",
+        "privacy_flags"
+      ],
+      "output": "dataset_candidate_record"
+    },
+    {
+      "name": "request_human_approval",
+      "input": [
+        "action_type",
+        "payload",
+        "reason"
+      ],
+      "output": "approval_token"
+    }
+  ]
+}

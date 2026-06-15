@@ -1,0 +1,31 @@
+{
+  "model_family": "DEIM/DEIMv2-compatible HSE taxonomy",
+  "version": "2026-06-15",
+  "classes": [
+    "person",
+    "hardhat",
+    "no_hardhat",
+    "safety_vest",
+    "no_safety_vest",
+    "gloves",
+    "no_gloves",
+    "goggles",
+    "no_goggles",
+    "mask",
+    "no_mask",
+    "ladder",
+    "scaffold",
+    "safety_cone",
+    "forklift",
+    "suspended_load",
+    "fire",
+    "smoke",
+    "spill",
+    "trailing_cable",
+    "open_hole",
+    "open_panel",
+    "extinguisher",
+    "blocked_exit",
+    "gas_cylinder"
+  ]
+}

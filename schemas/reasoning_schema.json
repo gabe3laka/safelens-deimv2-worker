@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SafeLens Senior QHSE Reasoning Output",
+  "type": "object",
+  "required": [
+    "hazard",
+    "object_or_condition",
+    "location_context",
+    "risk_state",
+    "likelihood",
+    "severity",
+    "score",
+    "matrix_band",
+    "hierarchy_of_controls_recommendation",
+    "reasoning",
+    "standard_reference",
+    "requires_human_approval"
+  ],
+  "properties": {
+    "hazard": {
+      "type": "string"
+    },
+    "object_or_condition": {
+      "type": "string"
+    },
+    "location_context": {
+      "type": "string"
+    },
+    "is_elevated": {
+      "type": "boolean"
+    },
+    "people_exposed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "risk_state": {
+      "type": "string",
+      "enum": [
+        "latent",
+        "active"
+      ]
+    },
+    "trigger_condition": {
+      "type": "string"
+    },
+    "likelihood": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5
+    },
+    "severity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5
+    },
+    "score": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 25
+    },
+    "matrix_band": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ]
+    },
+    "hierarchy_of_controls_recommendation": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "control_type",
+          "action"
+        ],
+        "properties": {
+          "control_type": {
+            "type": "string",
+            "enum": [
+              "elimination",
+              "substitution",
+              "engineering",
+              "administrative",
+              "ppe"
+            ]
+          },
+          "action": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "reasoning": {
+      "type": "string"
+    },
+    "standard_reference": {
+      "type": "string"
+    },
+    "requires_human_approval": {
+      "type": "boolean"
+    }
+  }
+}

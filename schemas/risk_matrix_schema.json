@@ -1,0 +1,47 @@
+{
+  "version": "2026-06-15",
+  "supported_matrices": [
+    3,
+    4,
+    5
+  ],
+  "default_matrix": 5,
+  "bands": [
+    {
+      "min": 1,
+      "max": 4,
+      "label": "low"
+    },
+    {
+      "min": 5,
+      "max": 9,
+      "label": "medium"
+    },
+    {
+      "min": 10,
+      "max": 16,
+      "label": "high",
+      "requires_human_approval": true
+    },
+    {
+      "min": 17,
+      "max": 25,
+      "label": "critical",
+      "requires_human_approval": true,
+      "default_action": "halt_work"
+    }
+  ],
+  "fields": [
+    "hazard",
+    "persons_at_risk",
+    "likelihood",
+    "severity",
+    "score",
+    "existing_controls",
+    "recommended_controls",
+    "residual_likelihood",
+    "residual_severity",
+    "residual_score",
+    "standard_reference"
+  ]
+}

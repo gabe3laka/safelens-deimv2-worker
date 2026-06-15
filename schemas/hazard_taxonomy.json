@@ -1,0 +1,103 @@
+{
+  "version": "2026-06-15",
+  "categories": [
+    {
+      "id": "ppe_non_compliance",
+      "hazards": [
+        "missing_hardhat",
+        "missing_vest",
+        "missing_gloves",
+        "missing_goggles",
+        "missing_mask"
+      ]
+    },
+    {
+      "id": "working_at_height",
+      "hazards": [
+        "unguarded_edge",
+        "no_fall_arrest",
+        "unsafe_scaffold_access"
+      ]
+    },
+    {
+      "id": "ladder_scaffold",
+      "hazards": [
+        "unsafe_ladder_angle",
+        "ladder_not_secured",
+        "scaffold_overload",
+        "missing_toeboard"
+      ]
+    },
+    {
+      "id": "openings_fall",
+      "hazards": [
+        "open_manhole",
+        "open_floor_hole",
+        "missing_barricade",
+        "missing_cover"
+      ]
+    },
+    {
+      "id": "slips_trips_housekeeping",
+      "hazards": [
+        "spill",
+        "trailing_cable",
+        "debris_walkway",
+        "blocked_walkway"
+      ]
+    },
+    {
+      "id": "electrical",
+      "hazards": [
+        "open_panel",
+        "exposed_wire",
+        "wet_near_electrical",
+        "missing_loto"
+      ]
+    },
+    {
+      "id": "fire_hot_work",
+      "hazards": [
+        "hot_work_near_combustibles",
+        "fire_smoke",
+        "blocked_extinguisher",
+        "missing_fire_watch"
+      ]
+    },
+    {
+      "id": "lifting_material_handling",
+      "hazards": [
+        "suspended_load",
+        "load_swing_zone",
+        "unstable_stack",
+        "forklift_pedestrian_conflict"
+      ]
+    },
+    {
+      "id": "confined_space",
+      "hazards": [
+        "entry_without_ptw",
+        "missing_gas_test",
+        "missing_attendant",
+        "poor_ventilation"
+      ]
+    },
+    {
+      "id": "manual_handling",
+      "hazards": [
+        "unsafe_lift",
+        "awkward_posture",
+        "overreach",
+        "repetitive_strain"
+      ]
+    },
+    {
+      "id": "environmental",
+      "hazards": [
+        "chemical_spill",
+        "unlabeled_container",
+        "improper_waste_storage"
+      ]
+    }
+  ]
+}

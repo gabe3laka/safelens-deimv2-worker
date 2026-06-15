@@ -1,0 +1,97 @@
+{
+  "version": "2026-06-15",
+  "sources": [
+    {
+      "hazard_category": "ppe_non_compliance",
+      "dataset": "PPE Combined Model",
+      "url": "https://universe.roboflow.com/roboflow-universe-projects/personal-protective-equipment-combined-model",
+      "license": "CC BY 4.0",
+      "commercial_safe": true
+    },
+    {
+      "hazard_category": "hardhat",
+      "dataset": "Hard Hats",
+      "url": "https://universe.roboflow.com/roboflow-universe-projects/hard-hats-fhbh5",
+      "license": "CC BY 4.0",
+      "commercial_safe": true
+    },
+    {
+      "hazard_category": "safety_vests",
+      "dataset": "Safety Vests",
+      "url": "https://universe.roboflow.com/roboflow-universe-projects/safety-vests",
+      "license": "CC BY 4.0",
+      "commercial_safe": true
+    },
+    {
+      "hazard_category": "construction_general",
+      "dataset": "Construction Site Safety",
+      "url": "https://universe.roboflow.com/roboflow-universe-projects/construction-site-safety",
+      "license": "CC BY 4.0",
+      "commercial_safe": true
+    },
+    {
+      "hazard_category": "construction_general",
+      "dataset": "Construction Site Safety HF mirror",
+      "url": "https://huggingface.co/datasets/keremberke/construction-safety-object-detection",
+      "license": "CC BY 4.0",
+      "commercial_safe": true
+    },
+    {
+      "hazard_category": "helmet_detection",
+      "dataset": "SHEL5K",
+      "url": "https://data.mendeley.com/datasets/9rcv8mm682/4",
+      "license": "CC BY 4.0",
+      "commercial_safe": true
+    },
+    {
+      "hazard_category": "fall_detection",
+      "dataset": "Fall Video Dataset",
+      "url": "https://www.kaggle.com/datasets/payutch/fall-video-dataset",
+      "license": "CC0",
+      "commercial_safe": true
+    },
+    {
+      "hazard_category": "fire_smoke",
+      "dataset": "D-Fire",
+      "url": "https://github.com/gaiasd/DFireDataset",
+      "license": "UNVERIFIED",
+      "commercial_safe": false,
+      "notes": "inspect LICENSE before use"
+    },
+    {
+      "hazard_category": "forklift_pedestrian",
+      "dataset": "Thalos Forklift Safety v1",
+      "url": "https://huggingface.co/thalostech2025/thalos-forklift-safety-v1",
+      "license": "AGPL-3.0",
+      "commercial_safe": false
+    },
+    {
+      "hazard_category": "ppe_multi_class",
+      "dataset": "SH17",
+      "url": "https://github.com/ahmadmughees/SH17dataset",
+      "license": "CC BY-NC-SA 4.0",
+      "commercial_safe": false
+    },
+    {
+      "hazard_category": "ppe_color_helmet",
+      "dataset": "CHV",
+      "url": "https://github.com/ZijianWang-ZW/PPE_detection",
+      "license": "UNCLEAR",
+      "commercial_safe": false
+    },
+    {
+      "hazard_category": "rare_hazards_synthetic",
+      "dataset": "BlenderProc",
+      "url": "https://github.com/DLR-RM/BlenderProc",
+      "license": "MIT",
+      "commercial_safe": true
+    },
+    {
+      "hazard_category": "rare_hazards_synthetic",
+      "dataset": "NVIDIA Omniverse Replicator",
+      "url": "https://developer.nvidia.com/omniverse",
+      "license": "Platform terms",
+      "commercial_safe": true
+    }
+  ]
+}

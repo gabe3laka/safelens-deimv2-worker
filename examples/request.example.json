@@ -1,0 +1,8 @@
+{
+  "input": {
+    "image_b64": "<BASE64_ENCODED_JPEG_OR_PNG>",
+    "conf": 0.35,
+    "img_size": 640,
+    "classes": null
+  }
+}
