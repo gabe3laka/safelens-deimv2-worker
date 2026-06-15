@@ -6,6 +6,7 @@
       "fields": [
         "observation",
         "objective_evidence",
+        "checklist_question_violated",
         "risk_rating",
         "standard_reference",
         "corrective_action",

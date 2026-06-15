@@ -1,0 +1,270 @@
+openapi: 3.1.0
+info:
+  title: SafeLens Agentic HSE API
+  version: 0.3.0
+  description: Typed, checkpointed HSE drafting and approval routes.
+servers:
+  - url: https://api.example.invalid
+    description: Authenticated Cloudflare edge origin
+tags:
+  - name: agentic-hse
+paths:
+  /agentic/health:
+    get:
+      tags: [agentic-hse]
+      responses:
+        "200":
+          description: Runtime and checkpoint status
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, service, checkpoint_backend, durable]
+                properties:
+                  ok: {type: boolean}
+                  service: {type: string}
+                  approval_threshold: {type: integer, const: 10}
+                  halt_threshold: {type: integer, const: 17}
+                  checkpoint_backend: {type: string, enum: [memory, postgres]}
+                  durable: {type: boolean}
+  /agentic/session/start:
+    post:
+      tags: [agentic-hse]
+      summary: Create or continue a checkpointed graph thread
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SessionStartRequest"}
+      responses:
+        "200":
+          description: Graph result or approval interrupt
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/GraphResponse"}
+        "503": {$ref: "#/components/responses/RuntimeUnavailable"}
+  /agentic/reason:
+    post:
+      tags: [agentic-hse]
+      summary: Request contextual reasoning through the server-configured private origin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ReasonRequest"}
+      responses:
+        "200":
+          description: Validated reasoning record; outages return a fail-safe approval-required record
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ReasoningRecord"}
+  /agentic/risk-assessment/draft:
+    post:
+      tags: [agentic-hse]
+      summary: Validate and preview a risk assessment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/RiskAssessmentDraft"}
+      responses:
+        "200":
+          description: Validated draft requiring approval
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/RiskAssessmentDraft"}
+  /agentic/risk-assessment/approve:
+    post:
+      tags: [agentic-hse]
+      summary: Resume the same graph thread with approve, reject, or revise
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ApprovalDecision"}
+      responses:
+        "200":
+          description: Resumed graph result
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/GraphResponse"}
+        "409":
+          description: Thread is missing, completed, or not awaiting approval
+  /agentic/audit/draft:
+    post:
+      tags: [agentic-hse]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AuditObservationDraft"}
+      responses:
+        "200":
+          description: Validated audit preview
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AuditObservationDraft"}
+  /agentic/training/draft:
+    post:
+      tags: [agentic-hse]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/TrainingModuleDraft"}
+      responses:
+        "200":
+          description: Validated anonymized training preview
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TrainingModuleDraft"}
+components:
+  responses:
+    RuntimeUnavailable:
+      description: LangGraph or checkpoint runtime is unavailable
+  schemas:
+    Detection:
+      type: object
+      required: [label, confidence]
+      properties:
+        label: {type: string, minLength: 1}
+        confidence: {type: number, minimum: 0, maximum: 1}
+        evidence_ref: {type: string}
+        bbox:
+          type: [array, "null"]
+          minItems: 4
+          maxItems: 4
+          items: {type: number}
+        metadata: {type: object, additionalProperties: true}
+      additionalProperties: false
+    SessionStartRequest:
+      type: object
+      properties:
+        thread_id: {type: [string, "null"]}
+        company_profile: {type: object, additionalProperties: true}
+        site_rules: {type: object, additionalProperties: true}
+        document_context: {type: array, items: {type: object}}
+        rag_context: {type: array, items: {type: object}}
+        frame_context: {type: object, additionalProperties: true}
+        zone_context: {type: object, additionalProperties: true}
+        detections: {type: array, items: {$ref: "#/components/schemas/Detection"}}
+      additionalProperties: false
+    ReasonRequest:
+      type: object
+      required: [detections]
+      properties:
+        detections:
+          type: array
+          minItems: 1
+          items: {$ref: "#/components/schemas/Detection"}
+        frame_ref: {type: [string, "null"]}
+        company_profile: {type: object, additionalProperties: true}
+        zone_context: {type: object, additionalProperties: true}
+      additionalProperties: false
+    ControlRecommendation:
+      type: object
+      required: [control_type, action]
+      properties:
+        control_type: {type: string, enum: [elimination, substitution, engineering, administrative, ppe]}
+        action: {type: string, minLength: 1}
+      additionalProperties: false
+    ReasoningRecord:
+      type: object
+      required: [hazard, object_or_condition, location_context, is_elevated, people_exposed, risk_state, trigger_condition, likelihood, severity, score, matrix_band, hierarchy_of_controls_recommendation, reasoning, standard_reference, requires_human_approval]
+      properties:
+        hazard: {type: string}
+        object_or_condition: {type: string}
+        location_context: {type: string}
+        is_elevated: {type: boolean}
+        people_exposed: {type: array, items: {type: string}}
+        risk_state: {type: string, enum: [latent, active]}
+        trigger_condition: {type: string}
+        likelihood: {type: integer, minimum: 1, maximum: 5}
+        severity: {type: integer, minimum: 1, maximum: 5}
+        score: {type: integer, minimum: 1, maximum: 25}
+        matrix_band: {type: string, enum: [low, medium, high, critical]}
+        hierarchy_of_controls_recommendation:
+          type: array
+          items: {$ref: "#/components/schemas/ControlRecommendation"}
+        reasoning: {type: string}
+        standard_reference: {type: string}
+        requires_human_approval: {type: boolean}
+      additionalProperties: false
+    RiskAssessmentDraft:
+      type: object
+      required: [hazard, likelihood, severity, score, matrix_band]
+      properties:
+        hazard: {type: string}
+        persons_at_risk: {type: array, items: {type: string}}
+        likelihood: {type: integer, minimum: 1, maximum: 5}
+        severity: {type: integer, minimum: 1, maximum: 5}
+        score: {type: integer, minimum: 1, maximum: 25}
+        matrix_band: {type: string, enum: [low, medium, high, critical]}
+        existing_controls: {type: array, items: {type: string}}
+        recommended_controls: {type: array, items: {$ref: "#/components/schemas/ControlRecommendation"}}
+        residual_likelihood: {type: [integer, "null"], minimum: 1, maximum: 5}
+        residual_severity: {type: [integer, "null"], minimum: 1, maximum: 5}
+        residual_score: {type: [integer, "null"], minimum: 1, maximum: 25}
+        residual_matrix_band: {type: [string, "null"], enum: [low, medium, high, critical, null]}
+        responsible_person: {type: string}
+        due_date: {type: [string, "null"], format: date}
+        standard_reference: {type: string}
+        requires_human_approval: {const: true}
+      additionalProperties: false
+    ApprovalDecision:
+      type: object
+      required: [thread_id, decision]
+      properties:
+        thread_id: {type: string, minLength: 1}
+        decision: {type: string, enum: [approve, reject, revise]}
+        approver_id: {type: [string, "null"]}
+        notes: {type: string}
+        revised_payload: {type: [object, "null"], additionalProperties: true}
+      allOf:
+        - if:
+            properties: {decision: {const: revise}}
+          then:
+            required: [revised_payload]
+      additionalProperties: false
+    AuditObservationDraft:
+      type: object
+      required: [observation]
+      properties:
+        observation: {type: string}
+        classification: {type: string, enum: [nonconformance, ofi, observation]}
+        objective_evidence: {type: string}
+        checklist_question_violated: {type: string}
+        possible_root_cause: {type: string}
+        risk_rating: {type: string, enum: [low, medium, high, critical]}
+        corrective_action: {type: string}
+        preventive_action: {type: string}
+        responsible_role: {type: string}
+        due_date: {type: [string, "null"], format: date}
+        verification_method: {type: string}
+        standard_reference: {type: string}
+      additionalProperties: false
+    TrainingModuleDraft:
+      type: object
+      required: [type, topic]
+      properties:
+        type:
+          type: string
+          enum: [toolbox_talk, micro_learning, quiz, worker_briefing, supervisor_briefing, training_record, before_after_explanation, method_statement_summary, refresher_training]
+        topic: {type: string}
+        content: {type: object, additionalProperties: true}
+        evidence_refs: {type: array, items: {type: string}}
+        anonymized: {const: true}
+      additionalProperties: false
+    GraphResponse:
+      type: object
+      required: [ok, thread_id, status, state, interrupts]
+      properties:
+        ok: {type: boolean}
+        thread_id: {type: string}
+        decision: {type: string}
+        executed: {type: boolean}
+        checkpoint_backend: {type: string}
+        durable: {type: boolean}
+        status: {type: string, enum: [awaiting_approval, completed, unknown]}
+        state: {type: object, additionalProperties: true}
+        interrupts: {type: array, items: {type: object}}

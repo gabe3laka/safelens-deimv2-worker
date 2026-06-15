@@ -199,6 +199,12 @@ async def lifespan(app):
     else:
         _log_startup("AUTO_WARMUP=false: model load deferred until POST /warmup")
     yield
+    try:
+        from agentic_hse.runtime import close_runtime
+
+        await close_runtime()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("agentic-hse runtime shutdown failed: %s", exc)
     _log_startup("server shutting down")
 
 app = FastAPI(title="safelens-vision-worker", version=WORKER_VERSION, lifespan=lifespan)
@@ -705,6 +711,19 @@ try:
 except Exception as exc:  # noqa: BLE001 -- streaming must never break server boot
     _log_startup("ws/vision: registration FAILED -- " + type(exc).__name__ + ": " + str(exc))
     log.warning("ws/vision registration failed: %s", exc)
+
+# -- Agentic HSE layer (LangGraph + Pydantic AI) ------------------------------
+# Mounts /agentic/* if the agentic package imports cleanly. The router itself
+# only needs FastAPI + the pure approval logic; langgraph/httpx are imported
+# lazily inside its handlers, so a missing orchestration dep degrades to a 503
+# on those endpoints rather than breaking server boot.
+try:
+    from agentic_hse.routes import router as agentic_router
+    app.include_router(agentic_router)
+    _log_startup("agentic-hse: /agentic/* routes registered")
+except Exception as exc:  # noqa: BLE001 -- agentic layer must never break server boot
+    _log_startup("agentic-hse: registration skipped -- " + type(exc).__name__ + ": " + str(exc))
+    log.warning("agentic-hse registration skipped: %s", exc)
 
 # -- Entrypoint ---------------------------------------------------------------
 

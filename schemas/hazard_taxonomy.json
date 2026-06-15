@@ -98,6 +98,26 @@
         "unlabeled_container",
         "improper_waste_storage"
       ]
+    },
+    {
+      "id": "compressed_gas",
+      "hazards": ["unsecured_cylinder", "missing_valve_cap", "incompatible_storage", "damaged_hose"]
+    },
+    {
+      "id": "excavation",
+      "hazards": ["unsupported_excavation", "unsafe_access", "spoil_near_edge", "vehicle_edge_exposure"]
+    },
+    {
+      "id": "lighting_visibility",
+      "hazards": ["poor_lighting", "glare", "obscured_signage", "blind_corner"]
+    },
+    {
+      "id": "tools_equipment",
+      "hazards": ["unsafe_tool_use", "missing_guard", "damaged_tool", "wrong_tool_for_task"]
+    },
+    {
+      "id": "restricted_lone_work",
+      "hazards": ["restricted_area_entry", "lone_worker", "missing_authorization", "missing_communication"]
     }
   ]
 }

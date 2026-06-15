@@ -44,6 +44,9 @@ Thumbs.db
 # Test outputs
 output/
 results/
+checkpointer/pgdata/
+runpod_training/prepared/
+datasets/raw/
 *.jpg
 *.jpeg
 *.png

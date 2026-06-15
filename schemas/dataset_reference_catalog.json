@@ -1,0 +1,14 @@
+{
+  "version": "2026-06-15",
+  "production_use": false,
+  "rule": "Research references only; excluded from production manifests and training preparation.",
+  "sources": [
+    {"dataset": "D-Fire", "url": "https://github.com/gaiasd/DFireDataset", "license": "UNVERIFIED", "usage": "verify_before_use"},
+    {"dataset": "SH17", "url": "https://github.com/ahmadmughees/SH17dataset", "license": "CC BY-NC-SA 4.0", "usage": "benchmark_only"},
+    {"dataset": "Ultralytics Construction-PPE", "url": "https://docs.ultralytics.com/datasets/detect/construction-ppe/", "license": "AGPL-3.0", "usage": "benchmark_only"},
+    {"dataset": "Thalos Forklift Safety v1", "url": "https://huggingface.co/thalostech2025/thalos-forklift-safety-v1", "license": "AGPL-3.0", "usage": "benchmark_only"},
+    {"dataset": "CHV color-helmet data", "url": "https://github.com/ZijianWang-ZW/PPE_detection", "license": "UNVERIFIED", "usage": "verify_before_use"},
+    {"dataset": "Pictor-v3", "url": "https://github.com/ciber-lab/pictor-ppe", "license": "UNVERIFIED", "usage": "verify_before_use"},
+    {"dataset": "NVIDIA Omniverse Replicator", "url": "https://developer.nvidia.com/omniverse", "license": "PLATFORM TERMS - VERIFY", "usage": "verify_before_use"}
+  ]
+}

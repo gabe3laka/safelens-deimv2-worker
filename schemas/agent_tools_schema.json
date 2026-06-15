@@ -3,55 +3,84 @@
   "tools": [
     {
       "name": "search_company_docs",
-      "input": [
-        "query",
-        "site_id"
-      ],
-      "output": "rag_result[]"
+      "input_schema": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {"query": {"type": "string"}, "site_id": {"type": ["string", "null"]}},
+        "additionalProperties": false
+      },
+      "output_schema": {"type": "array", "items": {"type": "object"}}
     },
     {
       "name": "reason_over_hazard",
-      "input": [
-        "detections",
-        "frame_ref",
-        "company_profile",
-        "zone_context"
-      ],
-      "output": "reasoning_schema"
+      "input_schema": {
+        "type": "object",
+        "required": ["detections", "company_profile", "zone_context"],
+        "properties": {
+          "detections": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+          "frame_ref": {"type": ["string", "null"]},
+          "company_profile": {"type": "object"},
+          "zone_context": {"type": "object"}
+        },
+        "additionalProperties": false
+      },
+      "output_schema": {"$ref": "reasoning_schema.json"}
     },
     {
       "name": "create_risk_assessment_draft",
-      "input": [
-        "reasoning_record",
-        "risk_matrix_config"
-      ],
-      "output": "risk_assessment_draft"
+      "input_schema": {
+        "type": "object",
+        "required": ["reasoning_record", "risk_matrix_config"],
+        "properties": {"reasoning_record": {"type": "object"}, "risk_matrix_config": {"type": "object"}},
+        "additionalProperties": false
+      },
+      "output_schema": {"type": "object", "required": ["score", "residual_score", "requires_human_approval"]}
     },
     {
       "name": "draft_audit_observation",
-      "input": [
-        "reasoning_record",
-        "checklist_context"
-      ],
-      "output": "audit_observation_draft"
+      "input_schema": {
+        "type": "object",
+        "required": ["reasoning_record"],
+        "properties": {"reasoning_record": {"type": "object"}, "checklist_context": {"type": "object"}},
+        "additionalProperties": false
+      },
+      "output_schema": {"type": "object", "required": ["observation", "checklist_question_violated", "due_date"]}
     },
     {
       "name": "queue_training_candidate",
-      "input": [
-        "frame_ref",
-        "hazard_tags",
-        "privacy_flags"
-      ],
-      "output": "dataset_candidate_record"
+      "input_schema": {
+        "type": "object",
+        "required": ["frame_ref", "hazard_tags", "privacy_flags"],
+        "properties": {
+          "frame_ref": {"type": "string"},
+          "hazard_tags": {"type": "array", "items": {"type": "string"}},
+          "privacy_flags": {"type": "object"}
+        },
+        "additionalProperties": false
+      },
+      "output_schema": {"type": "object", "required": ["review_status", "auto_deploy"]}
     },
     {
       "name": "request_human_approval",
-      "input": [
-        "action_type",
-        "payload",
-        "reason"
-      ],
-      "output": "approval_token"
+      "input_schema": {
+        "type": "object",
+        "required": ["thread_id", "action_type", "payload", "reason"],
+        "properties": {
+          "thread_id": {"type": "string"},
+          "action_type": {"type": "string"},
+          "payload": {"type": "object"},
+          "reason": {"type": "string"}
+        },
+        "additionalProperties": false
+      },
+      "output_schema": {
+        "type": "object",
+        "required": ["thread_id", "decision_required"],
+        "properties": {
+          "thread_id": {"type": "string"},
+          "decision_required": {"type": "array", "items": {"enum": ["approve", "reject", "revise"]}}
+        }
+      }
     }
   ]
 }

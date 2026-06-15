@@ -1,0 +1,12 @@
+services:
+  langgraph-postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: safelens_agentic
+      POSTGRES_USER: safelens
+      POSTGRES_PASSWORD: safelens_local_only_change_me
+    ports:
+      - "54329:5432"
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data

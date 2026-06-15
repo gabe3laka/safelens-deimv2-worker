@@ -6,7 +6,10 @@
     "hazard",
     "object_or_condition",
     "location_context",
+    "is_elevated",
+    "people_exposed",
     "risk_state",
+    "trigger_condition",
     "likelihood",
     "severity",
     "score",
@@ -103,5 +106,27 @@
     "requires_human_approval": {
       "type": "boolean"
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "score": {
+            "minimum": 10
+          }
+        },
+        "required": [
+          "score"
+        ]
+      },
+      "then": {
+        "properties": {
+          "requires_human_approval": {
+            "const": true
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
 }

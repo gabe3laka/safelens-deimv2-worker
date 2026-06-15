@@ -1,35 +1,14 @@
 {
   "version": "2026-06-15",
   "templates": [
-    {
-      "id": "toolbox_talk",
-      "sections": [
-        "topic",
-        "why_it_matters",
-        "what_went_wrong",
-        "controls",
-        "worker_questions",
-        "supervisor_checks"
-      ]
-    },
-    {
-      "id": "micro_learning",
-      "sections": [
-        "scenario",
-        "hazard",
-        "correct_behavior",
-        "quiz",
-        "escalation_rule"
-      ]
-    },
-    {
-      "id": "incident_refresher",
-      "sections": [
-        "case_summary",
-        "root_causes",
-        "controls",
-        "verification"
-      ]
-    }
+    {"id": "toolbox_talk", "sections": ["topic", "why_it_matters", "what_went_wrong", "controls", "worker_questions", "supervisor_checks"]},
+    {"id": "micro_learning", "sections": ["scenario", "hazard", "correct_behavior", "quiz", "escalation_rule"]},
+    {"id": "quiz", "sections": ["learning_objective", "questions", "answers", "pass_mark", "remediation"]},
+    {"id": "worker_briefing", "sections": ["task", "hazards", "controls", "stop_work_rule", "acknowledgement"]},
+    {"id": "supervisor_briefing", "sections": ["trend", "required_actions", "verification", "owners", "due_dates"]},
+    {"id": "training_record", "sections": ["module", "attendees", "trainer", "date", "assessment", "follow_up"]},
+    {"id": "before_after_explanation", "sections": ["before", "control_change", "after", "residual_risk", "verification"]},
+    {"id": "method_statement_summary", "sections": ["scope", "sequence", "hazards", "controls", "permits", "emergency_actions"]},
+    {"id": "refresher_training", "sections": ["trigger", "prior_learning", "changes", "knowledge_check", "next_due_date"]}
   ]
 }

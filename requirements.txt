@@ -39,3 +39,14 @@ pycocotools
 # ----- Build Mode (lightweight blueprint processing) -------------------------
 # CPU-only; NO new packages and NO GPU/model deps. Build Mode reuses Pillow and
 # numpy (above) plus opencv-python-headless (above) for edge/contour extraction.
+
+# ----- Agentic HSE layer (LangGraph + Pydantic AI orchestration) -------------
+# Optional at runtime: server.py mounts /agentic/* only if these import cleanly,
+# so the existing /detect + Build Mode paths never depend on them. The LangGraph
+# checkpointer targets a SELF-HOSTED Postgres (see checkpointer/), never Supabase.
+langgraph>=1.0,<2
+langgraph-checkpoint-postgres>=2.0
+psycopg[binary]>=3.1
+psycopg-pool>=3.2
+httpx>=0.27.0
+pydantic-ai>=1.0
