@@ -662,7 +662,7 @@ def _ws_active_tasks():
         backend = _active_backend()
     if backend == "deimv2":
         return ["det"]
-    if backend == "yolo26":
+    if backend in ("yolo26", "ultralytics"):
         try:
             import yolo26_loader
             return yolo26_loader.mode_tasks("live")
@@ -679,6 +679,23 @@ def _ws_active_tasks():
         out = [t.strip().lower() for t in raw.split(",")
                if t.strip().lower() in ("det", "pose")]
         return out or ["det"]
+
+def _ws_stream_config():
+    """Active-backend conf/img_size for /ws/vision (A1.5; post-fallback aware).
+
+    Resolves the SERVING backend's config via config_resolver so streaming uses
+    the same generic YOLO_* / legacy YOLO26_* / EDGECRAFTER_* values as /detect,
+    never a stale EdgeCrafter-derived default.
+    """
+    try:
+        from vision_backend import serving_backend
+        from config_resolver import resolve_effective_inference_config
+        b = serving_backend()
+        rb = "yolo26" if b in ("yolo26", "ultralytics") else b
+        cfg = resolve_effective_inference_config(rb, {})
+        return {"conf": cfg.conf, "img_size": cfg.img_size}
+    except Exception:  # noqa: BLE001
+        return {"conf": 0.25, "img_size": 640}
 
 def _ws_gpu_device():
     """GPU device name if CUDA is available, else None (never raises)."""
@@ -700,6 +717,7 @@ try:
         get_backend=_active_backend,
         get_tasks=_ws_active_tasks,
         get_gpu_device=_ws_gpu_device,
+        get_config=_ws_stream_config,
     )
     _log_startup("ws/vision: streaming route + /debug/stream registered")
 except Exception as exc:  # noqa: BLE001 -- streaming must never break server boot

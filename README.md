@@ -46,6 +46,38 @@ pre-baked into `/app/models/yolo26` and otherwise resolved from the cache dir
 or auto-downloaded by Ultralytics into it. Model-load status per task is in
 `GET /debug/state` under `backend_status.yolo26`.
 
+### Generic detector config + stronger demo profile (A1)
+
+The detector config also accepts **generic `YOLO_*` env names** that take
+**precedence** over the legacy `YOLO26_*` names (which still work unchanged when
+the generic ones are unset). `VISION_BACKEND=ultralytics` routes the YOLO family
+(YOLO11 / YOLO26 / YOLOE) through `ultralytics_loader.py` (a thin adapter over
+`yolo26_loader`). This lets you test a stronger detector for better recall
+**without editing the image**:
+
+```env
+VISION_BACKEND=ultralytics
+YOLO_DET_MODEL_ID=yolo11s.pt
+YOLO_IMG_SIZE=960
+YOLO_CONF=0.10
+YOLO_IOU=0.60
+YOLO_MAX_DETECTIONS=300
+```
+
+The resolved active backend/model/knobs are visible in `GET /debug/state` under
+`effective_config.active_detector` (`active_backend`, `active_model_id`,
+`img_size`, `conf`, `iou`, `max_detections`, `weights_source`). `/detect` **and**
+`/ws/vision` both use this resolved active-backend config (streaming no longer
+falls back to stale EdgeCrafter defaults). Precedence per value is
+**payload → `YOLO_*` → `YOLO26_*` → default**.
+
+> **Licensing (do not skip):** `yolo11s.pt` / Ultralytics weights are **AGPL-3.0**
+> — fine for testing/demo, but **not** a silent commercial production default
+> without an Ultralytics Enterprise License. For commercial production prefer
+> **DEIM / DEIMv2** or **RT-DETR** (Apache-2.0). Every candidate is recorded in
+> `model_registry.example.json` with `license_status` + `commit_weights:false`;
+> weights are never committed or baked into the image (runtime-resolved).
+
 ## Architecture
 
 This worker runs as a **long-running FastAPI/uvicorn HTTP server** on a RunPod

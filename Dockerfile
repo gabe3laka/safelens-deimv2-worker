@@ -146,6 +146,8 @@ COPY edgecrafter_loader.py /app/edgecrafter_loader.py
 COPY yolo26_loader.py /app/yolo26_loader.py
 COPY vision_backend.py /app/vision_backend.py
 COPY config_resolver.py /app/config_resolver.py
+COPY ultralytics_loader.py /app/ultralytics_loader.py
+COPY model_registry.example.json /app/model_registry.example.json
 COPY deimv2_infer.py /app/deimv2_infer.py
 COPY official_deimv2_loader.py /app/official_deimv2_loader.py
 COPY server.py /app/server.py
@@ -202,6 +204,18 @@ ENV YOLO26_CACHE_DIR="/runpod-volume/models/yolo26"
 # Ultralytics container hardening: writable config dir; never pip at runtime.
 ENV YOLO_CONFIG_DIR="/tmp/Ultralytics"
 ENV YOLO_AUTOINSTALL="false"
+
+# ------- Generic detector config (A1) -----------------------------------------
+# Generic YOLO_* names take PRECEDENCE over the legacy YOLO26_* above when set,
+# so a stronger detector profile can be tested WITHOUT editing the image:
+#   VISION_BACKEND=ultralytics
+#   YOLO_DET_MODEL_ID=yolo11s.pt  YOLO_IMG_SIZE=960  YOLO_CONF=0.10
+#   YOLO_IOU=0.60  YOLO_MAX_DETECTIONS=300
+# Left UNSET here on purpose: yolo11s.pt is AGPL -- verify commercial rights
+# before making it the production default (do NOT silently switch). Commercial
+# direction: DEIM/DEIMv2 or RT-DETR (Apache-2.0). See model_registry.example.json.
+# Weights are NEVER baked here; they resolve at runtime from cache/volume/registry.
+ENV MODEL_REGISTRY_PATH="/app/model_registry.example.json"
 
 # ------- (legacy comment) ------------------------------------------------------
 # edgecrafter (default) | deimv2 (legacy fallback)

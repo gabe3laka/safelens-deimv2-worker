@@ -533,6 +533,26 @@ def _default_backend() -> str:
     return os.getenv("VISION_BACKEND", "edgecrafter").strip().lower()
 
 
+def _resolve_active_stream_config() -> Dict[str, Any]:
+    """Resolve conf/img_size for the ACTIVE backend (A1.5 fix).
+
+    Streaming must use the active backend's settings, not stale EdgeCrafter
+    defaults. Uses config_resolver so /ws/vision honors generic YOLO_* (and
+    legacy YOLO26_*) when Ultralytics/YOLO is active, or EDGECRAFTER_* when
+    EdgeCrafter is active. Import-light (config_resolver pulls no torch) and
+    never raises -- falls back to safe defaults.
+    """
+    try:
+        import config_resolver
+        backend = os.getenv("VISION_BACKEND", "yolo26").strip().lower()
+        rb = "yolo26" if backend in ("yolo26", "ultralytics") else backend
+        cfg = config_resolver.resolve_effective_inference_config(rb, {})
+        return {"conf": cfg.conf, "img_size": cfg.img_size,
+                "iou": cfg.iou, "max_det": cfg.max_det, "backend": backend}
+    except Exception:  # noqa: BLE001
+        return {"conf": 0.25, "img_size": 640}
+
+
 def _require_run_inference(*_args: Any, **_kwargs: Any) -> Any:
     raise RuntimeError("ws_vision: run_inference dependency was not provided")
 
@@ -546,6 +566,7 @@ def register_ws_vision(
     get_backend: Callable[[], str] = _default_backend,
     get_tasks: Callable[[], List[str]] = _default_tasks,
     get_gpu_device: Callable[[], Optional[str]] = lambda: None,
+    get_config: Optional[Callable[[], Dict[str, Any]]] = None,
     metrics_interval_s: Optional[float] = None,
     warmup_timeout_s: Optional[float] = None,
     warmup_poll_s: Optional[float] = None,
@@ -571,9 +592,15 @@ def register_ws_vision(
         warmup_poll_s if warmup_poll_s is not None
         else _env_float("WS_WARMUP_POLL_S", 0.5)
     )
-    default_conf = _env_float("EDGECRAFTER_CONF", 0.25)
+    # A1.5: stream defaults come from the ACTIVE backend's config (generic
+    # YOLO_* / legacy YOLO26_* / EDGECRAFTER_*), never hardcoded EdgeCrafter.
     try:
-        default_img_size = int(_env_float("EDGECRAFTER_IMG_SIZE", 640))
+        _cfg = (get_config or _resolve_active_stream_config)() or {}
+    except Exception:  # noqa: BLE001
+        _cfg = {}
+    default_conf = float(_cfg.get("conf", 0.25))
+    try:
+        default_img_size = int(_cfg.get("img_size", 640))
     except (TypeError, ValueError):
         default_img_size = 640
 
