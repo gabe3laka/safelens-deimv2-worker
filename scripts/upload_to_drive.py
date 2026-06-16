@@ -25,7 +25,7 @@ Usage:
 Drive folder layout (IDs from SafeLens brief):
     Roboflow datasets  →  1U0Ks4U6UB1bmZIBRJo7OW_f49SUvXVuf
     Mendeley SHEL5K    →  1yQLu2QwLQ5Iz07fdnYZN7xkDeD8R83jf
-    Manifests          →  1RJXSNxqaVPXpYvJMKIQGfyGF1OtcknW4
+    Manifests          →  1fhau1LiikyU_FLP_Qsc4m46va744JFq4
 
 After all uploads complete, drive_file_id fields in data/acquisition_log.jsonl
 are updated automatically.
@@ -40,7 +40,7 @@ from pathlib import Path
 DRIVE_FOLDERS = {
     "roboflow": "1U0Ks4U6UB1bmZIBRJo7OW_f49SUvXVuf",
     "mendeley": "1yQLu2QwLQ5Iz07fdnYZN7xkDeD8R83jf",
-    "manifests": "1RJXSNxqaVPXpYvJMKIQGfyGF1OtcknW4",
+    "manifests": "1fhau1LiikyU_FLP_Qsc4m46va744JFq4",
 }
 
 SOURCE_FOLDERS = {
