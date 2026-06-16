@@ -302,6 +302,44 @@ ENV PRIVACY_BLUR_RADIUS="24"
 # Validation gate (validation/run_validation.py): min critical-hazard recall.
 ENV VALIDATION_MIN_RECALL_CRITICAL="0.90"
 
+# ------- Event-driven VLM reasoning (Qwen-VL / DeepSeek-VL2) ------------------
+# REAL adapter, but OFF by default and NEVER per-frame: /reason runs it on
+# demand and /detect triggers it asynchronously (rate-limited, above
+# REASONER_TRIGGER_LEVEL) and never waits for it. VLM output is an AI DRAFT
+# only (produced_by=vlm_reasoner, requires_human_review=true, should_alert=false)
+# -- it never becomes the safety authority. The deterministic engine remains the
+# signal. Weights are NOT baked into the image and NOT downloaded at build; they
+# resolve at runtime into REASONER_CACHE_DIR / the HF cache. REASONER_MODE=mock
+# gives a CPU, weight-free contract for app integration.
+ENV VLM_REASONER_ENABLED="false"
+ENV REASONER_MODE="qwen_vl"
+ENV QWEN_VL_MODEL_ID="Qwen/Qwen2.5-VL-7B-Instruct"
+ENV DEEPSEEK_VL_MODEL_ID="deepseek-ai/deepseek-vl2-small"
+ENV REASONER_DEVICE="cuda"
+ENV REASONER_DTYPE="auto"
+ENV REASONER_QUANTIZATION="4bit"
+ENV REASONER_MAX_IMAGE_SIDE="1024"
+ENV REASONER_MAX_NEW_TOKENS="768"
+ENV REASONER_TIMEOUT_MS="8000"
+ENV REASONER_MIN_INTERVAL_MS="5000"
+ENV REASONER_CACHE_TTL_MS="15000"
+ENV REASONER_TRIGGER_LEVEL="ORANGE"
+ENV REASONER_MAX_WORKERS="1"
+ENV REASONER_MAX_SESSIONS="64"
+ENV REASONER_CACHE_DIR="/runpod-volume/models/qwen-vl"
+
+# ------- Open-vocabulary scanner (GroundingDINO) -----------------------------
+# Optional, OFF by default, NEVER per-frame. Candidate-only output (requires
+# human review); never triggers official HSE alerts. Weights resolve at runtime
+# (NOT baked, NOT downloaded at build).
+ENV OPEN_VOCAB_SCANNER_ENABLED="false"
+ENV OPEN_VOCAB_SCANNER_MODE="grounding_dino"
+ENV GROUNDING_DINO_MODEL_ID="IDEA-Research/grounding-dino-tiny"
+ENV GROUNDING_DINO_BOX_THRESHOLD="0.35"
+ENV GROUNDING_DINO_TEXT_THRESHOLD="0.25"
+ENV OPEN_VOCAB_SCAN_INTERVAL_MS="30000"
+ENV GROUNDING_DINO_CACHE_DIR="/runpod-volume/models/groundingdino"
+
 # ------- DEIMv2 (legacy fallback) configuration ------------------------------
 ENV DEIMV2_DEVICE="cuda"
 ENV DEIMV2_BACKEND="official-deimv2-hf"

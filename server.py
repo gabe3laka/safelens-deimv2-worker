@@ -85,6 +85,22 @@ def _risk_config_safe():
     except Exception as exc:  # noqa: BLE001
         return {"error": type(exc).__name__ + ": " + str(exc)}
 
+def _reasoner_status_safe():
+    """vlm_reasoner.status_snapshot(), guarded so debug routes never crash."""
+    try:
+        import risk.vlm_reasoner as vlm
+        return vlm.status_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": type(exc).__name__ + ": " + str(exc)}
+
+def _open_vocab_config_safe():
+    """open_vocab_scanner.config(), guarded so debug routes never crash."""
+    try:
+        import risk.open_vocab_scanner as ovs
+        return ovs.config()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": type(exc).__name__ + ": " + str(exc)}
+
 # -- State --------------------------------------------------------------------
 
 _STATE_LOCK = threading.RLock()
@@ -429,6 +445,8 @@ async def debug_state():
         "backend_status": _backend_status_safe(),
         "plan_context": _plan_context_safe(),
         "risk_engine": _risk_config_safe(),
+        "reasoner": _reasoner_status_safe(),
+        "open_vocab_scanner": _open_vocab_config_safe(),
         "skip_warmup": SKIP_WARMUP,
         "auto_warmup": AUTO_WARMUP,
         "state": _public_state(),
@@ -545,18 +563,38 @@ async def detect(payload: Dict[str, Any]):
             payload=payload,  # Pass payload so config_resolver can extract conf/img_size
         )
         resp_dict = resp.model_dump()
+        session_id = payload.get("session_id") or payload.get("sessionId")
+        frame_id = payload.get("frame_id") or payload.get("frameId")
         # Additive deterministic risk-aware layer. No-op unless RISK_ENGINE_ENABLED.
         # Degradation ladder: a risk failure returns the normal detection result
         # with a `warning`, never a 500 (matches the backend_fallback behaviour).
         try:
             import risk
-            session_id = payload.get("session_id") or payload.get("sessionId")
-            frame_id = payload.get("frame_id") or payload.get("frameId")
             resp_dict = risk.attach_risk(resp_dict, session_id=session_id, frame_id=frame_id)
         except Exception as rexc:  # noqa: BLE001 -- risk must never break detection
             log.warning("detect: risk layer failed (returning detection): %s", rexc)
             if not resp_dict.get("warning"):
                 resp_dict["warning"] = "risk_engine_error: " + type(rexc).__name__ + ": " + str(rexc)
+        # Event-driven VLM reasoning (AI draft only): NON-BLOCKING + rate-limited.
+        # Triggered off the deterministic risk level; /detect never waits for the
+        # VLM -- it attaches the most recent cached draft (if any) as `scene_risks`
+        # (each requires_human_review=true) plus a `reasoner_status`, and returns.
+        try:
+            import risk.vlm_reasoner as vlm
+            if vlm.enabled() and resp_dict.get("schema_version"):
+                draft, status = vlm.maybe_trigger(
+                    session_id, frame_b64=image_b64,
+                    highest_level=resp_dict.get("highest_risk_level", "GREEN"),
+                    deterministic_risks=resp_dict.get("risks", []),
+                    entities=resp_dict.get("entities", []),
+                    scene_graph=resp_dict.get("scene_graph", {}),
+                    tracks=resp_dict.get("tracks", []), frame_id=frame_id,
+                )
+                resp_dict["reasoner_status"] = status
+                if draft and draft.get("risks"):
+                    resp_dict["scene_risks"] = draft["risks"]
+        except Exception as vexc:  # noqa: BLE001 -- VLM must never break detection
+            log.warning("detect: vlm trigger failed: %s", vexc)
         return JSONResponse(resp_dict)
     except Exception as exc:
         log.exception("detect failed: %s", exc)
@@ -565,6 +603,56 @@ async def detect(payload: Dict[str, Any]):
              "entities": [], "poses": [], "backend": _active_backend()},
             status_code=500,
         )
+
+# -- Reasoning endpoints (event-driven; AI draft only; never the safety authority) --
+#
+# POST /reason runs the REAL Qwen-VL (or DeepSeek-VL2 / mock) reasoner with a
+# hard timeout and returns strict JSON. The deterministic engine remains the
+# safety signal; VLM output is always produced_by="vlm_reasoner",
+# requires_human_review=true, should_alert=false. The reasoner is event-driven
+# (called after a deterministic candidate exists), NEVER per-frame, and degrades
+# to a clear reasoner_status when disabled/unavailable/slow -- it can never stall
+# /detect. POST /scan is the optional open-vocabulary GroundingDINO scanner
+# (disabled by default; candidate-only output). Both are guarded so a reasoning
+# problem can never break server boot or the live detection path.
+
+@app.post("/reason")
+async def reason(payload: Dict[str, Any]):
+    """Event-driven VLM reasoning over a deterministic candidate. Strict JSON."""
+    try:
+        import risk.vlm_reasoner as vlm
+        return JSONResponse(await vlm.reason_async(payload))
+    except Exception as exc:  # noqa: BLE001 -- never 500 the reasoning endpoint
+        log.warning("reason failed: %s", exc)
+        return JSONResponse({
+            "schema_version": "reason.v1", "produced_by": "vlm_reasoner",
+            "reasoner_status": "error", "requires_human_review": True,
+            "should_alert": False, "risks": [], "uncertain_items": [],
+            "error": type(exc).__name__ + ": " + str(exc),
+        })
+
+@app.post("/scan")
+async def scan(payload: Dict[str, Any]):
+    """Optional open-vocabulary (GroundingDINO) scan. Candidate-only; human review."""
+    try:
+        import risk.open_vocab_scanner as ovs
+        result = await asyncio.to_thread(
+            ovs.scan,
+            payload.get("frame_b64") or payload.get("image_b64"),
+            prompt=payload.get("prompt"),
+            session_id=payload.get("session_id") or payload.get("sessionId"),
+            frame_id=payload.get("frame_id") or payload.get("frameId"),
+            force=bool(payload.get("force", False)),
+        )
+        return JSONResponse(result)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("scan failed: %s", exc)
+        return JSONResponse({
+            "schema_version": "openvocab.v1", "produced_by": "open_vocab_scanner",
+            "source_model": "GroundingDINO", "status": "error", "candidate_only": True,
+            "requires_human_review": True, "candidates": [],
+            "error": type(exc).__name__ + ": " + str(exc),
+        })
 
 # -- Build Mode (lightweight blueprint processing; CPU-only, additive) --------
 #
