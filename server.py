@@ -77,6 +77,14 @@ def _plan_context_safe():
     except Exception as exc:  # noqa: BLE001
         return {"error": type(exc).__name__ + ": " + str(exc)}
 
+def _risk_config_safe():
+    """risk.config(), guarded so debug routes never crash."""
+    try:
+        import risk
+        return risk.config()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": type(exc).__name__ + ": " + str(exc)}
+
 # -- State --------------------------------------------------------------------
 
 _STATE_LOCK = threading.RLock()
@@ -420,6 +428,7 @@ async def debug_state():
         "backend": _active_backend(),
         "backend_status": _backend_status_safe(),
         "plan_context": _plan_context_safe(),
+        "risk_engine": _risk_config_safe(),
         "skip_warmup": SKIP_WARMUP,
         "auto_warmup": AUTO_WARMUP,
         "state": _public_state(),
@@ -535,7 +544,20 @@ async def detect(payload: Dict[str, Any]):
             class_filter=class_filter,
             payload=payload,  # Pass payload so config_resolver can extract conf/img_size
         )
-        return JSONResponse(resp.model_dump())
+        resp_dict = resp.model_dump()
+        # Additive deterministic risk-aware layer. No-op unless RISK_ENGINE_ENABLED.
+        # Degradation ladder: a risk failure returns the normal detection result
+        # with a `warning`, never a 500 (matches the backend_fallback behaviour).
+        try:
+            import risk
+            session_id = payload.get("session_id") or payload.get("sessionId")
+            frame_id = payload.get("frame_id") or payload.get("frameId")
+            resp_dict = risk.attach_risk(resp_dict, session_id=session_id, frame_id=frame_id)
+        except Exception as rexc:  # noqa: BLE001 -- risk must never break detection
+            log.warning("detect: risk layer failed (returning detection): %s", rexc)
+            if not resp_dict.get("warning"):
+                resp_dict["warning"] = "risk_engine_error: " + type(rexc).__name__ + ": " + str(rexc)
+        return JSONResponse(resp_dict)
     except Exception as exc:
         log.exception("detect failed: %s", exc)
         return JSONResponse(
@@ -707,6 +729,21 @@ def _ws_gpu_device():
         pass
     return None
 
+def _ws_attach_risk(message, session_id=None, frame_id=None):
+    """Merge the deterministic risk block into a /ws/vision 'vision' message.
+
+    No-op unless RISK_ENGINE_ENABLED; never raises (returns the message
+    unchanged on any failure so streaming is never broken by the risk layer).
+    The stream's session key is the camera_id, so per-camera tracker state
+    stays isolated (B1).
+    """
+    try:
+        import risk
+        return risk.attach_risk(message, session_id=session_id, frame_id=frame_id)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ws/vision: risk layer failed: %s", exc)
+        return message
+
 try:
     import ws_vision
     ws_vision.register_ws_vision(
@@ -718,6 +755,7 @@ try:
         get_tasks=_ws_active_tasks,
         get_gpu_device=_ws_gpu_device,
         get_config=_ws_stream_config,
+        risk_hook=_ws_attach_risk,
     )
     _log_startup("ws/vision: streaming route + /debug/stream registered")
 except Exception as exc:  # noqa: BLE001 -- streaming must never break server boot

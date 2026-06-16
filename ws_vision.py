@@ -211,6 +211,7 @@ class _VisionStreamSession:
         metrics_interval_s: float,
         warmup_timeout_s: float,
         warmup_poll_s: float,
+        risk_hook: Optional[Callable[..., Dict[str, Any]]] = None,
     ) -> None:
         self.ws = websocket
         self.get_state = get_state
@@ -219,6 +220,7 @@ class _VisionStreamSession:
         self.get_backend = get_backend
         self.get_tasks = get_tasks
         self.get_gpu_device = get_gpu_device
+        self.risk_hook = risk_hook
         self.default_conf = default_conf
         self.default_img_size = default_img_size
         self.metrics_interval_s = metrics_interval_s
@@ -422,7 +424,7 @@ class _VisionStreamSession:
         self._infer_avg.add(data.get("inference_ms") or 0.0)
         self._e2e_avg.add(e2e_ms)
 
-        await self.safe_send({
+        vision_msg: Dict[str, Any] = {
             "type": "vision",
             "camera_id": frame.get("camera_id"),
             "frame_id": frame.get("frame_id"),
@@ -437,7 +439,19 @@ class _VisionStreamSession:
             "received_at": received_at,
             "completed_at": completed_at,
             "end_to_end_latency_ms": e2e_ms,
-        })
+        }
+        # Additive deterministic risk layer (no-op unless RISK_ENGINE_ENABLED).
+        # Keyed by camera_id so per-stream tracker state stays isolated (B1).
+        # Never raises: on failure the plain vision message is sent unchanged.
+        if self.risk_hook is not None:
+            try:
+                vision_msg = self.risk_hook(
+                    vision_msg, session_id=frame.get("camera_id"),
+                    frame_id=frame.get("frame_id"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("ws/vision: risk_hook failed: %s", exc)
+        await self.safe_send(vision_msg)
 
     @staticmethod
     def _frame_float(frame: Dict[str, Any], key: str, default: float) -> float:
@@ -567,6 +581,7 @@ def register_ws_vision(
     get_tasks: Callable[[], List[str]] = _default_tasks,
     get_gpu_device: Callable[[], Optional[str]] = lambda: None,
     get_config: Optional[Callable[[], Dict[str, Any]]] = None,
+    risk_hook: Optional[Callable[..., Dict[str, Any]]] = None,
     metrics_interval_s: Optional[float] = None,
     warmup_timeout_s: Optional[float] = None,
     warmup_poll_s: Optional[float] = None,
@@ -619,6 +634,7 @@ def register_ws_vision(
             metrics_interval_s=metrics_interval_s,
             warmup_timeout_s=warmup_timeout_s,
             warmup_poll_s=warmup_poll_s,
+            risk_hook=risk_hook,
         )
         try:
             await session.run()

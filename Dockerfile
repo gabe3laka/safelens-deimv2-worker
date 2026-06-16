@@ -161,6 +161,12 @@ COPY build_blueprint.py /app/build_blueprint.py
 COPY build_segmentation.py /app/build_segmentation.py
 COPY plan_context.py /app/plan_context.py
 
+# Risk-aware perception (deterministic engine + per-session tracking) + the
+# CPU-only validation harness. No weights/datasets -- pure-Python rules + a JSON
+# matrix profile. Additive and gated by RISK_ENGINE_ENABLED (default off).
+COPY risk /app/risk
+COPY validation /app/validation
+
 # Worker code + upstream engine packages on PYTHONPATH. The EdgeCrafter ecdetseg
 # and ecpose subtrees each ship their own engine package; edgecrafter_loader.py
 # manages which one is active at import time, so we only add /app + /opt/DEIMv2
@@ -267,6 +273,34 @@ ENV PLAN_ASSEMBLY_STATE_ENABLED="false"
 ENV DEPTH_MODEL_ID="depth-anything-v2-small"
 ENV DEPTH_DEVICE="cuda"
 ENV DEPTH_CACHE_DIR="/runpod-volume/models/depth"
+
+# ------- Risk-aware perception (deterministic engine + tracking) -------------
+# Additive and OFF by default: when RISK_ENGINE_ENABLED=false the /detect and
+# /ws/vision responses are byte-for-byte the legacy shape. When enabled, the
+# deterministic engine (the safety signal) adds tracks/scene_graph/risks +
+# schema_version. Per-session tracker state is keyed by session_id/camera_id
+# with TTL eviction (Build Mode pattern). No weights, no GPU, no VLM here --
+# the event-driven Qwen-VL reasoner / GroundingDINO scanner are a later PR.
+ENV RISK_ENGINE_ENABLED="false"
+ENV RISK_TRACKING_ENABLED="true"
+ENV RISK_SCENE_GRAPH_ENABLED="true"
+ENV RISK_PROVENANCE_ENABLED="true"
+ENV RISK_MODEL_VERSION="risk_engine.v1"
+ENV RISK_MATRIX_PROFILE="/app/risk/risk_matrix_profile.json"
+ENV RISK_NEAR_THRESHOLD="0.12"
+ENV RISK_EDGE_THRESHOLD="0.04"
+ENV TRACK_IOU_MATCH="0.3"
+ENV TRACK_MAX_AGE_FRAMES="30"
+ENV TRACK_MAX_PER_SESSION="300"
+ENV SESSION_TTL_MS="30000"
+ENV SESSION_MAX_ACTIVE="64"
+# Privacy: blur persons/faces before any frame is persisted/sent to a VLM.
+# OFF until the (later) VLM/evidence path exists; the deterministic engine
+# needs no imagery. No emotion/biometric inference -- hazards/conditions only.
+ENV PRIVACY_BLUR_ENABLED="false"
+ENV PRIVACY_BLUR_RADIUS="24"
+# Validation gate (validation/run_validation.py): min critical-hazard recall.
+ENV VALIDATION_MIN_RECALL_CRITICAL="0.90"
 
 # ------- DEIMv2 (legacy fallback) configuration ------------------------------
 ENV DEIMV2_DEVICE="cuda"

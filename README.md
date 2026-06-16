@@ -275,6 +275,62 @@ signal if enabled without a backend (no extra image deps; Point-E is never run):
 
 `/debug/state` reports a `plan_context` block with all of these.
 
+## Risk-aware perception (deterministic engine + tracking)
+
+The `risk/` package adds a **deterministic, additive** risk layer on the live
+path (`/detect` HSE loop + `/ws/vision`). It is the **safety signal**: pure
+Python rules over the detector's entities, a per-session tracker, and a
+deterministic scene graph — **no GPU, no weights, no VLM**. It is gated by
+`RISK_ENGINE_ENABLED` (**default off**): when disabled, `/detect` and
+`/ws/vision` responses are byte-for-byte the legacy shape. When enabled, the
+response gains a `schema_version: "risk.v1"` plus additive `risk_engine`,
+`tracks`, `scene_graph`, `risks`, and `scene_risks` fields. A risk failure
+degrades to the normal detection result with a `warning` — never a 500.
+
+```
+detector entities → per-session tracker (IoU/centroid) → scene graph (geometry)
+  → 15 deterministic rules → 5×5 risk matrix (severity×likelihood) → controls
+  (hierarchy of controls) → provenance stamp → scored RiskItem[]
+```
+
+- **15 rules** (`R01..R15`): PPE (hardhat/vest/gloves), pedestrian↔vehicle /
+  ↔forklift separation, fire, smoke, blocked exit, object-near-edge,
+  working-at-height (ladder), scaffold, spill/slip, exposed electrical,
+  overhead suspended load, open-hole/fall — each fires only for the classes the
+  detector actually provides.
+- **Risk matrix** is a versioned JSON profile (`RISK_MATRIX_PROFILE`,
+  default `risk/risk_matrix_profile.json`): `score = severity × likelihood`,
+  banded GREEN/YELLOW/ORANGE/RED. The profile is **validated on load** (bands
+  monotonic, contiguous, full coverage) — a malformed matrix raises.
+- **Per-session tracking** is keyed by `session_id` (`/detect`) / `camera_id`
+  (`/ws/vision`) — never global, so two camera streams never cross-contaminate
+  `track_id`s. State has TTL eviction + a bounded active-session count, reusing
+  the Build Mode session sweep pattern.
+- **Provenance**: every risk carries `produced_by="risk_engine"`,
+  `rule_id`, `model_version`, `timestamp_ms`, and `requires_human_review=false`
+  (the deterministic engine is authoritative; AI drafts will set it true).
+- **Privacy** (`risk/privacy.py`): blurs persons/faces before any frame is
+  persisted or sent to a VLM (`PRIVACY_BLUR_ENABLED`, default off). Hazards and
+  conditions only — never emotion/identity/biometric inference.
+- **Validation gate** (`validation/run_validation.py`): runs the engine over
+  synthetic hazard scenarios (no GPU/weights) and exits non-zero if
+  critical-hazard recall drops below `VALIDATION_MIN_RECALL_CRITICAL` (0.90).
+
+| Env | Default | Notes |
+|-----|---------|-------|
+| `RISK_ENGINE_ENABLED` | `false` | master switch; off = legacy response shape |
+| `RISK_TRACKING_ENABLED` / `RISK_SCENE_GRAPH_ENABLED` | `true` | sub-stage toggles |
+| `RISK_MATRIX_PROFILE` | `/app/risk/risk_matrix_profile.json` | versioned 5×5 matrix |
+| `SESSION_TTL_MS` / `SESSION_MAX_ACTIVE` | `30000` / `64` | per-session tracker memory |
+| `RISK_NEAR_THRESHOLD` | `0.12` | normalized centroid distance for "near" |
+| `PRIVACY_BLUR_ENABLED` | `false` | blur persons before VLM/persist (later PR) |
+
+`/debug/state` reports a `risk_engine` block (flags, matrix profile/version,
+active sessions, and the last evaluation's risk/alert counts + highest level).
+The event-driven **Qwen-VL reasoner** (`POST /reason`) and **GroundingDINO**
+open-vocab scanner are a **separate later PR** and only enrich `scene_risks` as
+human-review AI drafts — they never become the safety authority.
+
 ## Docker image
 
 Built and pushed to GitHub Container Registry on every push to `main`:
@@ -337,6 +393,8 @@ TRANSFORMERS_CACHE=/runpod-volume/.cache/huggingface
 | `official_deimv2_loader.py` | Official DEIMv2 PyTorchModelHubMixin loader + pre/post-processing |
 | `handler.py` | Legacy RunPod serverless handler (kept for reference) |
 | `schema.py` | Pydantic request/response models |
+| `risk/` | Deterministic risk engine: `tracking`, `scene_graph`, `risk_matrix`, `controls`, `provenance`, `privacy`, `risk_engine`, `risk_schema` (+ `risk_matrix_profile.json`) |
+| `validation/` | CPU-only risk-engine quality gate (`run_validation.py` + synthetic `scenarios/`) |
 
 ## Diagnostic mode
 

@@ -1,0 +1,64 @@
+{
+  "description": "Synthetic deterministic hazard scenarios for the risk engine. No GPU, no weights, no real images -- entities are hand-specified normalized boxes. run_validation.py asserts the engine still recalls the expected hazards (CI quality gate; fail = recall regression).",
+  "img_w": 1280,
+  "img_h": 720,
+  "scenarios": [
+    {
+      "name": "person_missing_hardhat",
+      "critical": true,
+      "entities": [
+        {"label": "no_hardhat", "class_id": 1, "confidence": 0.82, "bbox": {"x": 0.40, "y": 0.20, "w": 0.10, "h": 0.18}},
+        {"label": "person", "class_id": 0, "confidence": 0.90, "bbox": {"x": 0.38, "y": 0.20, "w": 0.16, "h": 0.55}}
+      ],
+      "expect_hazards": ["ppe_missing_hardhat"],
+      "expect_min_level": "ORANGE"
+    },
+    {
+      "name": "pedestrian_forklift_overlap",
+      "critical": true,
+      "entities": [
+        {"label": "person", "class_id": 0, "confidence": 0.88, "bbox": {"x": 0.30, "y": 0.40, "w": 0.14, "h": 0.45}},
+        {"label": "forklift", "class_id": 7, "confidence": 0.86, "bbox": {"x": 0.34, "y": 0.42, "w": 0.24, "h": 0.40}}
+      ],
+      "expect_hazards": ["person_forklift_proximity"],
+      "expect_min_level": "ORANGE"
+    },
+    {
+      "name": "fire_present",
+      "critical": true,
+      "entities": [
+        {"label": "fire", "class_id": 80, "confidence": 0.79, "bbox": {"x": 0.55, "y": 0.55, "w": 0.20, "h": 0.25}}
+      ],
+      "expect_hazards": ["fire"],
+      "expect_min_level": "RED"
+    },
+    {
+      "name": "blocked_exit",
+      "critical": false,
+      "entities": [
+        {"label": "blocked_exit", "class_id": 90, "confidence": 0.7, "bbox": {"x": 0.10, "y": 0.30, "w": 0.20, "h": 0.50}}
+      ],
+      "expect_hazards": ["blocked_exit"],
+      "expect_min_level": "ORANGE"
+    },
+    {
+      "name": "object_near_edge_latent",
+      "critical": false,
+      "entities": [
+        {"label": "cup", "class_id": 41, "confidence": 0.66, "bbox": {"x": 0.93, "y": 0.50, "w": 0.06, "h": 0.10}}
+      ],
+      "expect_hazards": ["object_near_edge"],
+      "expect_min_level": "GREEN"
+    },
+    {
+      "name": "person_near_open_hole",
+      "critical": true,
+      "entities": [
+        {"label": "person", "class_id": 0, "confidence": 0.9, "bbox": {"x": 0.45, "y": 0.40, "w": 0.13, "h": 0.45}},
+        {"label": "open_hole", "class_id": 91, "confidence": 0.6, "bbox": {"x": 0.50, "y": 0.62, "w": 0.18, "h": 0.18}}
+      ],
+      "expect_hazards": ["open_hole_fall"],
+      "expect_min_level": "ORANGE"
+    }
+  ]
+}
