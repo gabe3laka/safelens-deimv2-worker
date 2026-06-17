@@ -211,6 +211,9 @@ class _VisionStreamSession:
         metrics_interval_s: float,
         warmup_timeout_s: float,
         warmup_poll_s: float,
+        risk_hook: Optional[Callable[..., Dict[str, Any]]] = None,
+        authorize_ws: Optional[Callable[[WebSocket], bool]] = None,
+        is_accepting: Optional[Callable[[], bool]] = None,
     ) -> None:
         self.ws = websocket
         self.get_state = get_state
@@ -219,6 +222,9 @@ class _VisionStreamSession:
         self.get_backend = get_backend
         self.get_tasks = get_tasks
         self.get_gpu_device = get_gpu_device
+        self.risk_hook = risk_hook
+        self.authorize_ws = authorize_ws
+        self.is_accepting = is_accepting or (lambda: True)
         self.default_conf = default_conf
         self.default_img_size = default_img_size
         self.metrics_interval_s = metrics_interval_s
@@ -353,6 +359,14 @@ class _VisionStreamSession:
             return
         mtype = msg.get("type") if isinstance(msg, dict) else None
         if mtype == "frame":
+            if not self.is_accepting():
+                # Graceful shutdown: stop accepting new frames, drain in-flight.
+                await self.safe_send({
+                    "type": "error", "error": "shutting_down",
+                    "camera_id": msg.get("camera_id") if isinstance(msg, dict) else None,
+                    "frame_id": msg.get("frame_id") if isinstance(msg, dict) else None,
+                })
+                return
             ok, err = validate_frame(msg)
             if not ok:
                 self.errors += 1
@@ -422,7 +436,7 @@ class _VisionStreamSession:
         self._infer_avg.add(data.get("inference_ms") or 0.0)
         self._e2e_avg.add(e2e_ms)
 
-        await self.safe_send({
+        vision_msg: Dict[str, Any] = {
             "type": "vision",
             "camera_id": frame.get("camera_id"),
             "frame_id": frame.get("frame_id"),
@@ -437,7 +451,19 @@ class _VisionStreamSession:
             "received_at": received_at,
             "completed_at": completed_at,
             "end_to_end_latency_ms": e2e_ms,
-        })
+        }
+        # Additive deterministic risk layer (no-op unless RISK_ENGINE_ENABLED).
+        # Keyed by camera_id so per-stream tracker state stays isolated (B1).
+        # Never raises: on failure the plain vision message is sent unchanged.
+        if self.risk_hook is not None:
+            try:
+                vision_msg = self.risk_hook(
+                    vision_msg, session_id=frame.get("camera_id"),
+                    frame_id=frame.get("frame_id"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("ws/vision: risk_hook failed: %s", exc)
+        await self.safe_send(vision_msg)
 
     @staticmethod
     def _frame_float(frame: Dict[str, Any], key: str, default: float) -> float:
@@ -489,6 +515,18 @@ class _VisionStreamSession:
 
     async def run(self) -> None:
         """Accept, announce, then run the recv/infer/metrics loops together."""
+        # Shared-secret auth on connect (B7). Reject before doing any work.
+        if self.authorize_ws is not None:
+            try:
+                authorized = self.authorize_ws(self.ws)
+            except Exception:  # noqa: BLE001
+                authorized = False
+            if not authorized:
+                try:
+                    await self.ws.close(code=1008)  # policy violation
+                except Exception:  # noqa: BLE001
+                    pass
+                return
         await self.ws.accept()
         await self.safe_send({"type": "connected"})
         _SESSIONS.append(self)
@@ -515,6 +553,20 @@ class _VisionStreamSession:
             _SESSIONS.remove(self)
         except ValueError:
             pass
+
+
+# -- Graceful shutdown --------------------------------------------------------
+
+def shutdown_all() -> int:
+    """Signal every live streaming session to close (graceful drain). Returns
+    the number of sessions signalled. Safe to call from the lifespan shutdown."""
+    sessions = list(_SESSIONS)
+    for s in sessions:
+        try:
+            s.closed.set()
+        except Exception:  # noqa: BLE001
+            pass
+    return len(sessions)
 
 
 # -- Registration -------------------------------------------------------------
@@ -567,6 +619,9 @@ def register_ws_vision(
     get_tasks: Callable[[], List[str]] = _default_tasks,
     get_gpu_device: Callable[[], Optional[str]] = lambda: None,
     get_config: Optional[Callable[[], Dict[str, Any]]] = None,
+    risk_hook: Optional[Callable[..., Dict[str, Any]]] = None,
+    authorize_ws: Optional[Callable[[WebSocket], bool]] = None,
+    is_accepting: Optional[Callable[[], bool]] = None,
     metrics_interval_s: Optional[float] = None,
     warmup_timeout_s: Optional[float] = None,
     warmup_poll_s: Optional[float] = None,
@@ -619,6 +674,9 @@ def register_ws_vision(
             metrics_interval_s=metrics_interval_s,
             warmup_timeout_s=warmup_timeout_s,
             warmup_poll_s=warmup_poll_s,
+            risk_hook=risk_hook,
+            authorize_ws=authorize_ws,
+            is_accepting=is_accepting,
         )
         try:
             await session.run()

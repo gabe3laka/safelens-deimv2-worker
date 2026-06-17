@@ -1,0 +1,58 @@
+{
+  "_fixture": "Risk-aware /detect response (risk engine ON). Legacy fields preserved + additive risk block with schema_version risk.v1.",
+  "entities": [
+    {"label": "person", "class_id": 0, "confidence": 0.9,
+     "bbox": {"x": 0.30, "y": 0.40, "w": 0.14, "h": 0.45}, "source": "yolo26"},
+    {"label": "forklift", "class_id": 7, "confidence": 0.86,
+     "bbox": {"x": 0.34, "y": 0.42, "w": 0.24, "h": 0.40}, "source": "yolo26"}
+  ],
+  "poses": [],
+  "segments": [],
+  "inference_ms": 14.0,
+  "model": "YOLO26",
+  "backend": "yolo26",
+  "tasks": ["det"],
+  "img_w": 1280,
+  "img_h": 720,
+  "error": null,
+  "warning": null,
+  "schema_version": "risk.v1",
+  "degraded": false,
+  "degradation_mode": "full",
+  "reasoner_status": "not_triggered",
+  "highest_risk_level": "ORANGE",
+  "risk_engine": {
+    "enabled": true, "degraded": false, "matrix_profile": "default-5x5-v1",
+    "matrix_version": "1.0.0", "tracking_enabled": true, "scene_graph_enabled": true,
+    "provenance_enabled": true, "privacy_blur_enabled": false,
+    "model_version": "risk_engine.v1", "session_id": "cam_1",
+    "active_tracks": 2, "risk_count": 1, "highest_level": "ORANGE", "alerting_count": 1
+  },
+  "tracks": [
+    {"track_id": "trk_1", "label": "person", "class_id": 0, "confidence": 0.9,
+     "bbox": {"x": 0.30, "y": 0.40, "w": 0.14, "h": 0.45},
+     "centroid": {"x": 0.37, "y": 0.625}, "velocity": {"vx": 0.0, "vy": 0.0},
+     "age_frames": 1, "hits": 1, "first_seen_ms": 1000, "last_seen_ms": 1000}
+  ],
+  "scene_graph": {"nodes": [], "relations": [
+    {"subject": 0, "relation": "overlaps", "object": 1, "iou": 0.18, "distance": 0.05}
+  ], "object_count": 2},
+  "risks": [
+    {"risk_id": "rsk_R04_person_forklift_trk_1", "rule_id": "R04_person_forklift",
+     "hazard_type": "person_forklift_proximity", "risk_state": "active",
+     "involved_track_ids": ["trk_1"], "involved_entities": [0, 1],
+     "severity": 4, "likelihood": 4, "risk_score": 16, "risk_level": "ORANGE",
+     "reason": "'person' overlaps 'forklift'.",
+     "bbox": {"x": 0.30, "y": 0.40, "w": 0.14, "h": 0.45},
+     "recommended_controls": [
+       {"level": "elimination", "action": "Keep pedestrians out of the forklift operating zone."},
+       {"level": "engineering", "action": "Install physical barriers / proximity detection on the MHE."}
+     ],
+     "recommended_action": "Keep pedestrians out of the forklift operating zone.",
+     "standard_reference": "OSHA 1926.602 / pedestrian-vehicle segregation",
+     "confidence": 1.0, "should_alert": true,
+     "produced_by": "risk_engine", "model_version": "risk_engine.v1",
+     "requires_human_review": false, "timestamp_ms": 1000}
+  ],
+  "scene_risks": []
+}
