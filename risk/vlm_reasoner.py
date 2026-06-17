@@ -357,8 +357,9 @@ def _decode_blurred(req: ReasonRequest):
         side = _max_image_side()
         if max(img.size) > side:
             img.thumbnail((side, side))
+        # Privacy egress guard (B8): no un-blurred frame may reach the VLM.
         if privacy.blur_enabled():
-            img = privacy.blur_persons(img, req.entities)
+            img, _blurred = privacy.sanitize_for_egress(img, req.entities)
         return img
     except Exception as exc:  # noqa: BLE001
         log.warning("vlm: frame decode/blur failed: %s", exc)

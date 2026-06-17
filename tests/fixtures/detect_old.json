@@ -1,0 +1,19 @@
+{
+  "_fixture": "Legacy /detect response shape (risk engine OFF). The app MUST keep parsing this. No schema_version / risk fields.",
+  "entities": [
+    {"label": "person", "class_id": 0, "confidence": 0.9,
+     "bbox": {"x": 0.3, "y": 0.4, "w": 0.14, "h": 0.45}, "source": "yolo26"}
+  ],
+  "poses": [],
+  "segments": [],
+  "inference_ms": 12.3,
+  "model": "YOLO26",
+  "backend": "yolo26",
+  "tasks": ["det"],
+  "img_w": 1280,
+  "img_h": 720,
+  "error": null,
+  "warning": null,
+  "fallbackUsed": null,
+  "fallbackReason": null
+}

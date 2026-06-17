@@ -228,7 +228,10 @@ def test_detect_mocked_returns_entities_and_poses(client, monkeypatch):
     monkeypatch.setattr(vision_backend, "run_inference",
                         lambda **kw: fake)
 
-    img_b64 = base64.b64encode(b"abcd").decode()
+    import io as _io
+    from PIL import Image as _Image
+    _buf = _io.BytesIO(); _Image.new("RGB", (8, 8), (200, 200, 200)).save(_buf, format="JPEG")
+    img_b64 = base64.b64encode(_buf.getvalue()).decode()  # real image (input guard decodes header)
     r = c.post("/detect", json={"image_b64": img_b64, "conf": 0.25, "img_size": 640})
     assert r.status_code == 200
     body = r.json()

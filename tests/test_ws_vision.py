@@ -39,9 +39,16 @@ from fastapi.testclient import TestClient
 import ws_vision
 from schema import BBox, Entity, Keypoint, Pose, InferResponse
 
-# Any valid base64 works -- validate_frame only checks base64 validity, and the
-# fake inference ignores the bytes (no real decode / GPU needed).
-_FRAME_B64 = base64.b64encode(b"\xff\xd8\xff\xe0fake-jpeg-bytes").decode()
+# The WS path only checks base64 validity (inference is mocked), but /detect's
+# input guard now decodes the image header -- so use a real (tiny) JPEG here.
+def _real_jpeg_b64():
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8), (210, 210, 210)).save(buf, format="JPEG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+_FRAME_B64 = _real_jpeg_b64()
 
 
 def _fake_response() -> InferResponse:
