@@ -1,0 +1,105 @@
+{
+  "_comment": "SafeLens worker model registry (EXAMPLE). Copy to model_registry.json and set MODEL_REGISTRY_PATH. Documents id/backend/tasks/license/weights source per model. WEIGHTS ARE NEVER COMMITTED OR BAKED INTO THE IMAGE (commit_weights:false): they resolve at runtime from the HF cache, /runpod-volume, or an approved URL, and are sha256-verified when set. VLM/GroundingDINO weights must not be downloaded during Docker build.",
+  "schema_version": "model_registry.v1",
+  "detectors": [
+    {
+      "id": "yolo11s.pt",
+      "backend": "ultralytics",
+      "tasks": ["det"],
+      "default_for": ["demo", "recall_test"],
+      "img_size": 960,
+      "license_status": "AGPL-3.0 (verify before commercial use; Ultralytics Enterprise License required for closed-source/commercial)",
+      "commercial_default": false,
+      "weights_source": "runtime: ultralytics auto-download into YOLO26_CACHE_DIR (/runpod-volume) or external registry",
+      "commit_weights": false,
+      "sha256": "TODO_fill_when_pinned"
+    },
+    {
+      "id": "yolo26n.pt",
+      "backend": "ultralytics",
+      "tasks": ["det"],
+      "default_for": ["live_fast"],
+      "img_size": 640,
+      "license_status": "verify (Ultralytics family; treat as AGPL unless confirmed)",
+      "commercial_default": false,
+      "weights_source": "runtime: baked best-effort into /app/models/yolo26 or auto-download into cache",
+      "commit_weights": false,
+      "sha256": "TODO_fill_when_pinned"
+    },
+    {
+      "id": "deimv2",
+      "backend": "deimv2",
+      "tasks": ["det"],
+      "default_for": ["commercial_candidate"],
+      "license_status": "Apache-2.0 (commercial-safe) -- preferred commercial direction",
+      "commercial_default": true,
+      "weights_source": "runtime: HF Hub (Intellindust/DEIMv2_DINOv3_S_COCO)",
+      "commit_weights": false,
+      "sha256": "TODO_fill_when_pinned"
+    },
+    {
+      "id": "rtdetr",
+      "backend": "rtdetr",
+      "tasks": ["det"],
+      "default_for": ["commercial_candidate"],
+      "license_status": "Apache-2.0 (commercial-safe; original lyuwenyu/RT-DETR, NOT the Ultralytics AGPL wrapper)",
+      "commercial_default": true,
+      "weights_source": "runtime: external registry / volume",
+      "commit_weights": false,
+      "sha256": "TODO_fill_when_pinned"
+    },
+    {
+      "id": "edgecrafter",
+      "backend": "edgecrafter",
+      "tasks": ["det", "pose"],
+      "default_for": ["fallback"],
+      "license_status": "verify upstream",
+      "commercial_default": false,
+      "weights_source": "runtime: download into EDGECRAFTER_CACHE_DIR (/runpod-volume)",
+      "commit_weights": false,
+      "sha256": "TODO_fill_when_pinned"
+    }
+  ],
+  "reasoners": [
+    {
+      "id": "Qwen/Qwen2.5-VL-7B-Instruct",
+      "role": "vlm_reasoner",
+      "default_for": ["reason"],
+      "license_status": "Apache-2.0 (verify checkpoint card before commercial use)",
+      "weights_source": "runtime: HF cache / /runpod-volume/models/qwen-vl (NEVER downloaded at Docker build)",
+      "commit_weights": false,
+      "sha256": "TODO_fill_when_pinned"
+    },
+    {
+      "id": "Qwen/Qwen2.5-VL-3B-Instruct",
+      "role": "vlm_reasoner",
+      "default_for": ["reason_low_vram"],
+      "license_status": "Apache-2.0 (verify checkpoint card)",
+      "weights_source": "runtime: HF cache / /runpod-volume/models/qwen-vl",
+      "commit_weights": false,
+      "sha256": "TODO_fill_when_pinned"
+    },
+    {
+      "id": "deepseek-ai/deepseek-vl2-small",
+      "role": "vlm_reasoner_alt",
+      "default_for": [],
+      "license_status": "VERIFY: DeepSeek-VL2 is the visual model (NOT R1/V3 text models). Confirm license before commercial use.",
+      "weights_source": "runtime: HF cache / /runpod-volume",
+      "commit_weights": false,
+      "sha256": "TODO_fill_when_pinned"
+    }
+  ],
+  "scanners": [
+    {
+      "id": "GroundingDINO_SwinT_OGC",
+      "role": "open_vocab_scanner",
+      "default_for": [],
+      "enabled_by_default": false,
+      "authority": "candidate_only (never an official HSE alert without deterministic confirmation or human review)",
+      "license_status": "Apache-2.0 (verify checkpoint)",
+      "weights_source": "runtime: /runpod-volume/models/groundingdino (NEVER downloaded at Docker build)",
+      "commit_weights": false,
+      "sha256": "TODO_fill_when_pinned"
+    }
+  ]
+}

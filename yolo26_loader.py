@@ -53,8 +53,10 @@ def _model_id(task):
         return _env("YOLO26_SEG_MODEL_ID", "yolo26n-seg.pt")
     if task == "pose":
         return _env("YOLO26_POSE_MODEL_ID", "yolo26n-pose.pt")
-    # det: new name first, legacy YOLO26_MODEL_ID still honored.
-    return _env("YOLO26_DET_MODEL_ID", "") or _env("YOLO26_MODEL_ID", "yolo26n.pt")
+    # det: generic YOLO_DET_MODEL_ID first (e.g. yolo11s.pt), then legacy
+    # YOLO26_DET_MODEL_ID / YOLO26_MODEL_ID -- old deployments keep working.
+    return (_env("YOLO_DET_MODEL_ID", "") or _env("YOLO26_DET_MODEL_ID", "")
+            or _env("YOLO26_MODEL_ID", "yolo26n.pt"))
 
 
 def pose_enabled():

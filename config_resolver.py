@@ -60,7 +60,9 @@ def resolve_effective_inference_config(
     payload = payload or {}
     backend = backend.strip().lower()
 
-    if backend == "yolo26":
+    # "ultralytics" is the generic name for the YOLO family (YOLO11/YOLO26/YOLOE)
+    # and shares the YOLO config resolution (generic YOLO_* first, legacy YOLO26_*).
+    if backend in ("yolo26", "ultralytics"):
         return _resolve_yolo26_config(payload)
     elif backend == "edgecrafter":
         return _resolve_edgecrafter_config(payload)
@@ -68,55 +70,68 @@ def resolve_effective_inference_config(
         return _resolve_default_config(payload)
 
 
+def _env_generic(generic: str, legacy: str, default: str) -> "tuple[str, str]":
+    """Resolve a value preferring the generic YOLO_* var, then legacy YOLO26_*.
+
+    Returns (value, source_label). An empty/unset generic var falls through to
+    the legacy var, then to the default -- so old YOLO26_* deployments keep
+    working unchanged while new generic YOLO_* names take precedence when set.
+    """
+    val = os.getenv(generic)
+    if val is not None and val != "":
+        return val, f"env:{generic}={val}"
+    val = os.getenv(legacy)
+    if val is not None and val != "":
+        return val, f"env:{legacy}={val}"
+    return default, f"default:{default}"
+
+
 def _resolve_yolo26_config(payload: dict) -> EffectiveInferenceConfig:
-    """Resolve YOLO26-specific config."""
+    """Resolve YOLO/Ultralytics config (generic YOLO_* first, legacy YOLO26_*)."""
     # conf resolution
     if "conf" in payload:
         conf = float(payload["conf"])
         conf_source = "payload.conf"
     else:
-        conf_env = os.getenv("YOLO26_CONF", "0.20")
+        conf_env, conf_source = _env_generic("YOLO_CONF", "YOLO26_CONF", "0.20")
         try:
             conf = float(conf_env)
-            conf_source = f"env:YOLO26_CONF={conf_env}"
         except (ValueError, TypeError):
             conf = 0.20
-            conf_source = "default:YOLO26_CONF_parse_failed"
-            log.warning("[config] YOLO26_CONF parse failed (%s), using default 0.20", conf_env)
+            conf_source = "default:YOLO_CONF_parse_failed"
+            log.warning("[config] YOLO_CONF/YOLO26_CONF parse failed (%s), using 0.20", conf_env)
 
     # img_size resolution
     if "img_size" in payload:
         img_size = int(payload["img_size"])
         img_size_source = "payload.img_size"
     else:
-        img_size_env = os.getenv("YOLO26_IMG_SIZE", "960")
+        img_size_env, img_size_source = _env_generic("YOLO_IMG_SIZE", "YOLO26_IMG_SIZE", "960")
         try:
             img_size = int(img_size_env)
-            img_size_source = f"env:YOLO26_IMG_SIZE={img_size_env}"
         except (ValueError, TypeError):
             img_size = 960
-            img_size_source = "default:YOLO26_IMG_SIZE_parse_failed"
-            log.warning("[config] YOLO26_IMG_SIZE parse failed (%s), using default 960", img_size_env)
+            img_size_source = "default:YOLO_IMG_SIZE_parse_failed"
+            log.warning("[config] YOLO_IMG_SIZE/YOLO26_IMG_SIZE parse failed (%s), using 960", img_size_env)
 
     # iou resolution (always from env for YOLO, never from payload)
-    iou_env = os.getenv("YOLO26_IOU", "0.50")
+    iou_env, iou_source = _env_generic("YOLO_IOU", "YOLO26_IOU", "0.50")
     try:
         iou = float(iou_env)
-        iou_source = f"env:YOLO26_IOU={iou_env}"
     except (ValueError, TypeError):
         iou = 0.50
-        iou_source = "default:YOLO26_IOU_parse_failed"
-        log.warning("[config] YOLO26_IOU parse failed (%s), using default 0.50", iou_env)
+        iou_source = "default:YOLO_IOU_parse_failed"
+        log.warning("[config] YOLO_IOU/YOLO26_IOU parse failed (%s), using 0.50", iou_env)
 
     # max_det resolution (always from env for YOLO, never from payload)
-    max_det_env = os.getenv("YOLO26_MAX_DETECTIONS", "170")
+    max_det_env, max_det_source = _env_generic(
+        "YOLO_MAX_DETECTIONS", "YOLO26_MAX_DETECTIONS", "170")
     try:
         max_det = int(max_det_env)
-        max_det_source = f"env:YOLO26_MAX_DETECTIONS={max_det_env}"
     except (ValueError, TypeError):
         max_det = 170
-        max_det_source = "default:YOLO26_MAX_DETECTIONS_parse_failed"
-        log.warning("[config] YOLO26_MAX_DETECTIONS parse failed (%s), using default 170", max_det_env)
+        max_det_source = "default:YOLO_MAX_DETECTIONS_parse_failed"
+        log.warning("[config] YOLO_MAX_DETECTIONS/YOLO26_MAX_DETECTIONS parse failed (%s), using 170", max_det_env)
 
     return EffectiveInferenceConfig(
         backend="yolo26",
@@ -206,6 +221,41 @@ def _resolve_default_config(payload: dict) -> EffectiveInferenceConfig:
     )
 
 
+def resolve_detector_model_id() -> str:
+    """Resolve the active detector model id (generic YOLO_* first, legacy YOLO26_*).
+
+    Supports stronger demo detectors (e.g. yolo11s.pt) via YOLO_DET_MODEL_ID
+    while keeping legacy YOLO26_DET_MODEL_ID / YOLO26_MODEL_ID working.
+    """
+    return (
+        os.getenv("YOLO_DET_MODEL_ID")
+        or os.getenv("YOLO26_DET_MODEL_ID")
+        or os.getenv("YOLO26_MODEL_ID")
+        or "yolo26n.pt"
+    )
+
+
+def get_active_detector_summary() -> dict:
+    """Resolved active backend + detector model + inference knobs (for /debug/state).
+
+    weights_source is descriptive (weights resolve at runtime from the cache /
+    volume / registry -- never baked secrets), matching the worker's existing
+    runtime weight-resolution contract.
+    """
+    backend = os.getenv("VISION_BACKEND", "yolo26").strip().lower()
+    is_yolo = backend in ("yolo26", "ultralytics")
+    cfg = resolve_effective_inference_config("yolo26" if is_yolo else backend, {})
+    return {
+        "active_backend": backend,
+        "active_model_id": resolve_detector_model_id() if is_yolo else None,
+        "img_size": cfg.img_size,
+        "conf": cfg.conf,
+        "iou": cfg.iou,
+        "max_detections": cfg.max_det,
+        "weights_source": "runtime_cache_or_external_registry",
+    }
+
+
 def get_effective_config_summary() -> dict:
     """Return a summary of all effective configs for all backends (for /debug/state)."""
     return {
@@ -213,6 +263,7 @@ def get_effective_config_summary() -> dict:
         "fallback_backend": os.getenv("FALLBACK_VISION_BACKEND", "edgecrafter").strip().lower(),
         "auto_backend_fallback": os.getenv("AUTO_BACKEND_FALLBACK", "true").strip().lower()
         in ("1", "true", "yes", "on"),
+        "active_detector": get_active_detector_summary(),
         "yolo26": {
             "conf": _safe_float(os.getenv("YOLO26_CONF", "0.20")),
             "img_size": _safe_int(os.getenv("YOLO26_IMG_SIZE", "960")),

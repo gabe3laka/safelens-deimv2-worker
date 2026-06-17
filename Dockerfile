@@ -25,6 +25,11 @@ FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
 WORKDIR /app
 
+# Build provenance (B6): the CI build passes --build-arg BUILD_SHA=<git sha>;
+# surfaced in /debug/state, /ready, /metrics, and every structured log line.
+ARG BUILD_SHA=unknown
+ENV BUILD_SHA=${BUILD_SHA}
+
 # System dependencies (git for repo clones, libgl for opencv).
 RUN apt-get update && apt-get install -y \
     git wget curl libgl1 libglib2.0-0 \
@@ -119,21 +124,14 @@ print("stack preserved + ultralytics", ultralytics.__version__,
       "+ EdgeCrafter engine import OK")
 PY
 
-# Best-effort: pre-bake YOLO26 weights so RunPod cold starts need no download
-# (runtime falls back to YOLO26_CACHE_DIR on the volume, then auto-download).
-# Never fails the build -- the worker degrades per task and can auto-fall back
-# to EdgeCrafter via AUTO_BACKEND_FALLBACK.
-RUN mkdir -p /app/models/yolo26 && cd /app/models/yolo26 && python - <<'PY'
-from ultralytics import YOLO
-# det (live loop) + seg (Build/Plan crops). pose is opt-in and not baked --
-# enabling YOLO26_POSE_ENABLED downloads it into the volume cache at runtime.
-for mid in ("yolo26n.pt", "yolo26n-seg.pt"):
-    try:
-        YOLO(mid)  # bare ids download into CWD (/app/models/yolo26)
-        print("YOLO26 weights baked:", mid)
-    except Exception as e:  # noqa: BLE001
-        print("WARN: could not pre-bake", mid, "->", type(e).__name__, e)
-PY
+# Hardening (B10): NO model weights are baked into the image and NONE are
+# downloaded at build time -- not YOLO, EdgeCrafter, DEIMv2, Qwen-VL,
+# DeepSeek-VL2, or GroundingDINO. Weights resolve at RUNTIME only, from
+# YOLO26_CACHE_DIR / EDGECRAFTER_CACHE_DIR / the HF cache on /runpod-volume, or
+# an approved registry. We still create the cache dir so the runtime can write
+# into it (auto-download / volume mount). Operators may pre-populate the volume
+# for air-gapped/no-egress deployments (see docs/runbook.md).
+RUN mkdir -p /app/models/yolo26
 
 # ---- Optional SAM2 runtime support ------------------------------------------
 # SAM2 code paths exist in build_segmentation.py, but dedicated SAM2 weights /
@@ -146,6 +144,8 @@ COPY edgecrafter_loader.py /app/edgecrafter_loader.py
 COPY yolo26_loader.py /app/yolo26_loader.py
 COPY vision_backend.py /app/vision_backend.py
 COPY config_resolver.py /app/config_resolver.py
+COPY ultralytics_loader.py /app/ultralytics_loader.py
+COPY model_registry.example.json /app/model_registry.example.json
 COPY deimv2_infer.py /app/deimv2_infer.py
 COPY official_deimv2_loader.py /app/official_deimv2_loader.py
 COPY server.py /app/server.py
@@ -158,6 +158,12 @@ COPY build_schema.py /app/build_schema.py
 COPY build_blueprint.py /app/build_blueprint.py
 COPY build_segmentation.py /app/build_segmentation.py
 COPY plan_context.py /app/plan_context.py
+
+# Risk-aware perception (deterministic engine + per-session tracking) + the
+# CPU-only validation harness. No weights/datasets -- pure-Python rules + a JSON
+# matrix profile. Additive and gated by RISK_ENGINE_ENABLED (default off).
+COPY risk /app/risk
+COPY validation /app/validation
 
 # Worker code + upstream engine packages on PYTHONPATH. The EdgeCrafter ecdetseg
 # and ecpose subtrees each ship their own engine package; edgecrafter_loader.py
@@ -202,6 +208,18 @@ ENV YOLO26_CACHE_DIR="/runpod-volume/models/yolo26"
 # Ultralytics container hardening: writable config dir; never pip at runtime.
 ENV YOLO_CONFIG_DIR="/tmp/Ultralytics"
 ENV YOLO_AUTOINSTALL="false"
+
+# ------- Generic detector config (A1) -----------------------------------------
+# Generic YOLO_* names take PRECEDENCE over the legacy YOLO26_* above when set,
+# so a stronger detector profile can be tested WITHOUT editing the image:
+#   VISION_BACKEND=ultralytics
+#   YOLO_DET_MODEL_ID=yolo11s.pt  YOLO_IMG_SIZE=960  YOLO_CONF=0.10
+#   YOLO_IOU=0.60  YOLO_MAX_DETECTIONS=300
+# Left UNSET here on purpose: yolo11s.pt is AGPL -- verify commercial rights
+# before making it the production default (do NOT silently switch). Commercial
+# direction: DEIM/DEIMv2 or RT-DETR (Apache-2.0). See model_registry.example.json.
+# Weights are NEVER baked here; they resolve at runtime from cache/volume/registry.
+ENV MODEL_REGISTRY_PATH="/app/model_registry.example.json"
 
 # ------- (legacy comment) ------------------------------------------------------
 # edgecrafter (default) | deimv2 (legacy fallback)
@@ -254,6 +272,82 @@ ENV DEPTH_MODEL_ID="depth-anything-v2-small"
 ENV DEPTH_DEVICE="cuda"
 ENV DEPTH_CACHE_DIR="/runpod-volume/models/depth"
 
+# ------- Risk-aware perception (deterministic engine + tracking) -------------
+# Additive and OFF by default: when RISK_ENGINE_ENABLED=false the /detect and
+# /ws/vision responses are byte-for-byte the legacy shape. When enabled, the
+# deterministic engine (the safety signal) adds tracks/scene_graph/risks +
+# schema_version. Per-session tracker state is keyed by session_id/camera_id
+# with TTL eviction (Build Mode pattern). No weights, no GPU, no VLM here --
+# the event-driven Qwen-VL reasoner / GroundingDINO scanner are a later PR.
+ENV RISK_ENGINE_ENABLED="false"
+ENV RISK_TRACKING_ENABLED="true"
+ENV RISK_SCENE_GRAPH_ENABLED="true"
+ENV RISK_PROVENANCE_ENABLED="true"
+ENV RISK_MODEL_VERSION="risk_engine.v1"
+ENV RISK_MATRIX_PROFILE="/app/risk/risk_matrix_profile.json"
+ENV RISK_NEAR_THRESHOLD="0.12"
+ENV RISK_EDGE_THRESHOLD="0.04"
+ENV TRACK_IOU_MATCH="0.3"
+ENV TRACK_MAX_AGE_FRAMES="30"
+ENV TRACK_MAX_PER_SESSION="300"
+ENV SESSION_TTL_MS="30000"
+ENV SESSION_MAX_ACTIVE="64"
+# Privacy: blur persons/faces before any frame is persisted/sent to a VLM.
+# OFF until the (later) VLM/evidence path exists; the deterministic engine
+# needs no imagery. No emotion/biometric inference -- hazards/conditions only.
+ENV PRIVACY_BLUR_ENABLED="false"
+ENV PRIVACY_BLUR_RADIUS="24"
+# Validation gate (validation/run_validation.py): min critical-hazard recall.
+ENV VALIDATION_MIN_RECALL_CRITICAL="0.90"
+
+# ------- Event-driven VLM reasoning (Qwen-VL / DeepSeek-VL2) ------------------
+# REAL adapter, but OFF by default and NEVER per-frame: /reason runs it on
+# demand and /detect triggers it asynchronously (rate-limited, above
+# REASONER_TRIGGER_LEVEL) and never waits for it. VLM output is an AI DRAFT
+# only (produced_by=vlm_reasoner, requires_human_review=true, should_alert=false)
+# -- it never becomes the safety authority. The deterministic engine remains the
+# signal. Weights are NOT baked into the image and NOT downloaded at build; they
+# resolve at runtime into REASONER_CACHE_DIR / the HF cache. REASONER_MODE=mock
+# gives a CPU, weight-free contract for app integration.
+ENV VLM_REASONER_ENABLED="false"
+ENV REASONER_MODE="qwen_vl"
+ENV QWEN_VL_MODEL_ID="Qwen/Qwen2.5-VL-7B-Instruct"
+ENV DEEPSEEK_VL_MODEL_ID="deepseek-ai/deepseek-vl2-small"
+ENV REASONER_DEVICE="cuda"
+ENV REASONER_DTYPE="auto"
+ENV REASONER_QUANTIZATION="4bit"
+ENV REASONER_MAX_IMAGE_SIDE="1024"
+ENV REASONER_MAX_NEW_TOKENS="768"
+ENV REASONER_TIMEOUT_MS="8000"
+ENV REASONER_MIN_INTERVAL_MS="5000"
+ENV REASONER_CACHE_TTL_MS="15000"
+ENV REASONER_TRIGGER_LEVEL="ORANGE"
+ENV REASONER_MAX_WORKERS="1"
+ENV REASONER_MAX_SESSIONS="64"
+ENV REASONER_CACHE_DIR="/runpod-volume/models/qwen-vl"
+
+# ------- Open-vocabulary scanner (GroundingDINO) -----------------------------
+# Optional, OFF by default, NEVER per-frame. Candidate-only output (requires
+# human review); never triggers official HSE alerts. Weights resolve at runtime
+# (NOT baked, NOT downloaded at build).
+ENV OPEN_VOCAB_SCANNER_ENABLED="false"
+ENV OPEN_VOCAB_SCANNER_MODE="grounding_dino"
+ENV GROUNDING_DINO_MODEL_ID="IDEA-Research/grounding-dino-tiny"
+ENV GROUNDING_DINO_BOX_THRESHOLD="0.35"
+ENV GROUNDING_DINO_TEXT_THRESHOLD="0.25"
+ENV OPEN_VOCAB_SCAN_INTERVAL_MS="30000"
+ENV GROUNDING_DINO_CACHE_DIR="/runpod-volume/models/groundingdino"
+
+# ------- Worker hardening (auth / input guards / shutdown) -------------------
+# WORKER_SHARED_SECRET is intentionally NOT set here (never bake secrets). Set it
+# at deploy time so the worker rejects any request without the proxy's secret on
+# every route except /health and /ping. Unset = compatibility/testing mode.
+# (placeholder documented, not a default secret): WORKER_SHARED_SECRET=""
+ENV WORKER_AUTH_HEADER="x-worker-secret"
+ENV MAX_REQUEST_BYTES="10000000"
+ENV MAX_IMAGE_MEGAPIXELS="16"
+ENV GRACEFUL_DRAIN_MS="1500"
+
 # ------- DEIMv2 (legacy fallback) configuration ------------------------------
 ENV DEIMV2_DEVICE="cuda"
 ENV DEIMV2_BACKEND="official-deimv2-hf"
@@ -261,6 +355,17 @@ ENV DEIMV2_MODEL_ID="Intellindust/DEIMv2_DINOv3_S_COCO"
 ENV DEIMV2_CONF="0.35"
 ENV DEIMV2_IMG_SIZE="640"
 ENV HF_HOME="/runpod-volume/.cache/huggingface"
+
+# ------- Non-root runtime user (B10) -----------------------------------------
+# Run as an unprivileged user. Writable runtime paths (startup log, Ultralytics
+# config, HF cache, and the /runpod-volume model caches) are created and chowned
+# so the user can write to them. NOTE: the mounted /runpod-volume must be
+# writable by uid 10001 (see docs/runbook.md) -- weights resolve there at runtime.
+RUN groupadd -r safelens && useradd -r -u 10001 -g safelens -m -d /home/safelens safelens \
+    && mkdir -p /runpod-volume/models /runpod-volume/.cache/huggingface /tmp/Ultralytics \
+    && chown -R safelens:safelens /app /runpod-volume /tmp/Ultralytics /home/safelens
+ENV HOME="/home/safelens"
+USER safelens
 
 EXPOSE ${PORT}
 

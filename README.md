@@ -46,6 +46,38 @@ pre-baked into `/app/models/yolo26` and otherwise resolved from the cache dir
 or auto-downloaded by Ultralytics into it. Model-load status per task is in
 `GET /debug/state` under `backend_status.yolo26`.
 
+### Generic detector config + stronger demo profile (A1)
+
+The detector config also accepts **generic `YOLO_*` env names** that take
+**precedence** over the legacy `YOLO26_*` names (which still work unchanged when
+the generic ones are unset). `VISION_BACKEND=ultralytics` routes the YOLO family
+(YOLO11 / YOLO26 / YOLOE) through `ultralytics_loader.py` (a thin adapter over
+`yolo26_loader`). This lets you test a stronger detector for better recall
+**without editing the image**:
+
+```env
+VISION_BACKEND=ultralytics
+YOLO_DET_MODEL_ID=yolo11s.pt
+YOLO_IMG_SIZE=960
+YOLO_CONF=0.10
+YOLO_IOU=0.60
+YOLO_MAX_DETECTIONS=300
+```
+
+The resolved active backend/model/knobs are visible in `GET /debug/state` under
+`effective_config.active_detector` (`active_backend`, `active_model_id`,
+`img_size`, `conf`, `iou`, `max_detections`, `weights_source`). `/detect` **and**
+`/ws/vision` both use this resolved active-backend config (streaming no longer
+falls back to stale EdgeCrafter defaults). Precedence per value is
+**payload → `YOLO_*` → `YOLO26_*` → default**.
+
+> **Licensing (do not skip):** `yolo11s.pt` / Ultralytics weights are **AGPL-3.0**
+> — fine for testing/demo, but **not** a silent commercial production default
+> without an Ultralytics Enterprise License. For commercial production prefer
+> **DEIM / DEIMv2** or **RT-DETR** (Apache-2.0). Every candidate is recorded in
+> `model_registry.example.json` with `license_status` + `commit_weights:false`;
+> weights are never committed or baked into the image (runtime-resolved).
+
 ## Architecture
 
 This worker runs as a **long-running FastAPI/uvicorn HTTP server** on a RunPod
@@ -243,6 +275,105 @@ signal if enabled without a backend (no extra image deps; Point-E is never run):
 
 `/debug/state` reports a `plan_context` block with all of these.
 
+## Risk-aware perception (deterministic engine + tracking)
+
+The `risk/` package adds a **deterministic, additive** risk layer on the live
+path (`/detect` HSE loop + `/ws/vision`). It is the **safety signal**: pure
+Python rules over the detector's entities, a per-session tracker, and a
+deterministic scene graph — **no GPU, no weights, no VLM**. It is gated by
+`RISK_ENGINE_ENABLED` (**default off**): when disabled, `/detect` and
+`/ws/vision` responses are byte-for-byte the legacy shape. When enabled, the
+response gains a `schema_version: "risk.v1"` plus additive `risk_engine`,
+`tracks`, `scene_graph`, `risks`, and `scene_risks` fields. A risk failure
+degrades to the normal detection result with a `warning` — never a 500.
+
+```
+detector entities → per-session tracker (IoU/centroid) → scene graph (geometry)
+  → 15 deterministic rules → 5×5 risk matrix (severity×likelihood) → controls
+  (hierarchy of controls) → provenance stamp → scored RiskItem[]
+```
+
+- **15 rules** (`R01..R15`): PPE (hardhat/vest/gloves), pedestrian↔vehicle /
+  ↔forklift separation, fire, smoke, blocked exit, object-near-edge,
+  working-at-height (ladder), scaffold, spill/slip, exposed electrical,
+  overhead suspended load, open-hole/fall — each fires only for the classes the
+  detector actually provides.
+- **Risk matrix** is a versioned JSON profile (`RISK_MATRIX_PROFILE`,
+  default `risk/risk_matrix_profile.json`): `score = severity × likelihood`,
+  banded GREEN/YELLOW/ORANGE/RED. The profile is **validated on load** (bands
+  monotonic, contiguous, full coverage) — a malformed matrix raises.
+- **Per-session tracking** is keyed by `session_id` (`/detect`) / `camera_id`
+  (`/ws/vision`) — never global, so two camera streams never cross-contaminate
+  `track_id`s. State has TTL eviction + a bounded active-session count, reusing
+  the Build Mode session sweep pattern.
+- **Provenance**: every risk carries `produced_by="risk_engine"`,
+  `rule_id`, `model_version`, `timestamp_ms`, and `requires_human_review=false`
+  (the deterministic engine is authoritative; AI drafts will set it true).
+- **Privacy** (`risk/privacy.py`): blurs persons/faces before any frame is
+  persisted or sent to a VLM (`PRIVACY_BLUR_ENABLED`, default off). Hazards and
+  conditions only — never emotion/identity/biometric inference.
+- **Validation gate** (`validation/run_validation.py`): runs the engine over
+  synthetic hazard scenarios (no GPU/weights) and exits non-zero if
+  critical-hazard recall drops below `VALIDATION_MIN_RECALL_CRITICAL` (0.90).
+
+| Env | Default | Notes |
+|-----|---------|-------|
+| `RISK_ENGINE_ENABLED` | `false` | master switch; off = legacy response shape |
+| `RISK_TRACKING_ENABLED` / `RISK_SCENE_GRAPH_ENABLED` | `true` | sub-stage toggles |
+| `RISK_MATRIX_PROFILE` | `/app/risk/risk_matrix_profile.json` | versioned 5×5 matrix |
+| `SESSION_TTL_MS` / `SESSION_MAX_ACTIVE` | `30000` / `64` | per-session tracker memory |
+| `RISK_NEAR_THRESHOLD` | `0.12` | normalized centroid distance for "near" |
+| `PRIVACY_BLUR_ENABLED` | `false` | blur persons before VLM/persist (later PR) |
+
+`/debug/state` reports a `risk_engine` block (flags, matrix profile/version,
+active sessions, and the last evaluation's risk/alert counts + highest level).
+## Event-driven reasoning (Qwen-VL) + open-vocab scanner (GroundingDINO)
+
+`risk/vlm_reasoner.py` is a **real** Qwen-VL (and optional DeepSeek-VL2) reasoner
+behind `POST /reason`, plus a non-blocking trigger from `/detect`. It is **not**
+the safety authority — the deterministic engine is. The VLM only **explains /
+verifies / drafts** *after* the deterministic engine produces a candidate, and
+its output is always an **AI draft**: `produced_by="vlm_reasoner"`,
+`requires_human_review=true`, `should_alert=false` (enforced by the schema, not
+trusted from the model).
+
+- **Never per-frame.** `/detect` calls `maybe_trigger()`: rate-limited
+  (`REASONER_MIN_INTERVAL_MS`), fired only at/above `REASONER_TRIGGER_LEVEL`
+  (default `ORANGE`), run on a bounded background executor. `/detect` **never
+  waits** — it attaches the most recent cached draft (if any) as `scene_risks`
+  plus a `reasoner_status` and returns. If the VLM is slow/unavailable the live
+  loop is unaffected.
+- **Real but lazy.** `torch`/`transformers` import only on first model use;
+  Qwen weights resolve at runtime into `REASONER_CACHE_DIR`/the HF cache and are
+  **never baked into the image or downloaded at Docker build**. Missing
+  deps/weights → `reasoner_status="unavailable"`; over-budget → `"timeout"`;
+  disabled → `"disabled"` — it never raises into the request path.
+- **`REASONER_MODE=mock`** gives a CPU, weight-free implementation of the full
+  `/reason` contract so the app can integrate before a GPU/Qwen deployment.
+- **Privacy.** When `PRIVACY_BLUR_ENABLED`, the frame is blurred (persons)
+  **before** it is passed to the model — no un-blurred frame reaches the VLM.
+
+`POST /reason` validates strictly against `risk/reason_schema.py`
+(`schema_version: "reason.v1"`). `POST /scan` is the optional open-vocabulary
+**GroundingDINO** scanner (`risk/grounding_dino_scanner.py`): disabled by
+default, throttled (never per-frame), output is **candidate-only**
+(`produced_by="open_vocab_scanner"`, `candidate_only=true`,
+`requires_human_review=true`) and can **never** trigger an official HSE alert.
+
+| Env | Default | Notes |
+|-----|---------|-------|
+| `VLM_REASONER_ENABLED` | `false` | master switch for `/reason` + `/detect` trigger |
+| `REASONER_MODE` | `qwen_vl` | `qwen_vl` \| `deepseek_vl2` \| `mock` |
+| `QWEN_VL_MODEL_ID` | `Qwen/Qwen2.5-VL-7B-Instruct` | runtime-resolved; 3B for low VRAM |
+| `REASONER_TRIGGER_LEVEL` / `REASONER_MIN_INTERVAL_MS` | `ORANGE` / `5000` | when/how often to trigger |
+| `REASONER_TIMEOUT_MS` | `8000` | hard cap; over-budget → `reasoner_status:"timeout"` |
+| `REASONER_QUANTIZATION` | `4bit` | `none` \| `8bit` \| `4bit` (GPU memory) |
+| `OPEN_VOCAB_SCANNER_ENABLED` | `false` | GroundingDINO scanner (candidate-only) |
+
+`/debug/state` reports `reasoner` and `open_vocab_scanner` blocks. **Deferred to
+a later PR:** fine-tuning, running the VLM every frame, and using the VLM as the
+alert authority (all explicitly out of scope).
+
 ## Docker image
 
 Built and pushed to GitHub Container Registry on every push to `main`:
@@ -305,6 +436,8 @@ TRANSFORMERS_CACHE=/runpod-volume/.cache/huggingface
 | `official_deimv2_loader.py` | Official DEIMv2 PyTorchModelHubMixin loader + pre/post-processing |
 | `handler.py` | Legacy RunPod serverless handler (kept for reference) |
 | `schema.py` | Pydantic request/response models |
+| `risk/` | Deterministic risk engine (`tracking`, `scene_graph`, `risk_matrix`, `controls`, `provenance`, `privacy`, `risk_engine`, `risk_schema` + `risk_matrix_profile.json`) **and** the event-driven reasoning layer (`vlm_reasoner`, `grounding_dino_scanner`, `open_vocab_scanner`, `reason_schema`) |
+| `validation/` | CPU-only risk-engine quality gate (`run_validation.py` + synthetic `scenarios/`) |
 
 ## Diagnostic mode
 

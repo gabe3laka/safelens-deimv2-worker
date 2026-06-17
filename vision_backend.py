@@ -93,7 +93,9 @@ def _load_backend(backend: str) -> Dict[str, Any]:
             "checkpoint_paths": {},
             "device": str(device),
         }
-    if backend == "yolo26":
+    if backend in ("yolo26", "ultralytics"):
+        # "ultralytics" is the generic YOLO family backend (YOLO11/YOLO26/YOLOE);
+        # it shares the yolo26_loader machinery (Ultralytics YOLO loading).
         import yolo26_loader
         return yolo26_loader.load()
     # default: edgecrafter
@@ -152,7 +154,7 @@ def _backend_ready(backend: str) -> bool:
         if backend == "deimv2":
             import deimv2_infer
             return deimv2_infer._model is not None
-        if backend == "yolo26":
+        if backend in ("yolo26", "ultralytics"):
             import yolo26_loader
             return yolo26_loader.is_ready()
         import edgecrafter_loader as ec
@@ -310,7 +312,7 @@ def run_inference(image_b64: str, conf: Optional[float] = None,
     if backend == "deimv2":
         resp = _deimv2_response(
             image_b64, effective.conf, effective.img_size, class_filter)
-    elif backend == "yolo26":
+    elif backend in ("yolo26", "ultralytics"):
         resp = _yolo26_response(
             image_b64,
             effective.conf,

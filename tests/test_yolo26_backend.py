@@ -437,7 +437,7 @@ def test_detect_contract_unchanged(server_mod, monkeypatch):
         server_mod._STATE["status"] = "ready"
     try:
         with TestClient(server_mod.app) as c:
-            r = c.post("/detect", json={"image_b64": _B64, "conf": 0.25, "img_size": 640})
+            r = c.post("/detect", json={"image_b64": _tiny_jpeg_b64(), "conf": 0.25, "img_size": 640})
             assert r.status_code == 200
             body = r.json()
             assert body["backend"] == "yolo26" and body["model"] == "YOLO26"
