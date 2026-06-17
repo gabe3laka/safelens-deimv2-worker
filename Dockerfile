@@ -168,6 +168,17 @@ COPY plan_context.py /app/plan_context.py
 COPY risk /app/risk
 COPY validation /app/validation
 
+# Single-worker GPU+CPU layers (additive, import-light, no weights):
+#  * shared/             -- cross-layer pydantic schemas, prompts, wire contracts
+#  * gpu_vision/         -- bounded GPU reasoner concurrency + GPU-pressure signal
+#  * temporal_reasoning/ -- event-triggered temporal VLM perception (non-blocking)
+#  * agentic_cpu/        -- CPU-only agentic orchestration mounted at /agent/*
+# agentic_cpu imports NO torch/cv2/ultralytics/transformers (CI import guard).
+COPY shared /app/shared
+COPY gpu_vision /app/gpu_vision
+COPY temporal_reasoning /app/temporal_reasoning
+COPY agentic_cpu /app/agentic_cpu
+
 # Worker code + upstream engine packages on PYTHONPATH. The EdgeCrafter ecdetseg
 # and ecpose subtrees each ship their own engine package; edgecrafter_loader.py
 # manages which one is active at import time, so we only add /app + /opt/DEIMv2
@@ -351,6 +362,51 @@ ENV MAX_REQUEST_BYTES="10000000"
 ENV MAX_IMAGE_MEGAPIXELS="16"
 ENV GRACEFUL_DRAIN_MS="1500"
 
+# ------- Event-triggered temporal VLM perception (GPU side) ------------------
+# Additive. The detector runs every frame; the VLM is event-triggered + NON-
+# BLOCKING (/detect never waits). Perception corrections are advisory (no human
+# approval); safety/compliance drafts require human review. No weights baked.
+ENV TEMPORAL_REASONING_ENABLED="true"
+ENV TEMPORAL_MEMORY_WINDOW_FRAMES="45"
+ENV TEMPORAL_MEMORY_TTL_MS="30000"
+ENV TEMPORAL_MAX_ACTIVE_SESSIONS="64"
+ENV TEMPORAL_STORE_KEYFRAMES="false"
+ENV TEMPORAL_REASONING_TRIGGER_MIN_INTERVAL_MS="5000"
+ENV TEMPORAL_REASONING_MAX_ASYNC_JOBS="2"
+ENV TEMPORAL_LABEL_FLIP_WINDOW_FRAMES="8"
+ENV SCENE_CONTEXT_ENABLED="true"
+ENV SCENE_CONTEXT_REFRESH_MS="15000"
+ENV SCENE_HINT_ENABLED="true"
+ENV CONTEXTUAL_SUPPRESSION_ENABLED="true"
+ENV SEMANTIC_CORRECTION_ENABLED="true"
+ENV SEMANTIC_CORRECTION_LOW_CONF_THRESHOLD="0.35"
+ENV OBJECT_EDGE_RISK_ENABLED="true"
+ENV OBJECT_EDGE_DISTANCE_THRESHOLD="0.10"
+ENV OBJECT_EDGE_HISTORY_FRAMES="6"
+ENV REASONER_RESULT_STALE_MS="12000"
+ENV REASONER_HUMAN_REVIEW_SCORE="10"
+# Bounded GPU reasoner concurrency (separate from the CPU agent's limits).
+ENV GPU_REASONER_MAX_INFLIGHT="1"
+
+# ------- CPU agentic orchestration (/agent/*) --------------------------------
+# CPU-only (no torch/cv2/ultralytics/transformers). Mounted in the SAME worker
+# but on a SEPARATE bounded job queue so it can never block /detect. Mock by
+# default: no real LLM key or DB required. Serious actions are drafts requiring
+# human approval; memory backends are NOT durable -- use postgres/supabase in
+# production (see docs/agentic_cpu_inside_runpod.md).
+ENV AGENTIC_CPU_ENABLED="true"
+ENV CPU_AGENT_MODE="mock"
+ENV CPU_AGENT_MAX_INFLIGHT="2"
+ENV CPU_AGENT_QUEUE_MAX="16"
+ENV CPU_AGENT_JOB_TIMEOUT_MS="30000"
+ENV CPU_AGENT_REQUIRE_APPROVAL="true"
+ENV CPU_AGENT_ACTION_LOG_BACKEND="memory"
+ENV CHECKPOINTER_BACKEND="memory"
+ENV CPU_AGENT_LLM_PROVIDER="mock"
+ENV CPU_AGENT_LLM_MODEL="mock"
+ENV CPU_AGENT_DISABLE_ON_GPU_PRESSURE="true"
+ENV CPU_AGENT_MAX_GPU_BUSY_RATIO="0.85"
+
 # ------- DEIMv2 (legacy fallback) configuration ------------------------------
 ENV DEIMV2_DEVICE="cuda"
 ENV DEIMV2_BACKEND="official-deimv2-hf"
@@ -368,14 +424,21 @@ sys.path.insert(0, "/app")
 required = [
     "/app/worker_guards.py", "/app/worker_runtime.py", "/app/worker_security.py",
     "/app/server.py", "/app/bootstrap.py",
+    "/app/shared", "/app/gpu_vision", "/app/temporal_reasoning", "/app/agentic_cpu",
 ]
 for p in required:
     if not os.path.exists(p):
         raise FileNotFoundError(f"missing required runtime file: {p}")
 for mod in ["worker_guards", "worker_runtime", "worker_security",
-            "schema", "config_resolver", "vision_backend", "ws_vision"]:
+            "schema", "config_resolver", "vision_backend", "ws_vision",
+            "shared", "gpu_vision", "temporal_reasoning", "agentic_cpu"]:
     importlib.import_module(mod)
     print("import OK:", mod)
+# CPU agent must build its router without pulling any GPU dep into the image.
+import agentic_cpu
+agentic_cpu.get_router()
+for _gpu in ("torch", "ultralytics", "cv2", "transformers"):
+    assert _gpu not in sys.modules, f"agentic_cpu leaked GPU dep at build: {_gpu}"
 print("SafeLens worker startup import smoke test passed")
 PY
 

@@ -501,6 +501,35 @@ def _build_adapter(m: str) -> Dict[str, Any]:
     return state
 
 
+# -- reusable raw-JSON generation (temporal perception layer) -----------------
+
+def generate_json(prompt: str, *, frame_b64: Optional[str] = None,
+                  entities: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    """Run the configured VLM on (prompt, optional frame) and return parsed JSON.
+
+    Reuses the same lazy adapter + the privacy blur in _decode_blurred, so no
+    un-blurred frame ever reaches the model. Returns None in mock mode, when the
+    model/deps are unavailable, or when the model does not emit valid JSON. Never
+    raises -- callers degrade on None. This is the shared bridge the temporal
+    perception layer (scene_context / semantic_corrections) uses so it does not
+    duplicate model loading.
+    """
+    m = mode()
+    if m == "mock" or not enabled():
+        return None
+    adapter = _get_adapter(m)
+    if not adapter.get("available"):
+        return None
+    req = ReasonRequest(frame_b64=frame_b64, entities=entities or [])
+    image = _decode_blurred(req)
+    try:
+        raw = adapter["generate"](prompt, image)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("vlm: generate_json failed: %s", exc)
+        return None
+    return _extract_json(raw)
+
+
 # -- status (for /debug/state) -------------------------------------------------
 
 def status_snapshot() -> Dict[str, Any]:

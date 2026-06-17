@@ -1,0 +1,31 @@
+{
+  "_comment": "Example agent draft returned by POST /agent/*/draft and /agent/approvals/preview. Serious actions are pending_approval + requires_human_approval=true and only become final via POST /agent/approvals/execute with approved=true. See docs/agentic_cpu_inside_runpod.md.",
+  "schema_version": "agent_action.v1",
+  "action_id": "act_123",
+  "action_type": "risk_assessment_approve",
+  "status": "pending_approval",
+  "requires_human_approval": true,
+  "created_by": "agentic_cpu",
+  "created_at_ms": 123456789,
+  "preview": {
+    "title": "Object near table edge",
+    "summary": "Cup tracked moving toward the table edge over recent frames.",
+    "risk_score": 4,
+    "recommended_controls": [
+      {"level": "elimination", "action": "Move the object away from the edge."}
+    ]
+  },
+  "payload": {},
+  "source": {
+    "vision_session_id": "cam_123",
+    "frame_id": "frame_456",
+    "detect_response_id": "det_789"
+  },
+  "provenance": {
+    "detector_model": "yolo26n.pt",
+    "reasoner_model": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "llm_provider": "mock",
+    "llm_model": "mock",
+    "produced_by": "agentic_cpu"
+  }
+}
