@@ -1,0 +1,29 @@
+{
+  "_fixture": "/reason response: AI draft only. produced_by=vlm_reasoner, requires_human_review=true, should_alert=false (forced).",
+  "schema_version": "reason.v1",
+  "produced_by": "vlm_reasoner",
+  "reasoner_model": "Qwen/Qwen2.5-VL-7B-Instruct",
+  "reasoner_status": "ok",
+  "scene_summary": "A pedestrian is within the operating zone of a forklift.",
+  "risks": [
+    {"risk_id": "vlm_rsk_R04", "involved_track_ids": ["trk_1"],
+     "hazard_type": "person_forklift_proximity", "risk_state": "active",
+     "trigger_condition": "Pedestrian remains in the path of the moving forklift.",
+     "risk_level": "ORANGE", "severity": 4, "likelihood": 4, "risk_score": 16,
+     "reason": "The person stands directly beside a forklift in motion.",
+     "visual_evidence": ["person adjacent to forklift", "no barrier between them"],
+     "recommended_controls": [
+       {"level": "elimination", "action": "Separate the pedestrian from the vehicle route."},
+       {"level": "administrative", "action": "Apply keep-clear rules and a banksman."}
+     ],
+     "recommended_action": "Separate the pedestrian from the vehicle route.",
+     "confidence": 0.72, "requires_human_review": true, "should_alert": false}
+  ],
+  "uncertain_items": ["Cannot confirm whether the forklift is powered on."],
+  "requires_human_review": true,
+  "should_alert": false,
+  "session_id": "cam_1",
+  "frame_id": "frame_42",
+  "latency_ms": 1840.0,
+  "error": null
+}

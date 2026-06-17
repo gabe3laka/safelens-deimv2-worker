@@ -1,0 +1,23 @@
+{
+  "_fixture": "Degraded /detect response: risk layer failed but DETECTION IS PRESERVED (no 500). degraded=true, degradation_mode=no_risk, warning set.",
+  "entities": [
+    {"label": "person", "class_id": 0, "confidence": 0.9,
+     "bbox": {"x": 0.30, "y": 0.40, "w": 0.14, "h": 0.45}, "source": "yolo26"}
+  ],
+  "poses": [],
+  "segments": [],
+  "inference_ms": 13.1,
+  "model": "YOLO26",
+  "backend": "yolo26",
+  "tasks": ["det"],
+  "img_w": 1280,
+  "img_h": 720,
+  "error": null,
+  "warning": "risk_engine_error: RuntimeError: simulated risk failure",
+  "schema_version": "risk.v1",
+  "degraded": true,
+  "degradation_mode": "no_risk",
+  "risk_engine": {"enabled": true, "degraded": true,
+                  "error": "risk_engine_error: RuntimeError: simulated risk failure",
+                  "session_id": "cam_1"}
+}

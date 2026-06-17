@@ -327,9 +327,52 @@ detector entities → per-session tracker (IoU/centroid) → scene graph (geomet
 
 `/debug/state` reports a `risk_engine` block (flags, matrix profile/version,
 active sessions, and the last evaluation's risk/alert counts + highest level).
-The event-driven **Qwen-VL reasoner** (`POST /reason`) and **GroundingDINO**
-open-vocab scanner are a **separate later PR** and only enrich `scene_risks` as
-human-review AI drafts — they never become the safety authority.
+## Event-driven reasoning (Qwen-VL) + open-vocab scanner (GroundingDINO)
+
+`risk/vlm_reasoner.py` is a **real** Qwen-VL (and optional DeepSeek-VL2) reasoner
+behind `POST /reason`, plus a non-blocking trigger from `/detect`. It is **not**
+the safety authority — the deterministic engine is. The VLM only **explains /
+verifies / drafts** *after* the deterministic engine produces a candidate, and
+its output is always an **AI draft**: `produced_by="vlm_reasoner"`,
+`requires_human_review=true`, `should_alert=false` (enforced by the schema, not
+trusted from the model).
+
+- **Never per-frame.** `/detect` calls `maybe_trigger()`: rate-limited
+  (`REASONER_MIN_INTERVAL_MS`), fired only at/above `REASONER_TRIGGER_LEVEL`
+  (default `ORANGE`), run on a bounded background executor. `/detect` **never
+  waits** — it attaches the most recent cached draft (if any) as `scene_risks`
+  plus a `reasoner_status` and returns. If the VLM is slow/unavailable the live
+  loop is unaffected.
+- **Real but lazy.** `torch`/`transformers` import only on first model use;
+  Qwen weights resolve at runtime into `REASONER_CACHE_DIR`/the HF cache and are
+  **never baked into the image or downloaded at Docker build**. Missing
+  deps/weights → `reasoner_status="unavailable"`; over-budget → `"timeout"`;
+  disabled → `"disabled"` — it never raises into the request path.
+- **`REASONER_MODE=mock`** gives a CPU, weight-free implementation of the full
+  `/reason` contract so the app can integrate before a GPU/Qwen deployment.
+- **Privacy.** When `PRIVACY_BLUR_ENABLED`, the frame is blurred (persons)
+  **before** it is passed to the model — no un-blurred frame reaches the VLM.
+
+`POST /reason` validates strictly against `risk/reason_schema.py`
+(`schema_version: "reason.v1"`). `POST /scan` is the optional open-vocabulary
+**GroundingDINO** scanner (`risk/grounding_dino_scanner.py`): disabled by
+default, throttled (never per-frame), output is **candidate-only**
+(`produced_by="open_vocab_scanner"`, `candidate_only=true`,
+`requires_human_review=true`) and can **never** trigger an official HSE alert.
+
+| Env | Default | Notes |
+|-----|---------|-------|
+| `VLM_REASONER_ENABLED` | `false` | master switch for `/reason` + `/detect` trigger |
+| `REASONER_MODE` | `qwen_vl` | `qwen_vl` \| `deepseek_vl2` \| `mock` |
+| `QWEN_VL_MODEL_ID` | `Qwen/Qwen2.5-VL-7B-Instruct` | runtime-resolved; 3B for low VRAM |
+| `REASONER_TRIGGER_LEVEL` / `REASONER_MIN_INTERVAL_MS` | `ORANGE` / `5000` | when/how often to trigger |
+| `REASONER_TIMEOUT_MS` | `8000` | hard cap; over-budget → `reasoner_status:"timeout"` |
+| `REASONER_QUANTIZATION` | `4bit` | `none` \| `8bit` \| `4bit` (GPU memory) |
+| `OPEN_VOCAB_SCANNER_ENABLED` | `false` | GroundingDINO scanner (candidate-only) |
+
+`/debug/state` reports `reasoner` and `open_vocab_scanner` blocks. **Deferred to
+a later PR:** fine-tuning, running the VLM every frame, and using the VLM as the
+alert authority (all explicitly out of scope).
 
 ## Docker image
 
@@ -393,7 +436,7 @@ TRANSFORMERS_CACHE=/runpod-volume/.cache/huggingface
 | `official_deimv2_loader.py` | Official DEIMv2 PyTorchModelHubMixin loader + pre/post-processing |
 | `handler.py` | Legacy RunPod serverless handler (kept for reference) |
 | `schema.py` | Pydantic request/response models |
-| `risk/` | Deterministic risk engine: `tracking`, `scene_graph`, `risk_matrix`, `controls`, `provenance`, `privacy`, `risk_engine`, `risk_schema` (+ `risk_matrix_profile.json`) |
+| `risk/` | Deterministic risk engine (`tracking`, `scene_graph`, `risk_matrix`, `controls`, `provenance`, `privacy`, `risk_engine`, `risk_schema` + `risk_matrix_profile.json`) **and** the event-driven reasoning layer (`vlm_reasoner`, `grounding_dino_scanner`, `open_vocab_scanner`, `reason_schema`) |
 | `validation/` | CPU-only risk-engine quality gate (`run_validation.py` + synthetic `scenarios/`) |
 
 ## Diagnostic mode
