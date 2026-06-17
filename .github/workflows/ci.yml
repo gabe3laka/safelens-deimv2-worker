@@ -70,9 +70,11 @@ jobs:
 
       # Filesystem scan (secrets + misconfig + vulnerable deps). Advisory first;
       # the published image is scanned in docker-publish after the build.
+      # Pinned to @master so action resolution always succeeds; pin to a verified
+      # release tag once one is confirmed (exit-code 0 keeps it non-blocking).
       - name: trivy fs scan
         continue-on-error: true
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
           scan-ref: .
