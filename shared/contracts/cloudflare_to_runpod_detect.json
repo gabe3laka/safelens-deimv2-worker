@@ -1,0 +1,22 @@
+{
+  "_comment": "Example POST /detect body forwarded App -> Cloudflare Gateway -> RunPod worker (port 8000). All fields beyond image_b64 are ADDITIVE and optional; the worker is backward-compatible if they are omitted. The app/Cloudflare SHOULD forward scene_hint, site_context, camera_context, reasoning_preferences when available (see docs/app_cloudflare_contract.md).",
+  "image_b64": "<base64 JPEG/PNG>",
+  "session_id": "cam_123",
+  "frame_id": "frame_456",
+  "conf": 0.25,
+  "img_size": 640,
+  "classes": null,
+  "scene_hint": "cafe_demo",
+  "site_context": {
+    "environment_type": "cafe",
+    "mode": "demo",
+    "allowed_hazard_focus": ["object_near_edge", "spill", "trip", "falling_object"]
+  },
+  "camera_context": {
+    "camera_name": "phone_camera",
+    "location_name": "cafe_table"
+  },
+  "reasoning_preferences": {
+    "force_reason": false
+  }
+}

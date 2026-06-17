@@ -30,28 +30,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install fastapi "pydantic>=2" pillow numpy httpx pytest ruff mypy
 
-      # Guard: every worker module imported by server.py must have a COPY line in
-      # the Dockerfile — catches the class of bug that caused the 5bcd431 outage.
+      # Guard: every worker module / package imported by server.py must have a
+      # COPY line in the Dockerfile — catches the class of bug that caused the
+      # 5bcd431 outage (missing COPY -> bootstrap import fallback).
       - name: check Dockerfile copies all worker modules
         run: |
           grep -q "COPY worker_guards.py /app/worker_guards.py" Dockerfile
           grep -q "COPY worker_runtime.py /app/worker_runtime.py" Dockerfile
           grep -q "COPY worker_security.py /app/worker_security.py" Dockerfile
+          grep -q "COPY shared /app/shared" Dockerfile
+          grep -q "COPY gpu_vision /app/gpu_vision" Dockerfile
+          grep -q "COPY temporal_reasoning /app/temporal_reasoning" Dockerfile
+          grep -q "COPY agentic_cpu /app/agentic_cpu" Dockerfile
 
       # ruff: scoped to the code this chain owns (keeps the gate green + meaningful;
       # the large legacy surface is excluded and tracked separately).
       - name: ruff (new modules)
-        run: ruff check worker_security.py worker_runtime.py worker_guards.py risk validation
+        run: ruff check worker_security.py worker_runtime.py worker_guards.py risk validation shared gpu_vision temporal_reasoning agentic_cpu
 
-      # mypy: lenient, scoped to the new ops modules + risk package.
+      # mypy: lenient, scoped to the new ops modules + risk + agent/temporal packages.
       - name: mypy (new modules)
-        run: mypy --ignore-missing-imports --no-strict-optional worker_security.py worker_runtime.py worker_guards.py risk || true
+        run: mypy --ignore-missing-imports --no-strict-optional worker_security.py worker_runtime.py worker_guards.py risk shared gpu_vision temporal_reasoning agentic_cpu || true
 
-      # pytest: CPU-only hardening / risk / reason / contract surfaces (no GPU,
-      # no real weights). The legacy DEIMv2 tests target removed functionality
-      # and are excluded here (tracked separately).
-      - name: pytest (hardening + risk + reason + contract + detector config)
-        run: pytest -q tests/test_risk_engine.py tests/test_reason_vlm.py tests/test_hardening.py tests/test_contract.py tests/test_detector_config.py
+      # pytest: CPU-only hardening / risk / reason / contract / temporal / agent
+      # surfaces (no GPU, no real weights, no LLM keys, no DB). The legacy DEIMv2
+      # tests target removed functionality and are excluded here.
+      - name: pytest (hardening + risk + reason + contract + temporal + agentic)
+        run: pytest -q tests/test_risk_engine.py tests/test_reason_vlm.py tests/test_hardening.py tests/test_contract.py tests/test_detector_config.py tests/test_temporal_reasoning.py tests/test_agentic_cpu.py tests/test_agent_import_guard.py
 
       # BLOCKING quality gate: deterministic risk-engine recall must not regress.
       - name: validation gate (blocking)

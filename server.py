@@ -105,6 +105,30 @@ def _open_vocab_config_safe():
     except Exception as exc:  # noqa: BLE001
         return {"error": type(exc).__name__ + ": " + str(exc)}
 
+def _temporal_config_safe():
+    """temporal_reasoning.config(), guarded so debug routes never crash."""
+    try:
+        import temporal_reasoning
+        return temporal_reasoning.config()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": type(exc).__name__ + ": " + str(exc)}
+
+def _agentic_cpu_config_safe():
+    """agentic_cpu.status_snapshot(), guarded so debug routes never crash."""
+    try:
+        import agentic_cpu
+        return agentic_cpu.status_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": type(exc).__name__ + ": " + str(exc)}
+
+def _gpu_vision_snapshot_safe():
+    """gpu_vision.snapshot(), guarded so debug routes never crash."""
+    try:
+        import gpu_vision
+        return gpu_vision.snapshot()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": type(exc).__name__ + ": " + str(exc)}
+
 def _runtime_block_safe():
     """build_sha + degradation + shutdown + guards/auth snapshot (no secrets)."""
     try:
@@ -370,8 +394,22 @@ async def ready():
     is_ready, detail = _ready_state()
     runtime.set_gauge("model_ready", float(detail["model_loaded"]))
     runtime.set_gauge("ready", float(is_ready))
+    # Both layers surfaced; overall readiness is the GPU VISION worker only --
+    # the CPU agent layer being disabled/not-ready must NOT fail vision readiness.
+    agentic_enabled, agentic_ready = False, False
+    try:
+        import agentic_cpu
+        agentic_enabled = agentic_cpu.enabled()
+        agentic_ready = agentic_cpu.ready()
+    except Exception:  # noqa: BLE001
+        pass
+    degraded = runtime.degradation_mode()
     body = {"ok": is_ready, "ready": is_ready, "build_sha": runtime.build_sha(),
-            "degradation_mode": runtime.degradation_mode(), **detail}
+            "degradation_mode": degraded,
+            "degraded_mode": None if degraded == "full" else degraded,
+            "gpu_vision_ready": is_ready,
+            "agentic_cpu_ready": agentic_ready,
+            "agentic_cpu_enabled": agentic_enabled, **detail}
     return JSONResponse(body, status_code=200 if is_ready else 503)
 
 # -- Prometheus metrics -------------------------------------------------------
@@ -402,6 +440,29 @@ async def metrics():
         live["risk_last_alerting"] = float(last.get("alerting_count", 0))
     except Exception:  # noqa: BLE001
         pass
+    # GPU reasoner + CPU agent + temporal queue/job gauges (always present).
+    try:
+        import gpu_vision
+        live["gpu_reasoner_jobs_inflight"] = float(gpu_vision.inflight())
+        live["gpu_busy_ratio"] = float(gpu_vision.gpu_busy_ratio())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import agentic_cpu.jobs as _ajobs
+        live["cpu_agent_jobs_inflight"] = float(_ajobs.queue_depth())
+        live["cpu_agent_queue_depth"] = float(_ajobs.queue_depth())
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import temporal_reasoning
+        live["temporal_pending_reasoner_jobs"] = float(temporal_reasoning.pending_reasoner_jobs())
+    except Exception:  # noqa: BLE001
+        pass
+    # Seed expected counters so they always render (value unchanged if no events).
+    for _counter in ("gpu_reasoner_jobs_dropped_total", "temporal_triggers_total",
+                     "cpu_agent_jobs_completed_total", "cpu_agent_jobs_failed_total",
+                     "cpu_agent_approval_required_total"):
+        runtime.inc(_counter, n=0.0)
     return PlainTextResponse(runtime.render_prometheus(live), media_type="text/plain; version=0.0.4")
 
 # -- Import diagnostics helper ------------------------------------------------
@@ -609,6 +670,10 @@ async def debug_state():
         "risk_engine": _risk_config_safe(),
         "reasoner": _reasoner_status_safe(),
         "open_vocab_scanner": _open_vocab_config_safe(),
+        "gpu_vision": {"enabled": True, "backend": _active_backend(),
+                       **_gpu_vision_snapshot_safe()},
+        "temporal_reasoning": _temporal_config_safe(),
+        "agentic_cpu": _agentic_cpu_config_safe(),
         "runtime": _runtime_block_safe(),
         "skip_warmup": SKIP_WARMUP,
         "auto_warmup": AUTO_WARMUP,
@@ -760,23 +825,42 @@ async def detect(payload: Dict[str, Any]):
                     resp_dict["scene_risks"] = draft["risks"]
         except Exception as vexc:  # noqa: BLE001 -- VLM must never break detection
             log.warning("detect: vlm trigger failed: %s", vexc)
+        # Event-triggered temporal perception (PR: single-worker GPU+CPU). ADDITIVE
+        # + NON-BLOCKING: folds the frame into per-session memory, adds deterministic
+        # object-near-edge risk, and (rarely, rate-limited) kicks an async VLM job
+        # for scene_context + perception corrections. /detect NEVER waits for it;
+        # it attaches the most recent cached blocks. No-op unless TEMPORAL_REASONING_ENABLED.
+        try:
+            import temporal_reasoning
+            if temporal_reasoning.enabled():
+                resp_dict = temporal_reasoning.attach_temporal(
+                    resp_dict, session_id=session_id, frame_id=frame_id,
+                    frame_b64=image_b64, payload=payload)
+        except Exception as texc:  # noqa: BLE001 -- temporal must never break detection
+            log.warning("detect: temporal layer failed: %s", texc)
         # Degradation ladder (B4): surface degraded/degradation_mode + metrics.
         rmeta = resp_dict.get("risk_engine") or {}
         mode = "no_risk" if isinstance(rmeta, dict) and rmeta.get("degraded") else "full"
         resp_dict["degraded"] = mode != "full"
         resp_dict["degradation_mode"] = mode
         runtime.set_degradation(mode)
-        runtime.observe_latency("detect_latency_ms", (time.perf_counter() - _t0) * 1000.0)
+        _detect_ms = (time.perf_counter() - _t0) * 1000.0
+        runtime.observe_latency("detect_latency_ms", _detect_ms)
+        runtime.observe_latency("gpu_detect_latency_ms", _detect_ms)
         if resp_dict.get("schema_version"):
             runtime.inc("risk_level_total", {"level": resp_dict.get("highest_risk_level", "GREEN")})
-        if resp_dict.get("reasoner_status"):
-            runtime.inc("reasoner_status_total", {"status": resp_dict["reasoner_status"]})
+        # reasoner_status is a string (legacy vlm trigger) or a dict (temporal
+        # layer, when enabled). Use the state label either way (dict -> .state).
+        _rs = resp_dict.get("reasoner_status")
+        _rs_label = _rs.get("state") if isinstance(_rs, dict) else _rs
+        if _rs_label:
+            runtime.inc("reasoner_status_total", {"status": str(_rs_label)})
         runtime.log_event("detect", session_id=session_id, frame_id=frame_id,
                           backend=resp_dict.get("backend"),
                           entities=len(resp_dict.get("entities", []) or []),
                           highest_risk_level=resp_dict.get("highest_risk_level"),
                           degradation_mode=mode,
-                          reasoner_status=resp_dict.get("reasoner_status"))
+                          reasoner_status=_rs_label)
         return JSONResponse(resp_dict)
     except Exception as exc:
         runtime.inc("detect_errors_total")
@@ -1069,6 +1153,22 @@ try:
 except Exception as exc:  # noqa: BLE001 -- streaming must never break server boot
     _log_startup("ws/vision: registration FAILED -- " + type(exc).__name__ + ": " + str(exc))
     log.warning("ws/vision registration failed: %s", exc)
+
+# -- CPU agentic layer (/agent/*) ---------------------------------------------
+#
+# Mounted into THIS app + process (single RunPod worker), but on a SEPARATE
+# bounded job queue with its own concurrency limit, so CPU agent work can never
+# block /detect. CPU-only (no torch/cv2/ultralytics/transformers). Routes always
+# exist; behaviour is gated by AGENTIC_CPU_ENABLED. Guarded so an agent-layer
+# import problem can never break server boot or the vision routes above.
+try:
+    import agentic_cpu
+    app.include_router(agentic_cpu.get_router(), prefix="/agent", tags=["agentic_cpu"])
+    _log_startup("agentic_cpu: /agent/* routes registered (enabled="
+                 + str(agentic_cpu.enabled()) + ", mode=" + agentic_cpu.config.mode() + ")")
+except Exception as exc:  # noqa: BLE001 -- agent layer must never break server boot
+    _log_startup("agentic_cpu: registration FAILED -- " + type(exc).__name__ + ": " + str(exc))
+    log.warning("agentic_cpu registration failed: %s", exc)
 
 # -- Entrypoint ---------------------------------------------------------------
 

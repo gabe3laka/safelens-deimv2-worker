@@ -1,0 +1,55 @@
+{
+  "_comment": "Example POST /detect response. The base vision fields (entities, poses, model, backend, ...) are unchanged from the legacy contract. risk.v1 fields appear when RISK_ENGINE_ENABLED. temporal_reasoning/scene_context/semantic_corrections/reasoner_status appear when TEMPORAL_REASONING_ENABLED. The VLM is event-triggered and non-blocking: /detect never waits for it.",
+  "entities": [
+    {"label": "cup", "class_id": 41, "confidence": 0.78, "bbox": {"x": 0.41, "y": 0.62, "w": 0.06, "h": 0.09}, "source": "yolo26", "track_id": "trk_12"}
+  ],
+  "poses": [],
+  "model": "YOLO26",
+  "backend": "yolo26",
+  "tasks": ["det"],
+  "inference_ms": 11.4,
+  "img_w": 1280,
+  "img_h": 720,
+  "schema_version": "risk.v1",
+  "highest_risk_level": "YELLOW",
+  "risks": [],
+  "scene_risks": [],
+  "temporal_reasoning": {
+    "enabled": true,
+    "session_id": "cam_123",
+    "memory_frames": 32,
+    "active_tracks": 5,
+    "triggered": true,
+    "trigger_reasons": ["scene_mismatch", "object_near_edge"]
+  },
+  "scene_context": {
+    "scene_type": "cafe",
+    "environment_type": "indoor_public",
+    "confidence": 0.82,
+    "source": "vlm_reasoner",
+    "reason": "Indoor cafe-like scene with tables, ceiling lights, seating; no construction evidence.",
+    "last_checked_ms": 123456789
+  },
+  "semantic_corrections": [
+    {
+      "track_id": "trk_7",
+      "raw_label": "bus",
+      "corrected_label": "ceiling panel",
+      "correction_type": "false_positive",
+      "action": "suppress_from_hse_alerts",
+      "confidence": 0.81,
+      "reason": "The object is attached to the indoor ceiling and does not have vehicle features.",
+      "produced_by": "vlm_reasoner",
+      "purpose": "perception_correction",
+      "requires_human_review": false
+    }
+  ],
+  "reasoner_status": {
+    "enabled": true,
+    "mode": "qwen_vl",
+    "state": "ready",
+    "last_trigger": "scene_mismatch",
+    "result_age_ms": 2000,
+    "stale": false
+  }
+}
