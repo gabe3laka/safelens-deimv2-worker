@@ -52,6 +52,3 @@ results/
 # Logs
 *.log
 logs/
-
-# Docker
-.dockerignore

@@ -98,11 +98,14 @@ def _ensure_loaded():
 
 
 def scan(frame_b64: Optional[str], *, prompt: Optional[str] = None,
-         session_id: Optional[str] = None, frame_id: Optional[str] = None) -> Dict[str, Any]:
+         session_id: Optional[str] = None, frame_id: Optional[str] = None,
+         entities: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Run an open-vocab scan; ALWAYS returns a candidate-only result dict.
 
     Never raises into the caller. Disabled / missing-deps / missing-image all
-    degrade to a clear status with no candidates.
+    degrade to a clear status with no candidates. Privacy egress guard (B8):
+    when PRIVACY_BLUR_ENABLED, persons are blurred before the model sees the
+    frame (the caller should pass `entities` so person regions are known).
     """
     t0 = time.perf_counter()
     text = prompt or default_prompt()
@@ -122,6 +125,13 @@ def scan(frame_b64: Optional[str], *, prompt: Optional[str] = None,
         res.status = "error"
         res.error = f"decode: {exc}"
         return res.enforce_candidate_contract().model_dump()
+    # Privacy egress guard (B8): blur persons before the model sees the frame.
+    try:
+        from . import privacy
+        if privacy.blur_enabled():
+            img, _blurred = privacy.sanitize_for_egress(img, entities or [])
+    except Exception:  # noqa: BLE001 -- privacy must never crash a scan
+        pass
     try:
         import torch
         model, processor = _ensure_loaded()

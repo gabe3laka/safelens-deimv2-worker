@@ -40,8 +40,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, PlainTextResponse
+
+import worker_guards as guards
+import worker_runtime as runtime
+import worker_security as security
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -100,6 +104,57 @@ def _open_vocab_config_safe():
         return ovs.config()
     except Exception as exc:  # noqa: BLE001
         return {"error": type(exc).__name__ + ": " + str(exc)}
+
+def _runtime_block_safe():
+    """build_sha + degradation + shutdown + guards/auth snapshot (no secrets)."""
+    try:
+        return {
+            "build_sha": runtime.build_sha(),
+            "uptime_s": runtime.uptime_s(),
+            "degraded": runtime.degradation_mode() != "full",
+            "degradation_mode": runtime.degradation_mode(),
+            "degradation_ladder": list(runtime.LADDER),
+            "accepting_frames": runtime.accepting(),
+            "auth": security.config(),
+            "input_guards": guards.config(),
+            "active_sessions": _active_session_count(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"error": type(exc).__name__ + ": " + str(exc)}
+
+def _active_session_count():
+    """Active risk-tracker sessions (torch-free; never raises)."""
+    try:
+        import risk.tracking as tracking
+        return tracking.active_session_count()
+    except Exception:  # noqa: BLE001
+        return 0
+
+def _ready_state():
+    """Compute readiness: model loaded AND config valid AND matrix loaded.
+
+    Returns (ready: bool, detail: dict). Used by GET /ready and /metrics.
+    """
+    detail = {"model_loaded": False, "matrix_valid": True, "config_valid": True,
+              "accepting_frames": runtime.accepting(), "checks": {}}
+    state = _public_state()
+    detail["model_loaded"] = bool(state.get("model_loaded"))
+    detail["status"] = state.get("status")
+    # risk matrix must load + validate when the risk engine is enabled.
+    try:
+        import risk.risk_engine as re
+        if re.enabled():
+            from risk import risk_matrix
+            risk_matrix.get_matrix()  # raises on malformed profile
+            detail["checks"]["risk_matrix"] = "ok"
+        else:
+            detail["checks"]["risk_matrix"] = "disabled"
+    except Exception as exc:  # noqa: BLE001
+        detail["matrix_valid"] = False
+        detail["checks"]["risk_matrix"] = "invalid: " + type(exc).__name__ + ": " + str(exc)
+    ready = (detail["model_loaded"] and detail["matrix_valid"]
+             and detail["config_valid"] and detail["accepting_frames"])
+    return ready, detail
 
 # -- State --------------------------------------------------------------------
 
@@ -201,9 +256,18 @@ def _start_warmup_background():
 
 # -- FastAPI lifespan ---------------------------------------------------------
 
+def _drain_s():
+    try:
+        return max(0.0, int(os.getenv("GRACEFUL_DRAIN_MS", "1500")) / 1000.0)
+    except (TypeError, ValueError):
+        return 1.5
+
 @asynccontextmanager
 async def lifespan(app):
+    runtime.reset_shutdown()  # clear any stale flag (dev/test re-starts)
     _log_startup("server starting")
+    _log_startup("build_sha=" + runtime.build_sha())
+    _log_startup("worker_auth_enabled=" + str(security.auth_enabled()))
     _log_startup("port=" + str(PORT))
     _log_startup("version=" + WORKER_VERSION)
     _log_startup("backend=" + _active_backend())
@@ -223,9 +287,45 @@ async def lifespan(app):
     else:
         _log_startup("AUTO_WARMUP=false: model load deferred until POST /warmup")
     yield
-    _log_startup("server shutting down")
+    # Graceful shutdown (B5): stop accepting new frames, drain in-flight work,
+    # close WebSockets cleanly, then let uvicorn exit. Triggered by SIGTERM via
+    # uvicorn's lifespan shutdown.
+    runtime.begin_shutdown()
+    _log_startup("server shutting down (graceful): no longer accepting frames")
+    closed = 0
+    try:
+        import ws_vision
+        closed = ws_vision.shutdown_all()
+        _log_startup("ws/vision: closed " + str(closed) + " streaming session(s)")
+    except Exception as exc:  # noqa: BLE001
+        _log_startup("ws/vision shutdown error: " + type(exc).__name__ + ": " + str(exc))
+    if closed > 0:
+        await asyncio.sleep(min(2.0, _drain_s()))
+    _log_startup("server shutdown complete")
 
 app = FastAPI(title="safelens-vision-worker", version=WORKER_VERSION, lifespan=lifespan)
+
+
+# -- Security + input-size middleware (B7) ------------------------------------
+# Shared-secret auth on every route except /health,/ping (disabled in compat/
+# test mode when WORKER_SHARED_SECRET is unset). A Content-Length cap rejects
+# oversized bodies with a structured 4xx before they are read. Never logs the
+# secret/auth header (worker_runtime.redact).
+@app.middleware("http")
+async def _hardening_middleware(request: Request, call_next):
+    path = request.url.path
+    if not security.is_public(path):
+        if not security.check_http(request.headers):
+            runtime.inc("auth_rejected_total", {"path": path})
+            return JSONResponse({"error": "unauthorized",
+                                 "detail": "missing or invalid worker secret"},
+                                status_code=401)
+        cl_err = guards.content_length_error(request.headers)
+        if cl_err:
+            runtime.inc("input_rejected_total", {"error": cl_err})
+            return JSONResponse({"error": cl_err, "entities": [], "poses": []},
+                                status_code=guards.status_for(cl_err))
+    return await call_next(request)
 
 # -- Health / ping (no model dependency) -------------------------------------
 
@@ -242,6 +342,50 @@ async def ping():
         "ok": True, "worker": "safelens-vision-worker",
         "mode": "live-server", "version": WORKER_VERSION, **_public_state(),
     })
+
+# -- Readiness (distinct from liveness) ---------------------------------------
+
+@app.get("/ready")
+async def ready():
+    """Readiness gate: 200 only when model loaded AND config/matrix valid AND
+    accepting frames. /health and /ping stay liveness (always 200). The gateway
+    should consult /ready before routing live traffic."""
+    is_ready, detail = _ready_state()
+    runtime.set_gauge("model_ready", float(detail["model_loaded"]))
+    runtime.set_gauge("ready", float(is_ready))
+    body = {"ok": is_ready, "ready": is_ready, "build_sha": runtime.build_sha(),
+            "degradation_mode": runtime.degradation_mode(), **detail}
+    return JSONResponse(body, status_code=200 if is_ready else 503)
+
+# -- Prometheus metrics -------------------------------------------------------
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus text metrics. Separate from HSE risk alerts (system health)."""
+    is_ready, detail = _ready_state()
+    live = {
+        "model_ready": float(detail["model_loaded"]),
+        "ready": float(is_ready),
+        "active_sessions": float(_active_session_count()),
+        "degradation_rank": float(runtime.LADDER.index(runtime.degradation_mode())
+                                  if runtime.degradation_mode() in runtime.LADDER else 0),
+        "accepting_frames": float(runtime.accepting()),
+    }
+    try:
+        from ws_vision import _GLOBAL
+        live["ws_dropped_frames_total"] = float(_GLOBAL["totals"]["dropped_frames"])
+        live["ws_processed_frames_total"] = float(_GLOBAL["totals"]["processed_frames"])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import risk.risk_engine as re
+        last = re._LAST
+        live["risk_active_tracks"] = float(last.get("active_tracks", 0))
+        live["risk_last_count"] = float(last.get("risk_count", 0))
+        live["risk_last_alerting"] = float(last.get("alerting_count", 0))
+    except Exception:  # noqa: BLE001
+        pass
+    return PlainTextResponse(runtime.render_prometheus(live), media_type="text/plain; version=0.0.4")
 
 # -- Import diagnostics helper ------------------------------------------------
 
@@ -447,6 +591,7 @@ async def debug_state():
         "risk_engine": _risk_config_safe(),
         "reasoner": _reasoner_status_safe(),
         "open_vocab_scanner": _open_vocab_config_safe(),
+        "runtime": _runtime_block_safe(),
         "skip_warmup": SKIP_WARMUP,
         "auto_warmup": AUTO_WARMUP,
         "state": _public_state(),
@@ -513,6 +658,14 @@ async def detect(payload: Dict[str, Any]):
     Returns entities (boxes) and poses (keypoints/skeleton). On any failure,
     returns a structured error with entities: [] and poses: [].
     """
+    _t0 = time.perf_counter()
+    runtime.inc("detect_requests_total")
+    if not runtime.accepting():
+        # Graceful shutdown: stop accepting new frames, let in-flight drain.
+        return JSONResponse(
+            {"error": "shutting_down", "entities": [], "poses": []},
+            status_code=503,
+        )
     state = _public_state()
     if state["status"] != "ready":
         # Not ready yet: log the full state, trigger the existing background
@@ -537,21 +690,15 @@ async def detect(payload: Dict[str, Any]):
             status_code=503,
         )
 
-    import binascii
-    import base64 as _b64
-
+    # Input protection (B7): presence, base64, byte size, and decoded
+    # megapixels (decompression-bomb guard). Structured 4xx -- never a 500.
     image_b64 = payload.get("image_b64")
-    if not image_b64:
+    ok, err, _info = guards.validate_image_b64(image_b64)
+    if not ok:
+        runtime.inc("input_rejected_total", {"error": err})
         return JSONResponse(
-            {"error": "missing_image_b64", "entities": [], "poses": []},
-            status_code=400,
-        )
-    try:
-        _b64.b64decode(image_b64, validate=True)
-    except (binascii.Error, ValueError):
-        return JSONResponse(
-            {"error": "invalid_base64", "entities": [], "poses": []},
-            status_code=400,
+            {"error": err, "entities": [], "poses": []},
+            status_code=guards.status_for(err),
         )
 
     try:
@@ -595,12 +742,33 @@ async def detect(payload: Dict[str, Any]):
                     resp_dict["scene_risks"] = draft["risks"]
         except Exception as vexc:  # noqa: BLE001 -- VLM must never break detection
             log.warning("detect: vlm trigger failed: %s", vexc)
+        # Degradation ladder (B4): surface degraded/degradation_mode + metrics.
+        rmeta = resp_dict.get("risk_engine") or {}
+        mode = "no_risk" if isinstance(rmeta, dict) and rmeta.get("degraded") else "full"
+        resp_dict["degraded"] = mode != "full"
+        resp_dict["degradation_mode"] = mode
+        runtime.set_degradation(mode)
+        runtime.observe_latency("detect_latency_ms", (time.perf_counter() - _t0) * 1000.0)
+        if resp_dict.get("schema_version"):
+            runtime.inc("risk_level_total", {"level": resp_dict.get("highest_risk_level", "GREEN")})
+        if resp_dict.get("reasoner_status"):
+            runtime.inc("reasoner_status_total", {"status": resp_dict["reasoner_status"]})
+        runtime.log_event("detect", session_id=session_id, frame_id=frame_id,
+                          backend=resp_dict.get("backend"),
+                          entities=len(resp_dict.get("entities", []) or []),
+                          highest_risk_level=resp_dict.get("highest_risk_level"),
+                          degradation_mode=mode,
+                          reasoner_status=resp_dict.get("reasoner_status"))
         return JSONResponse(resp_dict)
     except Exception as exc:
+        runtime.inc("detect_errors_total")
+        runtime.log_event("detect_failed", level=logging.ERROR,
+                          error=type(exc).__name__ + ": " + str(exc))
         log.exception("detect failed: %s", exc)
         return JSONResponse(
             {"error": "inference_failed: " + type(exc).__name__ + ": " + str(exc),
-             "entities": [], "poses": [], "backend": _active_backend()},
+             "entities": [], "poses": [], "backend": _active_backend(),
+             "degraded": True, "degradation_mode": "detect_only"},
             status_code=500,
         )
 
@@ -619,9 +787,25 @@ async def detect(payload: Dict[str, Any]):
 @app.post("/reason")
 async def reason(payload: Dict[str, Any]):
     """Event-driven VLM reasoning over a deterministic candidate. Strict JSON."""
+    if not runtime.accepting():
+        return JSONResponse({"schema_version": "reason.v1", "produced_by": "vlm_reasoner",
+                             "reasoner_status": "shutting_down", "requires_human_review": True,
+                             "should_alert": False, "risks": []}, status_code=503)
+    # If a frame is supplied, it must pass the input guards (megapixel/bomb).
+    frame = payload.get("frame_b64") or payload.get("image_b64")
+    if frame:
+        ok, err, _ = guards.validate_image_b64(frame)
+        if not ok:
+            runtime.inc("input_rejected_total", {"error": err})
+            return JSONResponse({"schema_version": "reason.v1", "produced_by": "vlm_reasoner",
+                                 "reasoner_status": "error", "error": err,
+                                 "requires_human_review": True, "should_alert": False,
+                                 "risks": []}, status_code=guards.status_for(err))
     try:
         import risk.vlm_reasoner as vlm
-        return JSONResponse(await vlm.reason_async(payload))
+        result = await vlm.reason_async(payload)
+        runtime.inc("reasoner_status_total", {"status": result.get("reasoner_status", "ok")})
+        return JSONResponse(result)
     except Exception as exc:  # noqa: BLE001 -- never 500 the reasoning endpoint
         log.warning("reason failed: %s", exc)
         return JSONResponse({
@@ -634,6 +818,14 @@ async def reason(payload: Dict[str, Any]):
 @app.post("/scan")
 async def scan(payload: Dict[str, Any]):
     """Optional open-vocabulary (GroundingDINO) scan. Candidate-only; human review."""
+    frame = payload.get("frame_b64") or payload.get("image_b64")
+    ok, err, _ = guards.validate_image_b64(frame)
+    if not ok:
+        runtime.inc("input_rejected_total", {"error": err})
+        return JSONResponse({"schema_version": "openvocab.v1", "produced_by": "open_vocab_scanner",
+                             "source_model": "GroundingDINO", "status": "error", "error": err,
+                             "candidate_only": True, "requires_human_review": True,
+                             "candidates": []}, status_code=guards.status_for(err))
     try:
         import risk.open_vocab_scanner as ovs
         result = await asyncio.to_thread(
@@ -642,6 +834,7 @@ async def scan(payload: Dict[str, Any]):
             prompt=payload.get("prompt"),
             session_id=payload.get("session_id") or payload.get("sessionId"),
             frame_id=payload.get("frame_id") or payload.get("frameId"),
+            entities=payload.get("entities"),
             force=bool(payload.get("force", False)),
         )
         return JSONResponse(result)
@@ -727,6 +920,13 @@ async def ws_echo(websocket: WebSocket):
       * echo every received JSON message back verbatim
       * close cleanly on client disconnect (never crashes the server)
     """
+    # Shared-secret auth on connect (B7), except in compat/test mode.
+    if not security.check_ws(websocket):
+        try:
+            await websocket.close(code=1008)  # policy violation
+        except Exception:
+            pass
+        return
     await websocket.accept()
     await websocket.send_json({"type": "connected"})
     try:
@@ -844,6 +1044,8 @@ try:
         get_gpu_device=_ws_gpu_device,
         get_config=_ws_stream_config,
         risk_hook=_ws_attach_risk,
+        authorize_ws=lambda ws: security.check_ws(ws),
+        is_accepting=runtime.accepting,
     )
     _log_startup("ws/vision: streaming route + /debug/stream registered")
 except Exception as exc:  # noqa: BLE001 -- streaming must never break server boot

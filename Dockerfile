@@ -25,6 +25,11 @@ FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
 WORKDIR /app
 
+# Build provenance (B6): the CI build passes --build-arg BUILD_SHA=<git sha>;
+# surfaced in /debug/state, /ready, /metrics, and every structured log line.
+ARG BUILD_SHA=unknown
+ENV BUILD_SHA=${BUILD_SHA}
+
 # System dependencies (git for repo clones, libgl for opencv).
 RUN apt-get update && apt-get install -y \
     git wget curl libgl1 libglib2.0-0 \
@@ -119,21 +124,14 @@ print("stack preserved + ultralytics", ultralytics.__version__,
       "+ EdgeCrafter engine import OK")
 PY
 
-# Best-effort: pre-bake YOLO26 weights so RunPod cold starts need no download
-# (runtime falls back to YOLO26_CACHE_DIR on the volume, then auto-download).
-# Never fails the build -- the worker degrades per task and can auto-fall back
-# to EdgeCrafter via AUTO_BACKEND_FALLBACK.
-RUN mkdir -p /app/models/yolo26 && cd /app/models/yolo26 && python - <<'PY'
-from ultralytics import YOLO
-# det (live loop) + seg (Build/Plan crops). pose is opt-in and not baked --
-# enabling YOLO26_POSE_ENABLED downloads it into the volume cache at runtime.
-for mid in ("yolo26n.pt", "yolo26n-seg.pt"):
-    try:
-        YOLO(mid)  # bare ids download into CWD (/app/models/yolo26)
-        print("YOLO26 weights baked:", mid)
-    except Exception as e:  # noqa: BLE001
-        print("WARN: could not pre-bake", mid, "->", type(e).__name__, e)
-PY
+# Hardening (B10): NO model weights are baked into the image and NONE are
+# downloaded at build time -- not YOLO, EdgeCrafter, DEIMv2, Qwen-VL,
+# DeepSeek-VL2, or GroundingDINO. Weights resolve at RUNTIME only, from
+# YOLO26_CACHE_DIR / EDGECRAFTER_CACHE_DIR / the HF cache on /runpod-volume, or
+# an approved registry. We still create the cache dir so the runtime can write
+# into it (auto-download / volume mount). Operators may pre-populate the volume
+# for air-gapped/no-egress deployments (see docs/runbook.md).
+RUN mkdir -p /app/models/yolo26
 
 # ---- Optional SAM2 runtime support ------------------------------------------
 # SAM2 code paths exist in build_segmentation.py, but dedicated SAM2 weights /
@@ -340,6 +338,16 @@ ENV GROUNDING_DINO_TEXT_THRESHOLD="0.25"
 ENV OPEN_VOCAB_SCAN_INTERVAL_MS="30000"
 ENV GROUNDING_DINO_CACHE_DIR="/runpod-volume/models/groundingdino"
 
+# ------- Worker hardening (auth / input guards / shutdown) -------------------
+# WORKER_SHARED_SECRET is intentionally NOT set here (never bake secrets). Set it
+# at deploy time so the worker rejects any request without the proxy's secret on
+# every route except /health and /ping. Unset = compatibility/testing mode.
+# (placeholder documented, not a default secret): WORKER_SHARED_SECRET=""
+ENV WORKER_AUTH_HEADER="x-worker-secret"
+ENV MAX_REQUEST_BYTES="10000000"
+ENV MAX_IMAGE_MEGAPIXELS="16"
+ENV GRACEFUL_DRAIN_MS="1500"
+
 # ------- DEIMv2 (legacy fallback) configuration ------------------------------
 ENV DEIMV2_DEVICE="cuda"
 ENV DEIMV2_BACKEND="official-deimv2-hf"
@@ -347,6 +355,17 @@ ENV DEIMV2_MODEL_ID="Intellindust/DEIMv2_DINOv3_S_COCO"
 ENV DEIMV2_CONF="0.35"
 ENV DEIMV2_IMG_SIZE="640"
 ENV HF_HOME="/runpod-volume/.cache/huggingface"
+
+# ------- Non-root runtime user (B10) -----------------------------------------
+# Run as an unprivileged user. Writable runtime paths (startup log, Ultralytics
+# config, HF cache, and the /runpod-volume model caches) are created and chowned
+# so the user can write to them. NOTE: the mounted /runpod-volume must be
+# writable by uid 10001 (see docs/runbook.md) -- weights resolve there at runtime.
+RUN groupadd -r safelens && useradd -r -u 10001 -g safelens -m -d /home/safelens safelens \
+    && mkdir -p /runpod-volume/models /runpod-volume/.cache/huggingface /tmp/Ultralytics \
+    && chown -R safelens:safelens /app /runpod-volume /tmp/Ultralytics /home/safelens
+ENV HOME="/home/safelens"
+USER safelens
 
 EXPOSE ${PORT}
 

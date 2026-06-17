@@ -46,11 +46,12 @@ def _now_ms() -> int:
 
 def scan(frame_b64: Optional[str], *, prompt: Optional[str] = None,
          session_id: Optional[str] = None, frame_id: Optional[str] = None,
-         force: bool = False) -> Dict[str, Any]:
+         entities: Optional[list] = None, force: bool = False) -> Dict[str, Any]:
     """Run an open-vocab scan (throttled per session unless force=True).
 
     force=True is for explicit user-requested scans (bypasses the interval, not
-    the enabled flag). Always returns a candidate-only result dict.
+    the enabled flag). `entities` lets the privacy egress guard blur persons.
+    Always returns a candidate-only result dict.
     """
     if not enabled():
         return OpenVocabResult(status="disabled", session_id=session_id,
@@ -69,7 +70,8 @@ def scan(frame_b64: Optional[str], *, prompt: Optional[str] = None,
             _LAST_SCAN_MS[sid] = now
 
     if backend() == "grounding_dino":
-        return gdino.scan(frame_b64, prompt=prompt, session_id=session_id, frame_id=frame_id)
+        return gdino.scan(frame_b64, prompt=prompt, session_id=session_id,
+                          frame_id=frame_id, entities=entities)
     return OpenVocabResult(status="unavailable", session_id=session_id, frame_id=frame_id,
                            error=f"unknown backend {backend()}").enforce_candidate_contract().model_dump()
 

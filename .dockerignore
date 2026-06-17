@@ -1,0 +1,73 @@
+# .dockerignore -- keep weights, datasets, private media, caches, secrets, and
+# generated artifacts OUT of the Docker build context (B11). Weights resolve at
+# RUNTIME only (/runpod-volume, HF cache, or approved registry) -- never baked.
+
+# -- version control / CI / docs noise --
+.git
+.github
+.gitignore
+*.md
+docs/
+examples/
+
+# -- model weights (never baked or committed) --
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.bin
+*.gguf
+*.engine
+models/
+**/models/
+checkpoints/
+*.ckpt
+
+# -- datasets / media / private imagery --
+datasets/
+data/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+*.mp4
+*.mov
+*.avi
+*.zip
+*.tar
+*.tar.gz
+
+# -- secrets / credentials --
+.env
+.env.*
+*.pem
+*.key
+*token*
+*secret*
+*credential*
+
+# -- generated indexes / vector stores / checkpoint DBs --
+rag/index/
+*.faiss
+*.sqlite
+*.sqlite3
+*.db
+
+# -- python / test caches --
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+tests/
+scripts/smoke_test.py
+
+# -- local preflight / scratch --
+*_preflight*/
+*.local

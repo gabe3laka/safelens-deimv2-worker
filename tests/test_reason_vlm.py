@@ -231,7 +231,7 @@ def test_scan_route_candidate_only(server_mod):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
     with TestClient(server_mod.app) as c:
-        r = c.post("/scan", json={"frame_b64": "ZmFrZQ==", "session_id": "s"})
+        r = c.post("/scan", json={"frame_b64": _tiny_jpeg_b64(), "session_id": "s"})
         assert r.status_code == 200
         body = r.json()
         assert body["produced_by"] == "open_vocab_scanner"
