@@ -152,6 +152,9 @@ COPY server.py /app/server.py
 COPY ws_vision.py /app/ws_vision.py
 COPY bootstrap.py /app/bootstrap.py
 COPY handler.py /app/handler.py
+COPY worker_guards.py /app/worker_guards.py
+COPY worker_runtime.py /app/worker_runtime.py
+COPY worker_security.py /app/worker_security.py
 
 # Build Mode (Build/Plan v2) modules -- required by server.py's /build routes.
 COPY build_schema.py /app/build_schema.py
@@ -355,6 +358,26 @@ ENV DEIMV2_MODEL_ID="Intellindust/DEIMv2_DINOv3_S_COCO"
 ENV DEIMV2_CONF="0.35"
 ENV DEIMV2_IMG_SIZE="640"
 ENV HF_HOME="/runpod-volume/.cache/huggingface"
+
+# Build-time smoke test: verify every module that bootstrap.py -> import server
+# needs is present in the image. Fails the build fast (not at runtime).
+# Must NOT start uvicorn, download weights, or call /warmup.
+RUN python - <<'PY'
+import importlib, os, sys
+sys.path.insert(0, "/app")
+required = [
+    "/app/worker_guards.py", "/app/worker_runtime.py", "/app/worker_security.py",
+    "/app/server.py", "/app/bootstrap.py",
+]
+for p in required:
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"missing required runtime file: {p}")
+for mod in ["worker_guards", "worker_runtime", "worker_security",
+            "schema", "config_resolver", "vision_backend", "ws_vision"]:
+    importlib.import_module(mod)
+    print("import OK:", mod)
+print("SafeLens worker startup import smoke test passed")
+PY
 
 # ------- Non-root runtime user (B10) -----------------------------------------
 # Run as an unprivileged user. Writable runtime paths (startup log, Ultralytics

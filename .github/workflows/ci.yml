@@ -30,6 +30,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install fastapi "pydantic>=2" pillow numpy httpx pytest ruff mypy
 
+      # Guard: every worker module imported by server.py must have a COPY line in
+      # the Dockerfile — catches the class of bug that caused the 5bcd431 outage.
+      - name: check Dockerfile copies all worker modules
+        run: |
+          grep -q "COPY worker_guards.py /app/worker_guards.py" Dockerfile
+          grep -q "COPY worker_runtime.py /app/worker_runtime.py" Dockerfile
+          grep -q "COPY worker_security.py /app/worker_security.py" Dockerfile
+
       # ruff: scoped to the code this chain owns (keeps the gate green + meaningful;
       # the large legacy surface is excluded and tracked separately).
       - name: ruff (new modules)
