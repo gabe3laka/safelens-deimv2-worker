@@ -860,6 +860,15 @@ def _build_scene_risks(
     return scene_risks
 
 
+def _add_warning(resp: Dict[str, Any], key: str) -> None:
+    """Append *key* to resp['warnings'] if not already present."""
+    existing = resp.get("warnings") or []
+    if isinstance(existing, str):
+        existing = [existing]
+    if key not in existing:
+        resp["warnings"] = existing + [key]
+
+
 # -- Detect endpoint ----------------------------------------------------------
 
 @app.post("/detect")
@@ -970,11 +979,7 @@ async def detect(payload: Dict[str, Any]):
                 resp_dict["reasoner_status"] = _normalize_reasoner_status("unavailable")
                 resp_dict["scene_risks"] = _build_scene_risks(
                     resp_dict.get("risks", []), None, resp_dict.get("tracks", []))
-                _warn = resp_dict.get("warnings") or []
-                if isinstance(_warn, str):
-                    _warn = [_warn]
-                if "qwen_unavailable" not in _warn:
-                    resp_dict["warnings"] = _warn + ["qwen_unavailable"]
+                _add_warning(resp_dict, "qwen_unavailable")
         except Exception as vexc:  # noqa: BLE001 -- VLM must never break detection
             log.warning("detect: vlm trigger failed: %s", vexc)
             if _hse:
@@ -982,10 +987,7 @@ async def detect(payload: Dict[str, Any]):
                 resp_dict["reasoner_status"] = _normalize_reasoner_status("error")
                 resp_dict["scene_risks"] = _build_scene_risks(
                     resp_dict.get("risks", []), None, resp_dict.get("tracks", []))
-                _warn = resp_dict.get("warnings") or []
-                if isinstance(_warn, str):
-                    _warn = [_warn]
-                resp_dict["warnings"] = _warn + ["qwen_unavailable"]
+                _add_warning(resp_dict, "qwen_unavailable")
         # Event-triggered temporal perception (PR: single-worker GPU+CPU). ADDITIVE
         # + NON-BLOCKING: folds the frame into per-session memory, adds deterministic
         # object-near-edge risk, and (rarely, rate-limited) kicks an async VLM job

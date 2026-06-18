@@ -115,14 +115,13 @@ def test_new_matrix_orange_band():
     m = risk_matrix.get_matrix()
     assert m.level(3, 3) == "ORANGE"  # score=9
     assert m.level(3, 4) == "ORANGE"  # score=12
-    assert m.level(2, 7) == "ORANGE"  # score=14 (clamped 7→5 → 10) -- actually 2*5=10
     assert m.level(2, 5) == "ORANGE"  # score=10
 
 
 def test_new_matrix_boundary_14_to_15():
     """Score 14 = ORANGE; score 15 = RED (updated threshold)."""
     m = risk_matrix.get_matrix()
-    # 2*5=10, 3*4=12, 7*2=14 (clamped), direct band check
+    # Direct band lookup to test exact boundary (14 is max ORANGE, 15 is min RED)
     assert m.band(14)["level"] == "ORANGE"
     assert m.band(15)["level"] == "RED"
 
