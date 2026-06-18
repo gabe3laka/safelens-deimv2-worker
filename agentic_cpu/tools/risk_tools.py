@@ -44,15 +44,19 @@ _DEFAULT_CONTROLS = [
 
 
 def score(severity: int, likelihood: int) -> Dict[str, Any]:
-    """5x5 risk score + band. severity/likelihood clamped to 1..5."""
+    """5x5 risk score + band. severity/likelihood clamped to 1..5.
+
+    Bands (updated to match risk_matrix_profile.json v2):
+      GREEN  1–3, YELLOW 4–8, ORANGE 9–14, RED 15–25.
+    """
     s = max(1, min(5, int(severity or 1)))
     likelihood_val = max(1, min(5, int(likelihood or 1)))
     rs = s * likelihood_val
-    if rs <= 4:
+    if rs <= 3:
         level = "GREEN"
-    elif rs <= 9:
+    elif rs <= 8:
         level = "YELLOW"
-    elif rs <= 15:
+    elif rs <= 14:
         level = "ORANGE"
     else:
         level = "RED"

@@ -732,6 +732,143 @@ async def warmup(wait: bool = Query(False)):
             await asyncio.sleep(1)
     return JSONResponse({"ok": True, "triggered": True, **_public_state()})
 
+# -- HSE intent detection + Live scene-risk helpers ---------------------------
+
+def wants_hse_reasoning(payload: Dict[str, Any]) -> bool:
+    """Return True when the payload signals live HSE scene-reasoning intent.
+
+    Checked flags (any one suffices):
+      * mode == "hse-monitoring"
+      * scene_hint == "live_hse_monitoring"
+      * "scene_reasoning" in tasks
+      * reasoning_preferences.return_scene_risks == True
+      * reasoning_preferences.return_reasoner_status == True
+    """
+    if payload.get("mode") == "hse-monitoring":
+        return True
+    if payload.get("scene_hint") == "live_hse_monitoring":
+        return True
+    tasks = payload.get("tasks") or []
+    if "scene_reasoning" in tasks:
+        return True
+    prefs = payload.get("reasoning_preferences") or {}
+    if prefs.get("return_scene_risks") is True:
+        return True
+    if prefs.get("return_reasoner_status") is True:
+        return True
+    return False
+
+
+# Internal -> app-facing reasoner state vocabulary.
+_RAW_TO_REASONER_STATE: Dict[str, str] = {
+    "disabled":             "disabled",
+    "not_triggered":        "rules_only",
+    "throttled":            "queued",
+    "triggered":            "running",
+    "cached":               "ready",
+    "cached_and_triggered": "running",
+    "error":                "error",
+    "timeout":              "timeout",
+    "unavailable":          "unavailable",
+    "ok":                   "ready",
+}
+
+
+def _normalize_reasoner_status(raw: Any, model_id: Optional[str] = None) -> Dict[str, Any]:
+    """Convert a raw (string or dict) reasoner status to the standard app-facing dict.
+
+    Standard states: ready | running | queued | unavailable | timeout |
+                     disabled | rules_only | error
+    """
+    if isinstance(raw, dict):
+        state = raw.get("state") or raw.get("status") or "unavailable"
+        out = dict(raw)
+        out["state"] = _RAW_TO_REASONER_STATE.get(state, state)
+        return out
+    state = _RAW_TO_REASONER_STATE.get(raw or "", raw or "unavailable")
+    d: Dict[str, Any] = {"state": state}
+    if model_id:
+        d["model"] = model_id
+    return d
+
+
+def _is_linkable(risk: Dict[str, Any]) -> bool:
+    """Return True when a risk entry has at least one link field the app can use."""
+    return bool(
+        risk.get("linked_entity_id")
+        or risk.get("involved_detection_ids")
+        or risk.get("involved_track_ids")
+        or risk.get("bbox")
+        or risk.get("approximate_region")
+    )
+
+
+def _build_scene_risks(
+    det_risks: Optional[list],
+    vlm_draft: Optional[Dict[str, Any]],
+    tracks: Optional[list],
+) -> list:
+    """Build the clean app-facing scene_risks list.
+
+    Rules:
+    * Active deterministic risks that are linkable are copied to scene_risks.
+    * VLM draft risks are enriched with track bbox data where possible.
+    * Vague / unlinked risks are excluded (not active scene_risks).
+    """
+    scene_risks: list = []
+
+    # 1. Active linkable deterministic risks
+    for risk in (det_risks or []):
+        if risk.get("risk_state", "active") == "active" and _is_linkable(risk):
+            sr = dict(risk)
+            sr.setdefault("produced_by", "risk_engine")
+            sr.setdefault("reasoner_model", "risk_engine.v1")
+            sr.setdefault("reasoner_status", "rules_only")
+            sr.setdefault("risk_reason", risk.get("reason", ""))
+            sr.setdefault("evidence", risk.get("visual_evidence") or
+                          ([risk["reason"]] if risk.get("reason") else []))
+            scene_risks.append(sr)
+
+    # 2. VLM draft risks -- enrich with track bbox if not already linked
+    if vlm_draft and vlm_draft.get("risks"):
+        track_map = {t.get("track_id"): t
+                     for t in (tracks or []) if t.get("track_id")}
+        vlm_model = vlm_draft.get("reasoner_model", "")
+        for r in vlm_draft["risks"]:
+            try:
+                risk_dict = r.model_dump() if hasattr(r, "model_dump") else dict(r)
+            except Exception:
+                continue
+            # Try to fill bbox from the first matching track
+            if not risk_dict.get("bbox") and risk_dict.get("involved_track_ids"):
+                for tid in risk_dict["involved_track_ids"]:
+                    if tid in track_map and track_map[tid].get("bbox"):
+                        risk_dict = dict(risk_dict)
+                        risk_dict["bbox"] = track_map[tid]["bbox"]
+                        break
+            if not _is_linkable(risk_dict):
+                continue  # exclude vague/unlinked VLM risk
+            risk_dict = dict(risk_dict)
+            risk_dict.setdefault("produced_by", "vlm_reasoner")
+            risk_dict.setdefault("reasoner_model", vlm_model)
+            risk_dict.setdefault("reasoner_status", "ready")
+            risk_dict.setdefault("risk_reason", risk_dict.get("reason", ""))
+            risk_dict.setdefault("evidence",
+                                 risk_dict.get("visual_evidence") or [])
+            scene_risks.append(risk_dict)
+
+    return scene_risks
+
+
+def _add_warning(resp: Dict[str, Any], key: str) -> None:
+    """Append *key* to resp['warnings'] if not already present."""
+    existing = resp.get("warnings") or []
+    if isinstance(existing, str):
+        existing = [existing]
+    if key not in existing:
+        resp["warnings"] = existing + [key]
+
+
 # -- Detect endpoint ----------------------------------------------------------
 
 @app.post("/detect")
@@ -775,8 +912,10 @@ async def detect(payload: Dict[str, Any]):
 
     # Input protection (B7): presence, base64, byte size, and decoded
     # megapixels (decompression-bomb guard). Structured 4xx -- never a 500.
-    image_b64 = payload.get("image_b64")
-    ok, err, _info = guards.validate_image_b64(image_b64)
+    # Part 1: accept frame_b64 (app alias) OR image_b64; use the same frame
+    # for detection, risk engine, VLM, and temporal reasoning.
+    frame_b64 = payload.get("frame_b64") or payload.get("image_b64")
+    ok, err, _info = guards.validate_image_b64(frame_b64)
     if not ok:
         runtime.inc("input_rejected_total", {"error": err})
         return JSONResponse(
@@ -788,7 +927,7 @@ async def detect(payload: Dict[str, Any]):
         from vision_backend import run_inference
         class_filter = payload.get("classes")
         resp = run_inference(
-            image_b64=image_b64,
+            image_b64=frame_b64,
             class_filter=class_filter,
             payload=payload,  # Pass payload so config_resolver can extract conf/img_size
         )
@@ -809,22 +948,46 @@ async def detect(payload: Dict[str, Any]):
         # Triggered off the deterministic risk level; /detect never waits for the
         # VLM -- it attaches the most recent cached draft (if any) as `scene_risks`
         # (each requires_human_review=true) plus a `reasoner_status`, and returns.
+        # Parts 2, 3, 4, 5: HSE intent forces the VLM trigger; reasoner_status is
+        # normalized to a stable dict; scene_risks are built from deterministic +
+        # VLM risks and ONLY include linkable (non-vague) items.
+        _hse = wants_hse_reasoning(payload)
+        _vlm_unavailable = False
         try:
             import risk.vlm_reasoner as vlm
-            if vlm.enabled() and resp_dict.get("schema_version"):
-                draft, status = vlm.maybe_trigger(
-                    session_id, frame_b64=image_b64,
-                    highest_level=resp_dict.get("highest_risk_level", "GREEN"),
+            if vlm.enabled() and (resp_dict.get("schema_version") or _hse):
+                # For HSE intent, force trigger regardless of current risk level.
+                effective_level = (
+                    vlm.trigger_level() if _hse
+                    else resp_dict.get("highest_risk_level", "GREEN")
+                )
+                draft, raw_status = vlm.maybe_trigger(
+                    session_id, frame_b64=frame_b64,
+                    highest_level=effective_level,
                     deterministic_risks=resp_dict.get("risks", []),
                     entities=resp_dict.get("entities", []),
                     scene_graph=resp_dict.get("scene_graph", {}),
                     tracks=resp_dict.get("tracks", []), frame_id=frame_id,
                 )
-                resp_dict["reasoner_status"] = status
-                if draft and draft.get("risks"):
-                    resp_dict["scene_risks"] = draft["risks"]
+                resp_dict["reasoner_status"] = _normalize_reasoner_status(
+                    raw_status, vlm._model_id())
+                resp_dict["scene_risks"] = _build_scene_risks(
+                    resp_dict.get("risks", []), draft, resp_dict.get("tracks", []))
+            elif _hse:
+                # HSE mode requested but VLM is disabled -- degrade gracefully.
+                _vlm_unavailable = True
+                resp_dict["reasoner_status"] = _normalize_reasoner_status("unavailable")
+                resp_dict["scene_risks"] = _build_scene_risks(
+                    resp_dict.get("risks", []), None, resp_dict.get("tracks", []))
+                _add_warning(resp_dict, "qwen_unavailable")
         except Exception as vexc:  # noqa: BLE001 -- VLM must never break detection
             log.warning("detect: vlm trigger failed: %s", vexc)
+            if _hse:
+                _vlm_unavailable = True
+                resp_dict["reasoner_status"] = _normalize_reasoner_status("error")
+                resp_dict["scene_risks"] = _build_scene_risks(
+                    resp_dict.get("risks", []), None, resp_dict.get("tracks", []))
+                _add_warning(resp_dict, "qwen_unavailable")
         # Event-triggered temporal perception (PR: single-worker GPU+CPU). ADDITIVE
         # + NON-BLOCKING: folds the frame into per-session memory, adds deterministic
         # object-near-edge risk, and (rarely, rate-limited) kicks an async VLM job
@@ -835,12 +998,15 @@ async def detect(payload: Dict[str, Any]):
             if temporal_reasoning.enabled():
                 resp_dict = temporal_reasoning.attach_temporal(
                     resp_dict, session_id=session_id, frame_id=frame_id,
-                    frame_b64=image_b64, payload=payload)
+                    frame_b64=frame_b64, payload=payload)
         except Exception as texc:  # noqa: BLE001 -- temporal must never break detection
             log.warning("detect: temporal layer failed: %s", texc)
         # Degradation ladder (B4): surface degraded/degradation_mode + metrics.
+        # VLM unavailability in HSE mode is also surfaced as degraded.
         rmeta = resp_dict.get("risk_engine") or {}
         mode = "no_risk" if isinstance(rmeta, dict) and rmeta.get("degraded") else "full"
+        if _vlm_unavailable and _hse:
+            mode = mode if mode == "no_risk" else "detect_only"
         resp_dict["degraded"] = mode != "full"
         resp_dict["degradation_mode"] = mode
         runtime.set_degradation(mode)

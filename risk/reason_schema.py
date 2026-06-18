@@ -49,18 +49,30 @@ class VlmRisk(BaseModel):
     """A single AI-draft risk from the VLM. Always human-review, never alerts."""
 
     risk_id: str
-    involved_track_ids: List[str] = Field(default_factory=list)
     hazard_type: str = "unknown"
-    risk_state: str = "latent"                 # latent | active
-    trigger_condition: Optional[str] = None
     risk_level: str = "GREEN"
+    risk_score: int = 1
     severity: int = 1
     likelihood: int = 1
-    risk_score: int = 1
-    reason: str = ""
+    risk_reason: Optional[str] = None       # primary linkable explanation
+    reason: str = ""                        # alias / legacy (same content as risk_reason)
     visual_evidence: List[str] = Field(default_factory=list)
-    recommended_controls: List[Control] = Field(default_factory=list)
+    evidence: List[str] = Field(default_factory=list)   # structured evidence list
     recommended_action: Optional[str] = None
+    recommended_controls: List[Control] = Field(default_factory=list)
+    # Linkability: every active scene_risk must have at least one of these.
+    involved_track_ids: List[str] = Field(default_factory=list)
+    involved_detection_ids: List[int] = Field(default_factory=list)
+    linked_entity_id: Optional[str] = None
+    bbox: Optional[Dict[str, float]] = None          # normalized x/y/w/h
+    approximate_region: Optional[str] = None         # text description when no bbox
+    # Provenance fields (set by engine; not trusted from VLM output)
+    produced_by: str = "vlm_reasoner"
+    reasoner_model: Optional[str] = None
+    reasoner_status: Optional[str] = None
+    # Context
+    risk_state: str = "latent"                 # latent | active
+    trigger_condition: Optional[str] = None
     confidence: float = 0.5
     # Forced by validators below -- a VLM draft can never self-authorize.
     requires_human_review: bool = True

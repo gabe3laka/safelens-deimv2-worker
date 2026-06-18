@@ -19,11 +19,11 @@
   "schema_version": "risk.v1",
   "degraded": false,
   "degradation_mode": "full",
-  "reasoner_status": "not_triggered",
+  "reasoner_status": {"state": "rules_only"},
   "highest_risk_level": "ORANGE",
   "risk_engine": {
-    "enabled": true, "degraded": false, "matrix_profile": "default-5x5-v1",
-    "matrix_version": "1.0.0", "tracking_enabled": true, "scene_graph_enabled": true,
+    "enabled": true, "degraded": false, "matrix_profile": "default-5x5-v2",
+    "matrix_version": "2.0.0", "tracking_enabled": true, "scene_graph_enabled": true,
     "provenance_enabled": true, "privacy_blur_enabled": false,
     "model_version": "risk_engine.v1", "session_id": "cam_1",
     "active_tracks": 2, "risk_count": 1, "highest_level": "ORANGE", "alerting_count": 1
@@ -41,7 +41,7 @@
     {"risk_id": "rsk_R04_person_forklift_trk_1", "rule_id": "R04_person_forklift",
      "hazard_type": "person_forklift_proximity", "risk_state": "active",
      "involved_track_ids": ["trk_1"], "involved_entities": [0, 1],
-     "severity": 4, "likelihood": 4, "risk_score": 16, "risk_level": "ORANGE",
+     "severity": 3, "likelihood": 4, "risk_score": 12, "risk_level": "ORANGE",
      "reason": "'person' overlaps 'forklift'.",
      "bbox": {"x": 0.30, "y": 0.40, "w": 0.14, "h": 0.45},
      "recommended_controls": [
