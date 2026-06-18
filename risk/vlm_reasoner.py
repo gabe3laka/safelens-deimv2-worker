@@ -375,19 +375,39 @@ def _build_prompt(req: ReasonRequest) -> str:
         "company_profile": req.company_profile,
     }
     schema_hint = (
-        '{"scene_summary": str, "risks": [{"risk_id": str, "involved_track_ids": [str], '
-        '"hazard_type": str, "risk_state": "latent|active", "trigger_condition": str, '
-        '"risk_level": "GREEN|YELLOW|ORANGE|RED", "severity": int, "likelihood": int, '
-        '"risk_score": int, "reason": str, "visual_evidence": [str], '
+        '{"scene_summary": str, "risks": [{'
+        '"risk_id": str, '
+        '"linked_entity_id": str_or_null, '
+        '"involved_track_ids": [str], '
+        '"involved_detection_ids": [int], '
+        '"bbox": {"x": float, "y": float, "w": float, "h": float}_or_null, '
+        '"approximate_region": str_or_null, '
+        '"hazard_type": str, '
+        '"risk_state": "latent|active", '
+        '"trigger_condition": str_or_null, '
+        '"risk_level": "GREEN|YELLOW|ORANGE|RED", '
+        '"severity": int, "likelihood": int, "risk_score": int, '
+        '"risk_reason": str, "reason": str, '
+        '"evidence": [str], "visual_evidence": [str], '
         '"recommended_controls": [{"level": str, "action": str}], '
-        '"recommended_action": str, "confidence": float}], "uncertain_items": [str]}')
+        '"recommended_action": str, "confidence": float'
+        '}], "uncertain_items": [str]}'
+    )
     return (
         "You are a senior QHSE manager assisting an automated safety system. "
         "The deterministic engine has already flagged candidate risks; your job is to "
         "EXPLAIN and VERIFY them and note relational/contextual risk a box detector misses "
         "(e.g. object near an edge, person under a suspended load). Reason about object x "
         "position x height x people-exposure x dynamics. Anchor advice to the hierarchy of "
-        "controls (elimination->...->ppe). You ADVISE only; you never authorize action.\n"
+        "controls (elimination->...->ppe). You ADVISE only; you never authorize action.\n\n"
+        "STRICT RULES:\n"
+        "1. Report ONLY risks that are visible in the CURRENT frame.\n"
+        "2. Every risk MUST include at least one of: linked_entity_id, involved_track_ids, "
+        "involved_detection_ids, bbox, or approximate_region. Vague/unlinked risks must NOT "
+        "be emitted -- place them in uncertain_items instead.\n"
+        "3. Return an EMPTY risks list if you are uncertain about any risk.\n"
+        "4. Do NOT fabricate risks. Do NOT inherit should_alert or requires_human_review "
+        "from the deterministic engine.\n\n"
         "Return STRICT JSON ONLY (no prose, no code fences) matching this schema:\n"
         + schema_hint + "\nContext:\n" + json.dumps(context)[:6000]
     )

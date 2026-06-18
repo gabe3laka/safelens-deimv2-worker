@@ -1,12 +1,12 @@
 {
-  "profile": "default-5x5-v1",
-  "version": "1.0.0",
-  "description": "OSHA/UK-HSE style 5x5 likelihood x severity matrix. Score = severity * likelihood; bands per HSE study-guide convention (1-4 low, 5-9 med, 10-16 high, 17-25 critical).",
+  "profile": "default-5x5-v2",
+  "version": "2.0.0",
+  "description": "OSHA/UK-HSE style 5x5 likelihood x severity matrix. Score = severity * likelihood; updated bands for live HSE monitoring (1-3 low, 4-8 med, 9-14 high, 15-25 critical).",
   "scale": { "severity_max": 5, "likelihood_max": 5 },
   "bands": [
-    { "level": "GREEN",  "min": 1,  "max": 4,  "color": "#2ecc71", "alert": false },
-    { "level": "YELLOW", "min": 5,  "max": 9,  "color": "#f1c40f", "alert": false },
-    { "level": "ORANGE", "min": 10, "max": 16, "color": "#e67e22", "alert": true },
-    { "level": "RED",    "min": 17, "max": 25, "color": "#e74c3c", "alert": true }
+    { "level": "GREEN",  "min": 1,  "max": 3,  "color": "#2ecc71", "alert": false },
+    { "level": "YELLOW", "min": 4,  "max": 8,  "color": "#f1c40f", "alert": false },
+    { "level": "ORANGE", "min": 9,  "max": 14, "color": "#e67e22", "alert": true },
+    { "level": "RED",    "min": 15, "max": 25, "color": "#e74c3c", "alert": true }
   ]
 }

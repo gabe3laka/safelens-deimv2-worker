@@ -253,8 +253,13 @@ def test_detect_triggers_reasoner_nonblocking(server_mod, monkeypatch):
             body = r.json()
             # deterministic risk present + non-blocking reasoner_status attached
             assert body["schema_version"] == "risk.v1"
-            assert body.get("reasoner_status") in (
-                "triggered", "cached", "cached_and_triggered", "throttled", "not_triggered")
+            # reasoner_status is now a normalized dict; state must be one of the
+            # standard app-facing values.
+            rs = body.get("reasoner_status")
+            assert isinstance(rs, dict), f"expected dict, got {rs!r}"
+            assert rs.get("state") in (
+                "running", "ready", "queued", "rules_only",
+                "unavailable", "disabled", "error", "timeout"), rs
             assert body["entities"][0]["label"] == "person"   # detection preserved
     finally:
         with server_mod._STATE_LOCK:
