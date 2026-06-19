@@ -54,7 +54,7 @@ def _latest_wins_enabled() -> bool:
     return _int_env("REASONER_LATEST_WINS", 1) != 0
 
 
-def _pending_max_age_ms() -> int:
+def _pending_frame_max_age_ms() -> int:
     return max(1, _int_env("REASONER_PENDING_FRAME_MAX_AGE_MS", 2500))
 
 
@@ -102,7 +102,7 @@ def _build_prompt(ctx: Dict[str, Any]) -> str:
                      for e in (ctx.get("entities") or [])][:30],
         "trigger_reasons": ctx.get("reasons", []),
     }
-    return (_load_prompt() + "\n\nReturn STRICT compact JSON only (no prose/code fences),"
+    return (_load_prompt() + "\n\nReturn compact JSON only (no prose/code fences),"
             " max 3 semantic_corrections; keep evidence/actions"
             " to one short sentence each. Return empty arrays when unsupported."
             "\nReturn STRICT JSON ONLY matching:\n" + schema_hint
@@ -176,7 +176,7 @@ def _run_job(sid: str, ctx: Dict[str, Any]) -> None:
             pending_ctx: Dict[str, Any] = {}
             if pending:
                 age = _now_ms() - int(pending.get("queued_ms", 0))
-                if age <= _pending_max_age_ms() and len(_INFLIGHT) < _max_async_jobs():
+                if age <= _pending_frame_max_age_ms() and len(_INFLIGHT) < _max_async_jobs():
                     _INFLIGHT.add(sid)
                     _LAST_TRIGGER_MS[sid] = _now_ms()
                     should_submit_pending = True

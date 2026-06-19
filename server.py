@@ -803,6 +803,7 @@ def _normalize_reasoner_status(raw: Any, model_id: Optional[str] = None,
 
 
 def _iou(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    """Compute IoU for normalized bbox dicts shaped as {x,y,w,h}."""
     try:
         ax, ay = float(a.get("x", 0.0)), float(a.get("y", 0.0))
         aw, ah = float(a.get("w", 0.0)), float(a.get("h", 0.0))
@@ -821,6 +822,7 @@ def _iou(a: Dict[str, Any], b: Dict[str, Any]) -> float:
 
 
 def _center_dist(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    """Compute normalized Euclidean distance between bbox centers."""
     try:
         ax = float(a.get("x", 0.0)) + float(a.get("w", 0.0)) / 2.0
         ay = float(a.get("y", 0.0)) + float(a.get("h", 0.0)) / 2.0
