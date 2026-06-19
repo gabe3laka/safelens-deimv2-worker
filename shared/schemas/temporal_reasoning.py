@@ -86,7 +86,7 @@ class ReasonerStatus(BaseModel):
 
     enabled: bool = False
     mode: str = "qwen_vl"
-    # idle | queued | running | ready | timeout | error | disabled
+    # idle | queued | queued_latest | running | ready | cached | throttled | timeout | error | unavailable | disabled
     state: str = "idle"
     last_trigger: Optional[str] = None
     result_age_ms: Optional[int] = None

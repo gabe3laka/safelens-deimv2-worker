@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.metadata
 import io
 import json
 import logging
@@ -61,32 +62,32 @@ def _model_id() -> str:
         return os.getenv("DEEPSEEK_VL_MODEL_ID", "deepseek-ai/deepseek-vl2-small")
     if m == "mock":
         return "mock"
-    return os.getenv("QWEN_VL_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
+    return os.getenv("QWEN_VL_MODEL_ID", "Qwen/Qwen2.5-VL-3B-Instruct")
 
 
 def trigger_level() -> str:
-    return os.getenv("REASONER_TRIGGER_LEVEL", "ORANGE").strip().upper()
+    return os.getenv("REASONER_TRIGGER_LEVEL", "YELLOW").strip().upper()
 
 
 def _min_interval_ms() -> int:
     try:
-        return int(os.getenv("REASONER_MIN_INTERVAL_MS", "5000"))
+        return int(os.getenv("REASONER_MIN_INTERVAL_MS", "1500"))
     except (TypeError, ValueError):
-        return 5000
+        return 1500
 
 
 def _timeout_ms() -> int:
     try:
-        return int(os.getenv("REASONER_TIMEOUT_MS", "8000"))
+        return int(os.getenv("REASONER_TIMEOUT_MS", "2500"))
     except (TypeError, ValueError):
-        return 8000
+        return 2500
 
 
 def _cache_ttl_ms() -> int:
     try:
-        return int(os.getenv("REASONER_CACHE_TTL_MS", "15000"))
+        return int(os.getenv("REASONER_CACHE_TTL_MS", "10000"))
     except (TypeError, ValueError):
-        return 15000
+        return 10000
 
 
 def _max_sessions() -> int:
@@ -98,9 +99,89 @@ def _max_sessions() -> int:
 
 def _max_image_side() -> int:
     try:
-        return int(os.getenv("REASONER_MAX_IMAGE_SIDE", "1024"))
+        return int(os.getenv("REASONER_MAX_IMAGE_SIDE", "512"))
     except (TypeError, ValueError):
-        return 1024
+        return 512
+
+
+def _max_new_tokens() -> int:
+    try:
+        return max(1, int(os.getenv("REASONER_MAX_NEW_TOKENS", "128")))
+    except (TypeError, ValueError):
+        return 128
+
+
+def _quantization_requested() -> str:
+    q = os.getenv("REASONER_QUANTIZATION", "4bit").strip().lower()
+    if q not in ("none", "8bit", "4bit"):
+        return "none"
+    return q
+
+
+def _serve_backend() -> str:
+    return os.getenv("REASONER_SERVE_BACKEND", "transformers").strip().lower()
+
+
+def _visual_tokens(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _visual_pixels(name: str, default_tokens: int) -> int:
+    patch = 28 * 28
+    return _visual_tokens(name, default_tokens) * patch
+
+
+def _quantization_diagnostics() -> Dict[str, Any]:
+    requested = _quantization_requested()
+    bnb_available = False
+    bnb_version = None
+    bnb_error = None
+    try:
+        import bitsandbytes as bnb  # type: ignore
+        bnb_available = True
+        bnb_version = getattr(bnb, "__version__", None)
+    except Exception as exc:  # noqa: BLE001
+        bnb_error = f"{type(exc).__name__}: {exc}"
+    if bnb_version is None:
+        try:
+            bnb_version = importlib.metadata.version("bitsandbytes")
+        except Exception:  # noqa: BLE001
+            pass
+    return {
+        "vlm.bitsandbytes_available": bnb_available,
+        "vlm.bitsandbytes_version": bnb_version,
+        "vlm.bitsandbytes_error": bnb_error,
+        "vlm.quantization_requested": requested,
+        "vlm.quantization_active": False,
+        "vlm.quantization_backend": "bitsandbytes",
+    }
+
+
+def _configure_quantization(kwargs: Dict[str, Any], quant_diag: Dict[str, Any]) -> None:
+    quant = quant_diag.get("vlm.quantization_requested", "none")
+    if quant not in ("4bit", "8bit"):
+        return
+    if quant_diag.get("vlm.bitsandbytes_available"):
+        try:
+            from transformers import BitsAndBytesConfig
+            kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=(quant == "4bit"), load_in_8bit=(quant == "8bit"))
+            quant_diag["vlm.quantization_active"] = True
+        except Exception as exc:  # noqa: BLE001
+            quant_diag["vlm.bitsandbytes_error"] = f"{type(exc).__name__}: {exc}"
+            log.warning(
+                "vlm: quantization requested=%s unavailable; full precision fallback (%s)",
+                quant,
+                exc,
+            )
+    else:
+        log.warning(
+            "vlm: quantization requested=%s but bitsandbytes unavailable; full precision fallback",
+            quant,
+        )
 
 
 def _now_ms() -> int:
@@ -186,6 +267,8 @@ def maybe_trigger(session_id: Optional[str], *, frame_b64: Optional[str],
         entry = _CACHE.get(sid)
         if entry and (now - entry["ts"]) <= _cache_ttl_ms():
             draft = dict(entry["response"])
+            draft["_cached_at_ms"] = entry["ts"]
+            draft["_cache_age_ms"] = now - entry["ts"]
         if not should:
             return draft, ("cached" if draft else "not_triggered")
         last = _LAST_RUN_MS.get(sid, 0)
@@ -370,6 +453,7 @@ def _build_prompt(req: ReasonRequest) -> str:
     context = {
         "deterministic_risks": req.deterministic_risks,
         "entities": req.entities[:30],
+        "tracks": req.tracks[:30],
         "scene_graph": {"relations": (req.scene_graph or {}).get("relations", [])[:30]},
         "known_hse_rules": req.known_hse_rules[:20],
         "company_profile": req.company_profile,
@@ -395,18 +479,21 @@ def _build_prompt(req: ReasonRequest) -> str:
     )
     return (
         "You are a senior QHSE manager assisting an automated safety system. "
-        "The deterministic engine has already flagged candidate risks; your job is to "
-        "EXPLAIN and VERIFY them and note relational/contextual risk a box detector misses "
-        "(e.g. object near an edge, person under a suspended load). Reason about object x "
-        "position x height x people-exposure x dynamics. Anchor advice to the hierarchy of "
-        "controls (elimination->...->ppe). You ADVISE only; you never authorize action.\n\n"
+        "YOLO/tracking are the coordinate authority. You only provide compact advisory "
+        "JSON linked to current detector/tracker entities.\n\n"
         "STRICT RULES:\n"
         "1. Report ONLY risks that are visible in the CURRENT frame.\n"
-        "2. Every risk MUST include at least one of: linked_entity_id, involved_track_ids, "
+        "2. Return compact JSON only. No prose, no markdown, no code fences.\n"
+        "3. Output at most 3 risks and at most 3 uncertain_items.\n"
+        "4. Keep each reason/evidence/action to one short sentence.\n"
+        "5. Do not output authoritative alert actions. All outputs are draft-only.\n"
+        "6. If unsupported/uncertain, return an empty risks list.\n"
+        "7. Keep YOLO boxes authoritative; do not invent final detector boxes.\n"
+        "8. Every risk MUST include at least one of: linked_entity_id, involved_track_ids, "
         "involved_detection_ids, bbox, or approximate_region. Vague/unlinked risks must NOT "
         "be emitted -- place them in uncertain_items instead.\n"
-        "3. Return an EMPTY risks list if you are uncertain about any risk.\n"
-        "4. Do NOT fabricate risks. Do NOT inherit should_alert or requires_human_review "
+        "9. Return an EMPTY risks list if you are uncertain about any risk.\n"
+        "10. Do NOT fabricate risks. Do NOT inherit should_alert or requires_human_review "
         "from the deterministic engine.\n\n"
         "Return STRICT JSON ONLY (no prose, no code fences) matching this schema:\n"
         + schema_hint + "\nContext:\n" + json.dumps(context)[:6000]
@@ -449,16 +536,23 @@ def _build_adapter(m: str) -> Dict[str, Any]:
     """Import torch/transformers and load the model lazily. Returns a dict with
     available + generate(prompt, image) or an error string. Heavy + best-effort:
     on any import/load failure -> available=False so the worker degrades."""
+    quant_diag = _quantization_diagnostics()
     try:
         import torch  # noqa: F401
         from transformers import AutoProcessor  # noqa: F401
     except Exception as exc:  # noqa: BLE001
-        return {"available": False, "error": f"deps unavailable: {exc}", "generate": None}
+        return {
+            "available": False,
+            "error": f"deps unavailable: {exc}",
+            "generate": None,
+            "diagnostics": quant_diag,
+            "model_id": _model_id(),
+        }
 
     model_id = _model_id()
     cache_dir = os.getenv("REASONER_CACHE_DIR", "/runpod-volume/models/qwen-vl")
     device = os.getenv("REASONER_DEVICE", "cuda")
-    quant = os.getenv("REASONER_QUANTIZATION", "4bit").strip().lower()
+    quant = quant_diag["vlm.quantization_requested"]
 
     def _load():
         import torch
@@ -469,13 +563,7 @@ def _build_adapter(m: str) -> Dict[str, Any]:
             kwargs["torch_dtype"] = getattr(torch, dtype, "auto")
         else:
             kwargs["torch_dtype"] = "auto"
-        if quant in ("4bit", "8bit"):
-            try:
-                from transformers import BitsAndBytesConfig
-                kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=(quant == "4bit"), load_in_8bit=(quant == "8bit"))
-            except Exception as exc:  # noqa: BLE001
-                log.warning("vlm: quantization unavailable (%s); loading full precision", exc)
+        _configure_quantization(kwargs, quant_diag)
         if m == "deepseek_vl2":
             from transformers import AutoModelForCausalLM
             model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
@@ -485,15 +573,27 @@ def _build_adapter(m: str) -> Dict[str, Any]:
             except Exception:  # noqa: BLE001 -- older transformers
                 from transformers import AutoModelForImageTextToText as _Q
             model = _Q.from_pretrained(model_id, **kwargs)
-        if quant not in ("4bit", "8bit") and device:
+        if ("quantization_config" not in kwargs) and device:
             model = model.to(device)
-        processor = AutoProcessor.from_pretrained(model_id, cache_dir=cache_dir,
-                                                  trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(
+            model_id,
+            cache_dir=cache_dir,
+            trust_remote_code=True,
+            min_pixels=_visual_pixels("QWEN_VL_MIN_VISUAL_TOKENS", 256),
+            max_pixels=_visual_pixels("QWEN_VL_MAX_VISUAL_TOKENS", 768),
+        )
         model.eval()
         return model, processor
 
-    state: Dict[str, Any] = {"available": True, "error": None, "model": None,
-                             "processor": None, "lock": threading.Lock()}
+    state: Dict[str, Any] = {
+        "available": True,
+        "error": None,
+        "model": None,
+        "processor": None,
+        "lock": threading.Lock(),
+        "diagnostics": quant_diag,
+        "model_id": model_id,
+    }
 
     def generate(prompt: str, image) -> str:
         import torch
@@ -511,7 +611,7 @@ def _build_adapter(m: str) -> Dict[str, Any]:
         if image is not None:
             proc_kwargs["images"] = [image]
         inputs = processor(**proc_kwargs).to(model.device)
-        max_new = int(os.getenv("REASONER_MAX_NEW_TOKENS", "768"))
+        max_new = _max_new_tokens()
         with torch.no_grad():
             out = model.generate(**inputs, max_new_tokens=max_new, do_sample=False)
         trimmed = out[:, inputs["input_ids"].shape[1]:]
@@ -553,6 +653,10 @@ def generate_json(prompt: str, *, frame_b64: Optional[str] = None,
 # -- status (for /debug/state) -------------------------------------------------
 
 def status_snapshot() -> Dict[str, Any]:
+    diag = _quantization_diagnostics()
+    adapter = _ADAPTER_STATE.get(mode())
+    if isinstance(adapter, dict):
+        diag.update(adapter.get("diagnostics") or {})
     with _LOCK:
         active = len(_CACHE)
         last = dict(_LAST_STATUS)
@@ -560,12 +664,20 @@ def status_snapshot() -> Dict[str, Any]:
         "enabled": enabled(),
         "mode": mode(),
         "model_id": _model_id(),
+        "serve_backend": _serve_backend(),
         "trigger_level": trigger_level(),
         "min_interval_ms": _min_interval_ms(),
         "timeout_ms": _timeout_ms(),
+        "cache_ttl_ms": _cache_ttl_ms(),
         "max_image_side": _max_image_side(),
+        "max_new_tokens": _max_new_tokens(),
+        "qwen_vl_min_visual_tokens": _visual_tokens("QWEN_VL_MIN_VISUAL_TOKENS", 256),
+        "qwen_vl_max_visual_tokens": _visual_tokens("QWEN_VL_MAX_VISUAL_TOKENS", 768),
+        "qwen_vllm_base_url": os.getenv("QWEN_VLLM_BASE_URL", "http://127.0.0.1:8001/v1"),
+        "qwen_sglang_base_url": os.getenv("QWEN_SGLANG_BASE_URL", "http://127.0.0.1:30000/v1"),
         "privacy_blur_enabled": privacy.blur_enabled(),
         "active_sessions": active,
         "last_status": last,
+        "diagnostics": diag,
         "note": "AI draft only; requires_human_review=true; never per-frame; never blocks /detect.",
     }

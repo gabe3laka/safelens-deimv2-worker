@@ -360,14 +360,22 @@ default, throttled (never per-frame), output is **candidate-only**
 (`produced_by="open_vocab_scanner"`, `candidate_only=true`,
 `requires_human_review=true`) and can **never** trigger an official HSE alert.
 
+4-bit/8-bit quantization uses `bitsandbytes` (installed in the image and checked
+at build time). If quantization is requested but unavailable at runtime, the
+worker logs diagnostics and falls back to full precision without breaking `/detect`.
+
 | Env | Default | Notes |
 |-----|---------|-------|
 | `VLM_REASONER_ENABLED` | `false` | master switch for `/reason` + `/detect` trigger |
 | `REASONER_MODE` | `qwen_vl` | `qwen_vl` \| `deepseek_vl2` \| `mock` |
-| `QWEN_VL_MODEL_ID` | `Qwen/Qwen2.5-VL-7B-Instruct` | runtime-resolved; 3B for low VRAM |
-| `REASONER_TRIGGER_LEVEL` / `REASONER_MIN_INTERVAL_MS` | `ORANGE` / `5000` | when/how often to trigger |
-| `REASONER_TIMEOUT_MS` | `8000` | hard cap; over-budget → `reasoner_status:"timeout"` |
+| `QWEN_VL_MODEL_ID` | `Qwen/Qwen2.5-VL-3B-Instruct` | live default on 24GB GPUs |
+| `QWEN_VL_DEEP_MODEL_ID` / `QWEN_VL_DEEP_ENABLED` | `Qwen/Qwen2.5-VL-7B-Instruct` / `false` | optional offline/deep analysis only (not loaded on live `/detect`) |
+| `REASONER_TRIGGER_LEVEL` / `REASONER_MIN_INTERVAL_MS` | `YELLOW` / `1500` | live heartbeat trigger + cadence |
+| `REASONER_TIMEOUT_MS` | `2500` | hard cap; over-budget → `reasoner_status:"timeout"` |
+| `REASONER_MAX_IMAGE_SIDE` / `REASONER_MAX_NEW_TOKENS` | `512` / `128` | heartbeat-safe response latency |
 | `REASONER_QUANTIZATION` | `4bit` | `none` \| `8bit` \| `4bit` (GPU memory) |
+| `QWEN_VL_MIN_VISUAL_TOKENS` / `QWEN_VL_MAX_VISUAL_TOKENS` | `256` / `768` | processor `min_pixels`/`max_pixels`; optional accuracy mode: max `1280` |
+| `REASONER_SERVE_BACKEND` | `transformers` | hooks for future `vllm` / `sglang` backends |
 | `OPEN_VOCAB_SCANNER_ENABLED` | `false` | GroundingDINO scanner (candidate-only) |
 
 `/debug/state` reports `reasoner` and `open_vocab_scanner` blocks. **Deferred to
@@ -424,6 +432,42 @@ DEIMV2_CONF=0.35
 DEIMV2_IMG_SIZE=640
 HF_HOME=/runpod-volume/.cache/huggingface
 TRANSFORMERS_CACHE=/runpod-volume/.cache/huggingface
+```
+
+### Recommended RunPod live heartbeat env (24 GB GPU)
+
+`VLM_REASONER_ENABLED` stays `false` in the image by default; enable it
+explicitly per deployment:
+
+```env
+VLM_REASONER_ENABLED=true
+QWEN_VL_MODEL_ID=Qwen/Qwen2.5-VL-3B-Instruct
+QWEN_VL_DEEP_MODEL_ID=Qwen/Qwen2.5-VL-7B-Instruct
+QWEN_VL_DEEP_ENABLED=false
+REASONER_QUANTIZATION=4bit
+REASONER_MAX_IMAGE_SIDE=512
+QWEN_VL_MIN_VISUAL_TOKENS=256
+QWEN_VL_MAX_VISUAL_TOKENS=768
+REASONER_MAX_NEW_TOKENS=128
+REASONER_TIMEOUT_MS=2500
+REASONER_MIN_INTERVAL_MS=1500
+REASONER_RESULT_STALE_MS=8000
+REASONER_CACHE_TTL_MS=10000
+REASONER_TRIGGER_LEVEL=YELLOW
+REASONER_MAX_WORKERS=1
+GPU_REASONER_MAX_INFLIGHT=1
+TEMPORAL_REASONING_MAX_ASYNC_JOBS=1
+TEMPORAL_REASONING_TRIGGER_MIN_INTERVAL_MS=1500
+SCENE_CONTEXT_REFRESH_MS=2000
+REASONER_LATEST_WINS=true
+REASONER_PENDING_FRAME_MAX_AGE_MS=2500
+REASONER_MATCH_IOU_MIN=0.20
+REASONER_MATCH_CENTER_DIST_MAX=0.20
+REASONER_LINKED_RISK_TTL_MS=8000
+REASONER_UNMATCHED_CANDIDATE_TTL_MS=5000
+REASONER_SERVE_BACKEND=transformers
+QWEN_VLLM_BASE_URL=http://127.0.0.1:8001/v1
+QWEN_SGLANG_BASE_URL=http://127.0.0.1:30000/v1
 ```
 
 ## Files

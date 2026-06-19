@@ -23,7 +23,7 @@
   },
   "provenance": {
     "detector_model": "yolo26n.pt",
-    "reasoner_model": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "reasoner_model": "Qwen/Qwen2.5-VL-3B-Instruct",
     "llm_provider": "mock",
     "llm_model": "mock",
     "produced_by": "agentic_cpu"

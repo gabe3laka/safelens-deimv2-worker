@@ -25,6 +25,7 @@ import pytest
 pytest.importorskip("pydantic")
 
 import temporal_reasoning as tr
+import temporal_reasoning.async_reasoning as ar
 from temporal_reasoning import edge_risk, scene_context, semantic_corrections
 from temporal_reasoning import session_memory as mem
 from temporal_reasoning import triggers
@@ -218,6 +219,54 @@ def test_reasoner_failure_never_breaks_attach(monkeypatch):
                              session_id="cam_err")
     # attach swallows the failure and still returns the detection
     assert out["entities"][0]["label"] == "cup"
+
+
+def test_latest_frame_wins_replaces_pending(monkeypatch):
+    monkeypatch.setenv("REASONER_LATEST_WINS", "true")
+    sid = "cam_latest"
+    with ar._LOCK:
+        ar._INFLIGHT.add(sid)
+        ar._PENDING.pop(sid, None)
+    try:
+        s1 = ar.maybe_trigger(
+            sid,
+            reasons=["risk_escalation"],
+            entities=[{"label": "cup"}],
+            tracks=[],
+            frame_b64="frame_old",
+            payload={},
+        )
+        s2 = ar.maybe_trigger(
+            sid,
+            reasons=["risk_escalation"],
+            entities=[{"label": "cup"}],
+            tracks=[],
+            frame_b64="frame_new",
+            payload={},
+        )
+        assert s1 == "queued_latest"
+        assert s2 == "queued_latest"
+        with ar._LOCK:
+            assert sid in ar._PENDING
+            assert ar._PENDING[sid]["ctx"]["frame_b64"] == "frame_new"
+    finally:
+        with ar._LOCK:
+            ar._INFLIGHT.discard(sid)
+            ar._PENDING.pop(sid, None)
+
+
+def test_temporal_memory_does_not_store_raw_frames():
+    sid = "cam_priv"
+    mem.update(
+        sid,
+        frame_id="f_raw",
+        entities=[{"label": "cup", "confidence": 0.7, "bbox": {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1}}],
+        tracks=[],
+    )
+    snap = mem.snapshot(sid)
+    dumped = str(snap).lower()
+    assert "frame_b64" not in dumped
+    assert "image_b64" not in dumped
 
 
 def test_privacy_blur_applied_before_vlm_frame_send(monkeypatch):

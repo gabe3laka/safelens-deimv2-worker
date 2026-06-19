@@ -38,7 +38,7 @@ def scene_context_enabled() -> bool:
 
 
 def scene_context_refresh_ms() -> int:
-    return _int_env("SCENE_CONTEXT_REFRESH_MS", 15000)
+    return _int_env("SCENE_CONTEXT_REFRESH_MS", 2000)
 
 
 def _low_conf_threshold() -> float:

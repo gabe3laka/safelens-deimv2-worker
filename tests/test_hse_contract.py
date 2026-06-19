@@ -218,7 +218,7 @@ def test_normalize_string_statuses(monkeypatch):
 
     assert n("disabled")["state"] == "disabled"
     assert n("not_triggered")["state"] == "rules_only"
-    assert n("throttled")["state"] == "queued"
+    assert n("throttled")["state"] == "throttled"
     assert n("triggered")["state"] == "running"
     assert n("cached")["state"] == "ready"
     assert n("cached_and_triggered")["state"] == "running"
@@ -323,6 +323,50 @@ def test_vlm_vague_risk_excluded(monkeypatch):
          "reason": "Vague", "visual_evidence": [], "evidence": [],
          "recommended_controls": [], "confidence": 0.3}
     ], "reasoner_model": "mock"}
+    scene = srv._build_scene_risks([], vlm_draft, [])
+    assert scene == []
+
+
+def test_unmatched_vlm_candidate_is_advisory_only(monkeypatch):
+    srv = _get_srv(monkeypatch)
+    vlm_draft = {"risks": [
+        {"risk_id": "vlm_unmatched", "hazard_type": "test", "risk_level": "YELLOW",
+         "severity": 2, "likelihood": 2, "risk_score": 4,
+         "approximate_region": "top-left",
+         "risk_state": "active", "reason": "Possible risk", "visual_evidence": [],
+         "recommended_controls": [], "confidence": 0.5}
+    ]}
+    scene = srv._build_scene_risks([], vlm_draft, [])
+    assert len(scene) == 1
+    assert scene[0]["candidate_only"] is True
+    assert scene[0].get("bbox") is None
+
+
+def test_unmatched_bbox_does_not_color_unrelated_track(monkeypatch):
+    srv = _get_srv(monkeypatch)
+    tracks = [{"track_id": "trk_far", "bbox": {"x": 0.8, "y": 0.8, "w": 0.1, "h": 0.1}}]
+    vlm_draft = {"risks": [
+        {"risk_id": "vlm_far", "hazard_type": "test", "risk_level": "YELLOW",
+         "severity": 2, "likelihood": 2, "risk_score": 4,
+         "bbox": {"x": 0.1, "y": 0.1, "w": 0.05, "h": 0.05},
+         "approximate_region": "left",
+         "risk_state": "active", "reason": "possible", "recommended_controls": []}
+    ]}
+    scene = srv._build_scene_risks([], vlm_draft, tracks)
+    assert len(scene) == 1
+    assert scene[0]["candidate_only"] is True
+    assert scene[0].get("bbox") is None
+
+
+def test_stale_unmatched_candidate_dropped(monkeypatch):
+    srv = _get_srv(monkeypatch)
+    vlm_draft = {"_cached_at_ms": 1, "risks": [
+        {"risk_id": "vlm_old", "hazard_type": "test", "risk_level": "YELLOW",
+         "severity": 2, "likelihood": 2, "risk_score": 4,
+         "approximate_region": "left", "risk_state": "active",
+         "reason": "old", "recommended_controls": [], "confidence": 0.5}
+    ]}
+    monkeypatch.setenv("REASONER_UNMATCHED_CANDIDATE_TTL_MS", "1")
     scene = srv._build_scene_risks([], vlm_draft, [])
     assert scene == []
 
@@ -546,10 +590,10 @@ def test_all_standard_states_map_cleanly(monkeypatch):
     """Every internal raw status maps to one of the documented app-facing states."""
     srv = _get_srv(monkeypatch)
     n = srv._normalize_reasoner_status
-    allowed = {"ready", "running", "queued", "unavailable", "timeout",
+    allowed = {"ready", "running", "queued", "queued_latest", "throttled", "unavailable", "timeout",
                "disabled", "rules_only", "error"}
     raw_inputs = ["disabled", "not_triggered", "throttled", "triggered",
-                  "cached", "cached_and_triggered", "error", "timeout",
+                  "cached", "cached_and_triggered", "queued_latest", "error", "timeout",
                   "unavailable", "ok"]
     for raw in raw_inputs:
         result = n(raw)
@@ -597,4 +641,4 @@ def test_queued_vlm_status():
     """Queued state is correctly normalized."""
     from server import _normalize_reasoner_status
     s = _normalize_reasoner_status("throttled")
-    assert s["state"] == "queued"
+    assert s["state"] == "throttled"

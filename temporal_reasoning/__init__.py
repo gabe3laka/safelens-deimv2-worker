@@ -33,7 +33,7 @@ _LEVEL_NAME = {v: k for k, v in _LEVEL.items()}
 
 
 def _result_stale_ms() -> int:
-    return _int_env("REASONER_RESULT_STALE_MS", 12000)
+    return _int_env("REASONER_RESULT_STALE_MS", 8000)
 
 
 def _camera_id(payload: Dict[str, Any], session_id: Optional[str]) -> Optional[str]:
@@ -109,8 +109,14 @@ def attach_temporal(resp_dict: Dict[str, Any], *, session_id: Optional[str] = No
         state = snap.get("pending_reasoner_state", "idle")
         if trigger_status == "disabled":
             state = "disabled"
-        elif trigger_status in ("triggered", "queued") and state in ("idle", "ready"):
+        elif trigger_status in ("triggered", "queued", "queued_latest") and state in ("idle", "ready"):
             state = "queued"
+        elif trigger_status == "queued_latest":
+            state = "queued_latest"
+        elif trigger_status == "throttled" and state in ("idle",):
+            state = "throttled"
+        elif trigger_status == "running":
+            state = "running"
         resp_dict["reasoner_status"] = {
             "enabled": _vlm_enabled(),
             "mode": _vlm_mode(),
@@ -118,6 +124,7 @@ def attach_temporal(resp_dict: Dict[str, Any], *, session_id: Optional[str] = No
             "last_trigger": snap.get("last_trigger"),
             "result_age_ms": result_age,
             "stale": bool(result_age is not None and result_age > _result_stale_ms()),
+            "run_status": trigger_status,
         }
         return resp_dict
     except Exception as exc:  # noqa: BLE001 -- temporal must never break /detect
