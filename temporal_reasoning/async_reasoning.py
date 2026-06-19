@@ -175,7 +175,7 @@ def _run_job(sid: str, ctx: Dict[str, Any]) -> None:
             should_submit_pending = False
             pending_ctx: Dict[str, Any] = {}
             if pending:
-                age = _now_ms() - int(pending.get("queued_ms", 0))
+                age = _now_ms() - int(pending.get("queued_ms", _now_ms()))
                 if age <= _pending_frame_max_age_ms() and len(_INFLIGHT) < _max_async_jobs():
                     _INFLIGHT.add(sid)
                     _LAST_TRIGGER_MS[sid] = _now_ms()

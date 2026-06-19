@@ -579,6 +579,7 @@ def _build_adapter(m: str) -> Dict[str, Any]:
             model_id,
             cache_dir=cache_dir,
             trust_remote_code=True,
+            # Qwen2.5-VL uses 28x28 visual patches; token limits are translated to pixels.
             min_pixels=_visual_pixels("QWEN_VL_MIN_VISUAL_TOKENS", 256),
             max_pixels=_visual_pixels("QWEN_VL_MAX_VISUAL_TOKENS", 768),
         )

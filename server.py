@@ -891,7 +891,7 @@ def _build_scene_risks(
         except (TypeError, ValueError):
             center_max = 0.20
         try:
-            cache_ts = int(vlm_draft.get("_cached_at_ms", now_ms) or now_ms)
+            cache_ts = int(vlm_draft.get("_cached_at_ms", now_ms))
         except (TypeError, ValueError):
             cache_ts = now_ms
         cache_age = max(0, now_ms - cache_ts)
