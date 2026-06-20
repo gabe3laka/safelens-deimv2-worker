@@ -90,6 +90,18 @@ def _cache_ttl_ms() -> int:
         return 10000
 
 
+def _failure_cooldown_ms() -> int:
+    """How long a terminal failure (json_parse_error/schema_error/timeout/error)
+    suppresses new Qwen jobs, independent of the (often short) result cache TTL.
+    Stops heartbeat frames from re-running Qwen every few seconds after a failure.
+    """
+    try:
+        cd = int(os.getenv("REASONER_FAILURE_COOLDOWN_MS", "30000"))
+    except (TypeError, ValueError):
+        cd = 30000
+    return max(_cache_ttl_ms(), cd)
+
+
 def _max_sessions() -> int:
     try:
         return int(os.getenv("REASONER_MAX_SESSIONS", "64"))
@@ -211,7 +223,10 @@ def _executor() -> ThreadPoolExecutor:
 
 
 def _sweep(now_ms: int) -> None:
-    ttl = max(_cache_ttl_ms(), _min_interval_ms()) * 4
+    # Keep entries at least long enough for the terminal-failure cooldown so the
+    # backoff in maybe_trigger can still see a recent failure.
+    ttl = max(max(_cache_ttl_ms(), _min_interval_ms()) * 4,
+              _failure_cooldown_ms() + _min_interval_ms())
     for sid in [s for s, v in list(_CACHE.items()) if now_ms - v.get("ts", now_ms) > ttl]:
         _CACHE.pop(sid, None)
         _LAST_RUN_MS.pop(sid, None)
@@ -272,6 +287,18 @@ def maybe_trigger(session_id: Optional[str], *, frame_b64: Optional[str],
             draft["_cached_at_ms"] = entry["ts"]
             draft["_cache_age_ms"] = now - entry["ts"]
         cached_status = _cached_reasoner_status(draft)
+        # Terminal-failure backoff (Fix 5): after a parse/schema/timeout/error
+        # result, suppress new Qwen jobs for the failure cooldown even once the
+        # result cache TTL has lapsed -- heartbeat frames must not re-run Qwen
+        # every few seconds. An explicit force_reason retry bypasses this.
+        if entry and not force_reason:
+            entry_status = _cached_reasoner_status(dict(entry["response"]))
+            if (_is_terminal_failure_status(entry_status)
+                    and (now - entry["ts"]) <= _failure_cooldown_ms()):
+                fail_draft = dict(entry["response"])
+                fail_draft["_cached_at_ms"] = entry["ts"]
+                fail_draft["_cache_age_ms"] = now - entry["ts"]
+                return fail_draft, entry_status
         if not should:
             return draft, (cached_status if draft else "not_triggered")
         if draft and _is_terminal_failure_status(cached_status) and not force_reason:
@@ -319,38 +346,52 @@ def _cache_terminal_response(sid: str, resp: Dict[str, Any]) -> None:
 
 
 def _run_and_cache(sid: str, req: Dict[str, Any]) -> None:
-    log.info("qwen_job_started", extra={"session_id": sid, "frame_id": req.get("frame_id")})
+    log.info("qwen_job_started session_id=%s frame_id=%s", sid, req.get("frame_id"))
     timeout_s = max(0.05, _timeout_ms() / 1000.0)
+    # One terminal result per job: whichever of {completion, timeout, error}
+    # happens first wins; a late repair from an abandoned worker is ignored (Fix 6).
+    cancel = threading.Event()
+    stored = {"done": False}
+
+    def _store_once(resp: Dict[str, Any]) -> None:
+        with _LOCK:
+            if stored["done"]:
+                return
+            stored["done"] = True
+        _cache_terminal_response(sid, resp)
+        log.info("qwen_result_stored session_id=%s frame_id=%s reasoner_status=%s",
+                 sid, req.get("frame_id"), resp.get("reasoner_status"))
+
+    job_req = dict(req)
+    job_req["_cancel_event"] = cancel
     try:
-        # Use a one-shot worker so the background /detect orchestration can impose
-        # the same hard deadline as /reason without blocking the bounded trigger pool.
+        # One-shot worker so the background /detect orchestration can impose the
+        # same hard deadline as /reason without blocking the bounded trigger pool.
         ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vlm-reason-timeout")
-        fut = ex.submit(reason_sync, req)
+        fut = ex.submit(reason_sync, job_req)
         try:
             resp = fut.result(timeout=timeout_s)
+            _store_once(resp)
         except FutureTimeout:
-            log.warning("qwen_timeout", extra={"session_id": sid, "frame_id": req.get("frame_id")})
+            cancel.set()  # tell the orphaned worker to skip the repair pass
+            log.warning("qwen_timeout session_id=%s frame_id=%s", sid, req.get("frame_id"))
             resp = ReasonResponse(
                 reasoner_status="timeout", reasoner_model=_model_id(),
                 session_id=sid, frame_id=req.get("frame_id"),
                 error=f"timeout after {timeout_s}s",
             ).enforce_draft_contract().model_dump()
+            _store_once(resp)
             fut.cancel()
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
-        _cache_terminal_response(sid, resp)
-        log.info("qwen_result_stored", extra={
-            "session_id": sid, "frame_id": req.get("frame_id"),
-            "reasoner_status": resp.get("reasoner_status"),
-        })
     except Exception as exc:  # noqa: BLE001 -- background must never crash the worker
-        log.warning("qwen_error", extra={"session_id": sid, "frame_id": req.get("frame_id")}, exc_info=True)
+        log.warning("qwen_error session_id=%s frame_id=%s: %s", sid, req.get("frame_id"), exc)
         resp = ReasonResponse(
             reasoner_status="error", reasoner_model=_model_id(),
             session_id=sid, frame_id=req.get("frame_id"),
             error=f"{type(exc).__name__}: {exc}",
         ).enforce_draft_contract().model_dump()
-        _cache_terminal_response(sid, resp)
+        _store_once(resp)
     finally:
         with _LOCK:
             _INFLIGHT.discard(sid)
@@ -365,6 +406,12 @@ def reason_sync(payload: Any) -> Dict[str, Any]:
     the background trigger and (via to_thread) by reason_async / POST /reason.
     """
     t0 = time.perf_counter()
+    # A background job may pass a cancel Event (out-of-band, not a schema field)
+    # so a fired deadline can skip the repair pass (Fix 6).
+    cancel_event = None
+    if isinstance(payload, dict):
+        cancel_event = payload.get("_cancel_event")
+        payload = {k: v for k, v in payload.items() if k != "_cancel_event"}
     req = payload if isinstance(payload, ReasonRequest) else ReasonRequest(**(payload or {}))
     base = dict(reasoner_model=_model_id(), request_id=req.request_id,
                 session_id=req.session_id, frame_id=req.frame_id)
@@ -377,7 +424,7 @@ def reason_sync(payload: Any) -> Dict[str, Any]:
         if m == "mock":
             resp = _mock_reason(req)
         elif m in ("qwen_vl", "deepseek_vl2"):
-            resp = _model_reason(req, m)
+            resp = _model_reason(req, m, cancel_event=cancel_event)
         else:
             resp = ReasonResponse(reasoner_status="unavailable",
                                   error=f"unknown REASONER_MODE={m}")
@@ -456,7 +503,54 @@ def _mock_reason(req: ReasonRequest) -> ReasonResponse:
 _ADAPTER_STATE: Dict[str, Any] = {}  # mode -> {"loaded": bool, "error": str, model/proc}
 
 
-def _model_reason(req: ReasonRequest, m: str) -> ReasonResponse:
+# Detector-owned keys the VLM must NOT emit (YOLO owns boxes/ids/confidence).
+# Dropped from both the top level and every risk object before validation.
+_FORBIDDEN_REASON_KEYS = frozenset({
+    "entities", "bbox", "class_id", "confidence", "detections", "objects",
+    "track_id", "track_ids", "detection_id", "detection_ids", "boxes", "class",
+})
+# Risk fields the VLM is allowed to contribute (everything else is dropped).
+_ALLOWED_RISK_KEYS = (
+    "hazard_type", "risk_level", "risk_state", "reason", "risk_reason",
+    "recommended_action", "visual_evidence", "evidence", "trigger_condition",
+    "approximate_region", "involved_track_ids", "linked_entity_id", "risk_id",
+)
+
+
+def _sanitize_reason_data(data: Any) -> Dict[str, Any]:
+    """Normalize parsed model JSON into exactly {scene_summary, risks, uncertain_items}.
+
+    Drops detector-owned keys (entities/bbox/class_id/confidence/...) so a model
+    that ignored the schema and copied the detector list collapses to a safe,
+    valid result instead of a parse error. Risks are capped at 2 and each gets a
+    risk_id. A dict with only forbidden/unknown keys becomes safe-empty success.
+    """
+    if not isinstance(data, dict):
+        return {"scene_summary": "", "risks": [], "uncertain_items": []}
+    summary = data.get("scene_summary")
+    summary = summary if isinstance(summary, str) else ""
+    risks: List[Dict[str, Any]] = []
+    raw_risks = data.get("risks")
+    if isinstance(raw_risks, list):
+        for i, item in enumerate(raw_risks):
+            if not isinstance(item, dict):
+                continue
+            clean = {k: v for k, v in item.items()
+                     if k in _ALLOWED_RISK_KEYS and k not in _FORBIDDEN_REASON_KEYS}
+            if not clean:
+                continue
+            clean.setdefault("risk_id", f"qwen_{i + 1}")
+            risks.append(clean)
+            if len(risks) >= 2:
+                break
+    uncertain_raw = data.get("uncertain_items")
+    uncertain = ([str(u) for u in uncertain_raw][:5]
+                 if isinstance(uncertain_raw, list) else [])
+    return {"scene_summary": summary, "risks": risks, "uncertain_items": uncertain}
+
+
+def _model_reason(req: ReasonRequest, m: str, *,
+                  cancel_event: Optional["threading.Event"] = None) -> ReasonResponse:
     adapter = _get_adapter(m)
     if not adapter["available"]:
         return ReasonResponse(reasoner_status="unavailable",
@@ -478,6 +572,12 @@ def _model_reason(req: ReasonRequest, m: str) -> ReasonResponse:
             "qwen_json_parse_failed session_id=%s frame_id=%s qwen_raw_output_excerpt=%r",
             req.session_id, req.frame_id, excerpt,
         )
+        # If a hard deadline already fired for this job, skip the (expensive)
+        # repair generate -- its output would be discarded anyway (Fix 6).
+        if cancel_event is not None and cancel_event.is_set():
+            return ReasonResponse(reasoner_status="timeout",
+                                  error="cancelled before repair",
+                                  scene_summary="", risks=[], uncertain_items=[])
         repair_raw = None
         try:
             log.info("qwen_json_repair_started session_id=%s frame_id=%s",
@@ -504,14 +604,25 @@ def _model_reason(req: ReasonRequest, m: str) -> ReasonResponse:
             return ReasonResponse(reasoner_status="json_parse_error",
                                   error="model did not return valid JSON",
                                   scene_summary="", risks=[], uncertain_items=[])
+    # Parsed JSON exists. Sanitize it down to the small schema, dropping any
+    # detector-owned keys the model wrongly emitted -> safe empty is still a
+    # success (reasoner_status="ok"), never unavailable (Fix 3 + Fix 4).
+    clean = _sanitize_reason_data(data)
     try:
-        resp = ReasonResponse(**{k: v for k, v in data.items()
-                                 if k in ReasonResponse.model_fields})
-        resp.reasoner_status = "ok"
+        resp = ReasonResponse(
+            reasoner_status="ok",
+            scene_summary=clean["scene_summary"],
+            risks=[VlmRisk(**r) for r in clean["risks"]],
+            uncertain_items=clean["uncertain_items"],
+        )
         return resp
-    except Exception as exc:  # noqa: BLE001
-        log.warning("qwen_schema_failed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
-        return ReasonResponse(reasoner_status="schema_error", error=f"schema: {exc}")
+    except Exception as exc:  # noqa: BLE001 -- sanitized data should always validate
+        log.warning("qwen_schema_failed session_id=%s frame_id=%s: %s",
+                    req.session_id, req.frame_id, exc)
+        # Degrade to safe-empty success rather than a hard error: the model did
+        # return JSON, it just had nothing usable.
+        return ReasonResponse(reasoner_status="ok", scene_summary=clean["scene_summary"],
+                              risks=[], uncertain_items=clean["uncertain_items"])
 
 
 def _decode_blurred(req: ReasonRequest):
@@ -534,44 +645,64 @@ def _decode_blurred(req: ReasonRequest):
         return None
 
 
+def _compact_scene_hint(req: ReasonRequest) -> str:
+    """A tiny, safe scene hint for the VLM.
+
+    Object LABELS and the highest deterministic risk level only -- never bbox
+    coordinates, class_ids, confidence numbers or track ids (YOLO owns those).
+    Feeding the raw detector dump is what made the 3B model echo entity/bbox
+    data back and overflow its token budget.
+    """
+    labels: List[str] = []
+    seen = set()
+    for e in req.entities:
+        lbl = str(e.get("label") or "").strip()
+        if lbl and lbl not in seen:
+            seen.add(lbl)
+            labels.append(lbl)
+        if len(labels) >= 12:
+            break
+    highest = "GREEN"
+    for dr in req.deterministic_risks:
+        lvl = str(dr.get("risk_level", "GREEN")).upper()
+        if _LEVEL.get(lvl, 0) > _LEVEL.get(highest, 0):
+            highest = lvl
+    objs = ", ".join(labels) if labels else "none"
+    return f"Detected objects: {objs}.\nHighest deterministic risk: {highest}."
+
+
 def _build_prompt(req: ReasonRequest) -> str:
-    context = {
-        "deterministic_risks": req.deterministic_risks[:10],
-        "entities": req.entities[:20],
-        "tracks": req.tracks[:20],
-        "scene_graph": {"relations": (req.scene_graph or {}).get("relations", [])[:20]},
-    }
-    schema_hint = {
-        "scene_summary": "Short visible scene description.",
-        "risks": [
-            {
-                "risk_id": "qwen_1",
-                "hazard_type": "object_near_edge",
-                "risk_level": "YELLOW",
-                "risk_state": "active",
-                "linked_entity_id": "track_1",
-                "involved_track_ids": ["track_1"],
-                "involved_detection_ids": [],
-                "bbox": None,
-                "reason": "The object appears close to an edge.",
-                "visual_evidence": ["object near edge"],
-                "recommended_action": "Move the object away from the edge.",
-                "confidence": 0.7,
-            }
-        ],
-        "uncertain_items": [],
-    }
+    # Ultra-minimal schema. Qwen must NEVER echo detector entities/bbox/class_id/
+    # confidence (YOLO owns those) -- it only summarizes visible scene risk.
     return (
-        "Return JSON only. No markdown. No prose. No code fences. "
-        "If uncertain, return an empty risks array. At most 3 risks. "
-        "Every risk must link to detector evidence using linked_entity_id, "
-        "involved_track_ids, involved_detection_ids, bbox, or approximate_region. "
-        "Do not invent risks; risks: [] is a successful answer. "
-        "Do not set should_alert or requires_human_review. "
-        "Use this small schema shape exactly; omit fields you cannot support.\n"
-        f"Target JSON example: {json.dumps(schema_hint, separators=(',', ':'))}\n"
-        "Detector/tracker context:\n"
-        + json.dumps(context, default=str, separators=(",", ":"))[:4000]
+        "You are an HSE scene reasoner.\n\n"
+        "Return valid minified JSON only.\n"
+        "No markdown.\n"
+        "No prose.\n"
+        "No code fences.\n\n"
+        "Do NOT output detector entities.\n"
+        "Do NOT output bbox coordinates.\n"
+        "Do NOT output class_id.\n"
+        "Do NOT output confidence values.\n"
+        "Do NOT copy the detector list.\n\n"
+        "YOLO already provides boxes and object IDs. Your job is only to "
+        "summarize visible scene risk.\n\n"
+        'Required JSON:\n{"scene_summary":"","risks":[],"uncertain_items":[]}\n\n'
+        "Rules:\n"
+        '- "scene_summary" must be one short sentence.\n'
+        '- "risks" must contain at most 2 items.\n'
+        '- If no clear visible risk exists, use "risks":[].\n'
+        '- If risk evidence is weak or uncertain, use "risks":[] and explain in "uncertain_items".\n'
+        "- Each risk must be visually supported by the current frame.\n"
+        "- Do not invent hazards.\n"
+        "- Do not mention raw detector data.\n"
+        '- Do not include any key named "entities", "bbox", "class_id", or "confidence".\n\n'
+        "Allowed risk object:\n"
+        '{"hazard_type":"object_near_edge|slip_trip|blocked_path|falling_object|'
+        'ppe_missing|unsafe_interaction|other","risk_level":"YELLOW|ORANGE|RED",'
+        '"reason":"","recommended_action":"","visual_evidence":[]}\n\n'
+        + _compact_scene_hint(req) + "\n\n"
+        "Return only the JSON object."
     )
 
 
@@ -582,16 +713,20 @@ def _safe_raw_output_excerpt(raw: Any, limit: int = 800) -> str:
 
 def _build_json_repair_prompt(raw_excerpt: str) -> str:
     return (
-        "You are repairing model output for a production JSON parser.\n\n"
+        "Repair this model output into valid JSON only.\n\n"
         "Return valid minified JSON only.\n"
         "No markdown.\n"
         "No prose.\n"
         "No code fences.\n\n"
-        "Required top-level schema (valid JSON, empty values shown):\n"
+        'Required JSON:\n{"scene_summary":"","risks":[],"uncertain_items":[]}\n\n'
+        "Do NOT output detector entities.\n"
+        "Do NOT output bbox coordinates.\n"
+        "Do NOT output class_id.\n"
+        "Do NOT output confidence values.\n"
+        'Do NOT include keys named "entities", "bbox", "class_id", or "confidence".\n\n'
+        "If the raw output cannot be repaired safely, return:\n"
         '{"scene_summary":"","risks":[],"uncertain_items":[]}\n\n'
-        "If a field is missing, use a safe empty value.\n"
-        'If you cannot recover a risk, return "risks": [].\n'
-        "Repair this output into valid JSON only:\n\n"
+        "Raw output:\n"
         f"{raw_excerpt}"
     )
 

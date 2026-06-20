@@ -564,7 +564,8 @@ def test_qwen_bad_json_repair_success(monkeypatch):
     assert resp.scene_summary == "repaired"
     assert len(calls) == 2
     assert calls[1][1] is None
-    assert "Repair this output into valid JSON only" in calls[1][0]
+    assert "Repair this model output into valid JSON only" in calls[1][0]
+    assert "Do NOT output detector entities" in calls[1][0]
 
 
 def test_qwen_bad_json_repair_failure_json_parse_error(monkeypatch):
@@ -762,3 +763,209 @@ def test_detect_surfaces_json_parse_error_not_unavailable(server_mod, monkeypatc
     finally:
         with server_mod._STATE_LOCK:
             server_mod._STATE["status"] = "cold"
+
+
+# -- Fix 1/2: prompts forbid detector data and never dump bbox/confidence ------
+
+def test_main_prompt_forbids_detector_data_and_omits_raw_numbers():
+    req = vlm.ReasonRequest(
+        entities=[{"label": "chair", "class_id": 56, "confidence": 0.7753851413726807,
+                   "bbox": {"x": 0.0014784264688690503, "y": 0.0008622083114460111,
+                            "w": 0.32068837403009337, "h": 0.3328886058880016}}],
+        deterministic_risks=[{"risk_level": "YELLOW", "risk_id": "r1"}])
+    p = vlm._build_prompt(req)
+    for forbidden in ("Do NOT output detector entities", "Do NOT output bbox",
+                      "Do NOT output class_id", "Do NOT output confidence"):
+        assert forbidden in p
+    # compact hint keeps the LABEL but never the raw bbox/confidence numbers
+    assert "chair" in p
+    assert "0.7753851413726807" not in p
+    assert "0.32068837403009337" not in p
+    assert "Highest deterministic risk: YELLOW" in p
+
+
+def test_repair_prompt_forbids_detector_data():
+    rp = vlm._build_json_repair_prompt("garbage")
+    for forbidden in ("Do NOT output detector entities", "Do NOT output bbox coordinates",
+                      "Do NOT output class_id", "Do NOT output confidence values"):
+        assert forbidden in rp
+    assert vlm._extract_json(rp) == {"scene_summary": "", "risks": [], "uncertain_items": []}
+
+
+# -- Fix 3: schema sanitizer drops detector-owned keys ------------------------
+
+def test_sanitizer_drops_detector_owned_keys_and_caps_risks():
+    data = {
+        "scene_summary": "a dining area", "entities": [{"label": "chair"}],
+        "bbox": {"x": 0}, "class_id": 56, "confidence": 0.77,
+        "risks": [
+            {"hazard_type": "slip_trip", "risk_level": "YELLOW", "reason": "wet",
+             "recommended_action": "mop", "visual_evidence": ["puddle"],
+             "bbox": {"x": 0.1}, "class_id": 9, "confidence": 0.9},
+            {"hazard_type": "blocked_path", "risk_level": "ORANGE"},
+            {"hazard_type": "other", "risk_level": "RED"},
+        ],
+        "uncertain_items": ["maybe a cable"],
+    }
+    out = vlm._sanitize_reason_data(data)
+    assert set(out.keys()) == {"scene_summary", "risks", "uncertain_items"}
+    assert "entities" not in out and "bbox" not in out and "class_id" not in out
+    assert len(out["risks"]) == 2  # capped at 2
+    r0 = out["risks"][0]
+    assert "bbox" not in r0 and "class_id" not in r0 and "confidence" not in r0
+    assert r0["hazard_type"] == "slip_trip" and r0["risk_id"]  # synthesized id
+    assert out["scene_summary"] == "a dining area"
+    assert out["uncertain_items"] == ["maybe a cable"]
+
+
+def test_sanitizer_only_forbidden_keys_becomes_safe_empty():
+    out = vlm._sanitize_reason_data(
+        {"entities": [{"chair": 1}], "bbox": {"x": 0}, "class_id": 56})
+    assert out == {"scene_summary": "", "risks": [], "uncertain_items": []}
+
+
+# -- Fix 3/4: model path -- entity JSON / wrong keys become safe-empty SUCCESS --
+
+def _qwen_adapter(monkeypatch, generate):
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "qwen_vl", {"available": True, "generate": generate})
+
+
+def test_model_reason_entities_json_becomes_safe_empty_ok(monkeypatch):
+    # valid JSON but only detector entities -> sanitized to safe empty, status ok
+    _qwen_adapter(monkeypatch, lambda p, i:
+                  '{"entities":[{"label":"chair","class_id":56,"confidence":0.77,"bbox":{"x":0.1}}]}')
+    resp = vlm._model_reason(vlm.ReasonRequest(session_id="c", frame_id="f"), "qwen_vl")
+    assert resp.reasoner_status == "ok"          # NOT json_parse_error / unavailable
+    assert resp.risks == [] and resp.scene_summary == ""
+
+
+def test_model_reason_drops_qwen_bbox_and_confidence_in_risk(monkeypatch):
+    _qwen_adapter(monkeypatch, lambda p, i: (
+        '{"scene_summary":"x","risks":[{"hazard_type":"object_near_edge",'
+        '"risk_level":"YELLOW","reason":"r","bbox":{"x":0.1,"y":0.2},"confidence":0.9}],'
+        '"uncertain_items":[]}'))
+    resp = vlm._model_reason(vlm.ReasonRequest(session_id="c", frame_id="f"), "qwen_vl")
+    assert resp.reasoner_status == "ok"
+    assert len(resp.risks) == 1
+    assert resp.risks[0].hazard_type == "object_near_edge"
+    assert resp.risks[0].bbox is None          # Qwen-supplied bbox dropped
+    assert resp.risks[0].confidence == 0.5     # Qwen-supplied confidence dropped (default)
+
+
+def test_model_reason_malformed_then_repair_safe_empty_ok(monkeypatch):
+    calls = []
+    def generate(prompt, image):
+        calls.append(1)
+        if len(calls) == 1:
+            return '```json\n{\n\n and and "entities":[{"chair class_id:56 bbox:{x:0.1'  # malformed
+        return '{"scene_summary":"","risks":[],"uncertain_items":[]}'   # repair -> safe empty
+    _qwen_adapter(monkeypatch, generate)
+    resp = vlm._model_reason(vlm.ReasonRequest(session_id="c", frame_id="f"), "qwen_vl")
+    assert resp.reasoner_status == "ok"
+    assert resp.risks == []
+    assert len(calls) == 2
+
+
+def test_detect_safe_empty_reason_surfaces_ready(server_mod, monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    import vision_backend
+    import risk.vlm_reasoner as _vlm
+    monkeypatch.setenv("RISK_ENGINE_ENABLED", "true")
+    monkeypatch.setenv("TEMPORAL_REASONING_ENABLED", "false")
+    monkeypatch.setattr(vision_backend, "run_inference", lambda **kw: _fake_resp())
+    with _vlm._LOCK:
+        _vlm._CACHE["cam_empty"] = {"response": {
+            "reasoner_status": "ok", "scene_summary": "", "risks": [],
+            "uncertain_items": []}, "ts": _vlm._now_ms()}
+    with server_mod._STATE_LOCK:
+        server_mod._STATE["status"] = "ready"
+    try:
+        with TestClient(server_mod.app) as c:
+            # poll-only/heartbeat frame: read the cached safe-empty result without
+            # re-triggering, so the ok/empty draft surfaces as ready (not unavailable).
+            r = c.post("/detect", json={
+                "image_b64": _tiny_jpeg_b64(), "session_id": "cam_empty", "hse": True,
+                "reasoning_preferences": {"do_not_start_new_reasoning_job": True}})
+            assert r.status_code == 200
+            rs = r.json().get("reasoner_status")
+            assert rs.get("state") == "ready"
+            assert rs.get("state") != "unavailable"
+    finally:
+        with server_mod._STATE_LOCK:
+            server_mod._STATE["status"] = "cold"
+
+
+# -- Fix 5: terminal-failure cooldown outlives the (short) result cache TTL ----
+
+def test_terminal_failure_blocks_retrigger_after_cache_ttl(monkeypatch):
+    monkeypatch.setenv("REASONER_CACHE_TTL_MS", "50")          # short result TTL
+    monkeypatch.setenv("REASONER_FAILURE_COOLDOWN_MS", "30000")  # long failure cooldown
+    monkeypatch.setenv("REASONER_MIN_INTERVAL_MS", "1")
+    with vlm._LOCK:
+        vlm._CACHE["cam_cd"] = {
+            "response": {"reasoner_status": "json_parse_error", "risks": []},
+            "ts": vlm._now_ms() - 200}  # older than cache TTL, within cooldown
+    called = {"submit": 0}
+    class NoSubmit:
+        def submit(self, *a, **k):
+            called["submit"] += 1
+    monkeypatch.setattr(vlm, "_executor", lambda: NoSubmit())
+    draft, status = vlm.maybe_trigger(
+        "cam_cd", frame_b64=None, highest_level="ORANGE", deterministic_risks=[DET_RISK])
+    assert status == "json_parse_error"
+    assert called["submit"] == 0
+
+
+def test_force_reason_retries_within_failure_cooldown(monkeypatch):
+    monkeypatch.setenv("REASONER_CACHE_TTL_MS", "10000")
+    monkeypatch.setenv("REASONER_FAILURE_COOLDOWN_MS", "30000")
+    monkeypatch.setenv("REASONER_MIN_INTERVAL_MS", "1")
+    with vlm._LOCK:
+        vlm._CACHE["cam_fcd"] = {
+            "response": {"reasoner_status": "json_parse_error", "risks": []},
+            "ts": vlm._now_ms()}
+        vlm._LAST_RUN_MS["cam_fcd"] = 0
+    called = {"submit": 0}
+    class Submitter:
+        def submit(self, *a, **k):
+            called["submit"] += 1
+    monkeypatch.setattr(vlm, "_executor", lambda: Submitter())
+    draft, status = vlm.maybe_trigger(
+        "cam_fcd", frame_b64=None, highest_level="ORANGE",
+        deterministic_risks=[DET_RISK], force_reason=True)
+    assert status == "cached_and_triggered"
+    assert called["submit"] == 1
+
+
+# -- Fix 6: only one terminal result per job; timeout cancels the repair -------
+
+def test_timeout_and_late_completion_store_only_one_result(monkeypatch):
+    monkeypatch.setenv("REASONER_TIMEOUT_MS", "50")
+    stores = {"n": 0}
+    real_cache = vlm._cache_terminal_response
+    def counting_cache(sid, resp):
+        stores["n"] += 1
+        return real_cache(sid, resp)
+    monkeypatch.setattr(vlm, "_cache_terminal_response", counting_cache)
+    monkeypatch.setattr(vlm, "reason_sync",
+                        lambda req: (time.sleep(0.3), {"reasoner_status": "ok"})[1])
+    vlm._run_and_cache("cam_to", {"session_id": "cam_to", "frame_id": "f"})
+    cached = vlm.get_cached_draft("cam_to")
+    assert cached["reasoner_status"] == "timeout"
+    assert stores["n"] == 1   # the late completion did NOT store a second result
+
+
+def test_model_reason_skips_repair_when_cancelled(monkeypatch):
+    import threading
+    calls = []
+    def generate(prompt, image):
+        calls.append(1)
+        return "not json"
+    _qwen_adapter(monkeypatch, generate)
+    ev = threading.Event()
+    ev.set()
+    resp = vlm._model_reason(vlm.ReasonRequest(session_id="c", frame_id="f"),
+                             "qwen_vl", cancel_event=ev)
+    assert resp.reasoner_status == "timeout"
+    assert len(calls) == 1   # initial generate only -- repair pass skipped
