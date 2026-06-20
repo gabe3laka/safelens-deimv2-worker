@@ -772,6 +772,8 @@ _RAW_TO_REASONER_STATE: Dict[str, str] = {
     "completed":            "ready",
     "cached_and_triggered": "running",
     "error":                "error",
+    "schema_error":         "schema_error",
+    "json_parse_error":     "json_parse_error",
     "timeout":              "timeout",
     "unavailable":          "unavailable",
     "ok":                   "ready",
@@ -783,7 +785,7 @@ def _normalize_reasoner_status(raw: Any, model_id: Optional[str] = None,
     """Convert a raw (string or dict) reasoner status to the standard app-facing dict.
 
     Standard states: ready | running | queued | queued_latest | throttled |
-                     unavailable | timeout | disabled | rules_only | error
+                     unavailable | timeout | disabled | rules_only | error | schema_error | json_parse_error
     """
     if isinstance(raw, dict):
         state = raw.get("state") or raw.get("status") or "unavailable"
@@ -1068,7 +1070,10 @@ async def detect(payload: Dict[str, Any]):
                 if do_not_start_new_reasoning_job and not force_reason:
                     # Poll-only/cached-only live frames must not replace pending Qwen work.
                     draft = vlm.get_cached_draft(session_id)
-                    raw_status = "cached" if draft else "not_triggered"
+                    raw_status = (
+                        (draft.get("reasoner_status") if isinstance(draft, dict) else None)
+                        or ("cached" if draft else "not_triggered")
+                    )
                 else:
                     # For HSE intent, force trigger regardless of current risk level.
                     effective_level = (
@@ -1082,6 +1087,7 @@ async def detect(payload: Dict[str, Any]):
                         entities=resp_dict.get("entities", []),
                         scene_graph=resp_dict.get("scene_graph", {}),
                         tracks=resp_dict.get("tracks", []), frame_id=frame_id,
+                        force_reason=force_reason,
                     )
                 snap = vlm.status_snapshot()
                 _reasoner_diag = {

@@ -537,3 +537,99 @@ def test_detect_force_reason_still_calls_maybe_trigger(server_mod, monkeypatch):
     finally:
         with server_mod._STATE_LOCK:
             server_mod._STATE["status"] = "cold"
+
+
+def test_qwen_markdown_code_fenced_json_extracts():
+    raw = '```json\n{"scene_summary":"ok","risks":[],"uncertain_items":[]}\n```'
+    assert vlm._extract_json(raw)["scene_summary"] == "ok"
+
+
+def test_qwen_prose_plus_json_extracts():
+    raw = 'Here is the result: {"scene_summary":"ok","risks":[],"uncertain_items":[]} thanks'
+    assert vlm._extract_json(raw)["risks"] == []
+
+
+def test_qwen_bad_json_repair_success(monkeypatch):
+    calls = []
+    def generate(prompt, image):
+        calls.append((prompt, image))
+        if len(calls) == 1:
+            return 'not json at all'
+        return '{"scene_summary":"repaired","risks":[],"uncertain_items":[]}'
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "qwen_vl", {"available": True, "generate": generate})
+    resp = vlm._model_reason(vlm.ReasonRequest(session_id="cam_repair", frame_id="f1"), "qwen_vl")
+    assert resp.reasoner_status == "ok"
+    assert resp.scene_summary == "repaired"
+    assert len(calls) == 2
+    assert calls[1][1] is None
+    assert "Repair this output into valid JSON only" in calls[1][0]
+
+
+def test_qwen_bad_json_repair_failure_json_parse_error(monkeypatch):
+    def generate(prompt, image):
+        return 'still not json'
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "qwen_vl", {"available": True, "generate": generate})
+    resp = vlm._model_reason(vlm.ReasonRequest(session_id="cam_bad", frame_id="f1"), "qwen_vl")
+    assert resp.reasoner_status == "json_parse_error"
+    assert resp.error == "model did not return valid JSON"
+    assert resp.risks == []
+    assert resp.uncertain_items == []
+
+
+def test_parse_failure_statuses_are_not_mapped_to_unavailable(server_mod):
+    schema = server_mod._normalize_reasoner_status("schema_error")
+    parse = server_mod._normalize_reasoner_status("json_parse_error")
+    assert schema["state"] == "schema_error"
+    assert parse["state"] == "json_parse_error"
+    assert schema["state"] != "unavailable"
+    assert parse["state"] != "unavailable"
+
+
+def test_cached_schema_error_prevents_immediate_retrigger(monkeypatch):
+    monkeypatch.setenv("REASONER_CACHE_TTL_MS", "10000")
+    monkeypatch.setenv("REASONER_MIN_INTERVAL_MS", "1")
+    with vlm._LOCK:
+        vlm._CACHE["cam_schema"] = {"response": {"reasoner_status": "schema_error", "risks": []}, "ts": vlm._now_ms()}
+    called = {"submit": 0}
+    class NoSubmit:
+        def submit(self, *args, **kwargs):
+            called["submit"] += 1
+    monkeypatch.setattr(vlm, "_executor", lambda: NoSubmit())
+    draft, status = vlm.maybe_trigger(
+        "cam_schema", frame_b64=None, highest_level="ORANGE", deterministic_risks=[DET_RISK]
+    )
+    assert status == "schema_error"
+    assert draft["reasoner_status"] == "schema_error"
+    assert called["submit"] == 0
+
+
+def test_force_reason_can_retry_after_schema_failure(monkeypatch):
+    monkeypatch.setenv("REASONER_CACHE_TTL_MS", "10000")
+    monkeypatch.setenv("REASONER_MIN_INTERVAL_MS", "1")
+    with vlm._LOCK:
+        vlm._CACHE["cam_force_schema"] = {"response": {"reasoner_status": "schema_error", "risks": []}, "ts": vlm._now_ms()}
+        vlm._LAST_RUN_MS["cam_force_schema"] = 0
+    called = {"submit": 0}
+    class Submitter:
+        def submit(self, *args, **kwargs):
+            called["submit"] += 1
+    monkeypatch.setattr(vlm, "_executor", lambda: Submitter())
+    draft, status = vlm.maybe_trigger(
+        "cam_force_schema", frame_b64=None, highest_level="ORANGE",
+        deterministic_risks=[DET_RISK], force_reason=True,
+    )
+    assert status == "cached_and_triggered"
+    assert draft["reasoner_status"] == "schema_error"
+    assert called["submit"] == 1
+
+
+def test_background_repair_failure_stores_json_parse_error(monkeypatch):
+    monkeypatch.setattr(vlm, "reason_sync", lambda req: {
+        "reasoner_status": "json_parse_error", "error": "model did not return valid JSON",
+        "scene_summary": "", "risks": [], "uncertain_items": [],
+    })
+    vlm._run_and_cache("cam_schema_store", {"session_id": "cam_schema_store", "frame_id": "f_schema"})
+    cached = vlm.get_cached_draft("cam_schema_store")
+    assert cached["reasoner_status"] == "json_parse_error"
+    assert cached["error"] == "model did not return valid JSON"
+    assert cached["risks"] == []
