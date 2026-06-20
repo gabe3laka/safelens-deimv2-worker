@@ -368,7 +368,7 @@ worker logs diagnostics and falls back to full precision without breaking `/dete
 |-----|---------|-------|
 | `VLM_REASONER_ENABLED` | `false` | master switch for `/reason` + `/detect` trigger |
 | `REASONER_MODE` | `qwen_vl` | `qwen_vl` \| `deepseek_vl2` \| `mock` |
-| `QWEN_VL_MODEL_ID` | `Qwen/Qwen2.5-VL-3B-Instruct` | live default on 24GB GPUs |
+| `QWEN_VL_MODEL_ID` | `Qwen/Qwen2.5-VL-3B-Instruct` | live default on 24GB GPUs; cache path precedence: `QWEN_VL_CACHE_DIR` → `REASONER_CACHE_DIR` |
 | `QWEN_VL_DEEP_MODEL_ID` / `QWEN_VL_DEEP_ENABLED` | `Qwen/Qwen2.5-VL-7B-Instruct` / `false` | optional offline/deep analysis only (not loaded on live `/detect`) |
 | `REASONER_TRIGGER_LEVEL` / `REASONER_MIN_INTERVAL_MS` | `YELLOW` / `1500` | live heartbeat trigger + cadence |
 | `REASONER_TIMEOUT_MS` | `2500` | hard cap; over-budget → `reasoner_status:"timeout"` |

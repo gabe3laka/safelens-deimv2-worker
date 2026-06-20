@@ -208,8 +208,11 @@ def test_visual_token_pixels_from_env(monkeypatch):
 
 
 def test_processor_receives_min_max_pixels(monkeypatch):
+    monkeypatch.setenv("REASONER_MODE", "qwen_vl")
     monkeypatch.setenv("QWEN_VL_MIN_VISUAL_TOKENS", "300")
     monkeypatch.setenv("QWEN_VL_MAX_VISUAL_TOKENS", "700")
+    monkeypatch.setenv("QWEN_VL_CACHE_DIR", "/cache/qwen")
+    monkeypatch.setenv("REASONER_CACHE_DIR", "/cache/reasoner")
     captured = {}
 
     class _NoGrad:
@@ -243,6 +246,7 @@ def test_processor_receives_min_max_pixels(monkeypatch):
         def from_pretrained(_model_id, **kwargs):
             captured["min_pixels"] = kwargs.get("min_pixels")
             captured["max_pixels"] = kwargs.get("max_pixels")
+            captured["processor_cache_dir"] = kwargs.get("cache_dir")
             return _Processor()
 
     class _Model:
@@ -251,6 +255,7 @@ def test_processor_receives_min_max_pixels(monkeypatch):
 
         @staticmethod
         def from_pretrained(*_a, **_k):
+            captured["model_cache_dir"] = _k.get("cache_dir")
             return _Model()
 
         def eval(self):
@@ -279,6 +284,23 @@ def test_processor_receives_min_max_pixels(monkeypatch):
     adapter["generate"]("prompt", None)
     assert captured["min_pixels"] == 300 * (28 * 28)
     assert captured["max_pixels"] == 700 * (28 * 28)
+    assert captured["processor_cache_dir"] == "/cache/qwen"
+    assert captured["model_cache_dir"] == "/cache/qwen"
+
+    monkeypatch.delenv("QWEN_VL_CACHE_DIR", raising=False)
+    monkeypatch.setenv("REASONER_CACHE_DIR", "/cache/reasoner-fallback")
+    captured.clear()
+    adapter = vlm._build_adapter("qwen_vl")
+    adapter["generate"]("prompt", None)
+    assert captured["processor_cache_dir"] == "/cache/reasoner-fallback"
+    assert captured["model_cache_dir"] == "/cache/reasoner-fallback"
+
+    monkeypatch.delenv("REASONER_CACHE_DIR", raising=False)
+    captured.clear()
+    adapter = vlm._build_adapter("qwen_vl")
+    adapter["generate"]("prompt", None)
+    assert captured["processor_cache_dir"] == "/runpod-volume/models/qwen-vl-3b"
+    assert captured["model_cache_dir"] == "/runpod-volume/models/qwen-vl-3b"
 
 
 def test_quantization_requested_and_available_activates(monkeypatch):
