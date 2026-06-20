@@ -565,21 +565,24 @@ def test_qwen_bad_json_repair_success(monkeypatch):
     assert "Repair this output into valid JSON only" in calls[1][0]
 
 
-def test_qwen_bad_json_repair_failure_schema_error(monkeypatch):
+def test_qwen_bad_json_repair_failure_json_parse_error(monkeypatch):
     def generate(prompt, image):
         return 'still not json'
     monkeypatch.setitem(vlm._ADAPTER_STATE, "qwen_vl", {"available": True, "generate": generate})
     resp = vlm._model_reason(vlm.ReasonRequest(session_id="cam_bad", frame_id="f1"), "qwen_vl")
-    assert resp.reasoner_status == "schema_error"
+    assert resp.reasoner_status == "json_parse_error"
     assert resp.error == "model did not return valid JSON"
     assert resp.risks == []
     assert resp.uncertain_items == []
 
 
-def test_schema_error_is_not_mapped_to_unavailable(server_mod):
-    mapped = server_mod._normalize_reasoner_status("schema_error")
-    assert mapped["state"] == "schema_error"
-    assert mapped["state"] != "unavailable"
+def test_parse_failure_statuses_are_not_mapped_to_unavailable(server_mod):
+    schema = server_mod._normalize_reasoner_status("schema_error")
+    parse = server_mod._normalize_reasoner_status("json_parse_error")
+    assert schema["state"] == "schema_error"
+    assert parse["state"] == "json_parse_error"
+    assert schema["state"] != "unavailable"
+    assert parse["state"] != "unavailable"
 
 
 def test_cached_schema_error_prevents_immediate_retrigger(monkeypatch):
@@ -620,13 +623,13 @@ def test_force_reason_can_retry_after_schema_failure(monkeypatch):
     assert called["submit"] == 1
 
 
-def test_background_repair_failure_stores_schema_error(monkeypatch):
+def test_background_repair_failure_stores_json_parse_error(monkeypatch):
     monkeypatch.setattr(vlm, "reason_sync", lambda req: {
-        "reasoner_status": "schema_error", "error": "model did not return valid JSON",
+        "reasoner_status": "json_parse_error", "error": "model did not return valid JSON",
         "scene_summary": "", "risks": [], "uncertain_items": [],
     })
     vlm._run_and_cache("cam_schema_store", {"session_id": "cam_schema_store", "frame_id": "f_schema"})
     cached = vlm.get_cached_draft("cam_schema_store")
-    assert cached["reasoner_status"] == "schema_error"
+    assert cached["reasoner_status"] == "json_parse_error"
     assert cached["error"] == "model did not return valid JSON"
     assert cached["risks"] == []

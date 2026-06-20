@@ -486,14 +486,14 @@ def _model_reason(req: ReasonRequest, m: str) -> ReasonResponse:
                 "session_id": req.session_id, "frame_id": req.frame_id,
                 "qwen_raw_output_excerpt": excerpt,
             })
-            return ReasonResponse(reasoner_status="schema_error", error=f"json repair failed: {exc}",
+            return ReasonResponse(reasoner_status="json_parse_error", error=f"json repair failed: {exc}",
                                   scene_summary="")
         if data is None:
             log.warning("qwen_json_repair_failed", extra={
                 "session_id": req.session_id, "frame_id": req.frame_id,
                 "qwen_raw_output_excerpt": excerpt,
             })
-            return ReasonResponse(reasoner_status="schema_error", error="model did not return valid JSON",
+            return ReasonResponse(reasoner_status="json_parse_error", error="model did not return valid JSON",
                                   scene_summary="", risks=[], uncertain_items=[])
     try:
         resp = ReasonResponse(**{k: v for k, v in data.items()

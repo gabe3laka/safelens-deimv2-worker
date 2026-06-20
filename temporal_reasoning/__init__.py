@@ -125,7 +125,7 @@ def attach_temporal(resp_dict: Dict[str, Any], *, session_id: Optional[str] = No
         elif trigger_status == "running":
             state = "running"
         elif trigger_status in ("schema_error", "json_parse_error", "error", "timeout", "unavailable"):
-            state = "schema_error" if trigger_status == "json_parse_error" else trigger_status
+            state = trigger_status
         resp_dict["reasoner_status"] = {
             "enabled": _vlm_enabled(),
             "mode": _vlm_mode(),

@@ -773,7 +773,7 @@ _RAW_TO_REASONER_STATE: Dict[str, str] = {
     "cached_and_triggered": "running",
     "error":                "error",
     "schema_error":         "schema_error",
-    "json_parse_error":     "schema_error",
+    "json_parse_error":     "json_parse_error",
     "timeout":              "timeout",
     "unavailable":          "unavailable",
     "ok":                   "ready",
@@ -785,7 +785,7 @@ def _normalize_reasoner_status(raw: Any, model_id: Optional[str] = None,
     """Convert a raw (string or dict) reasoner status to the standard app-facing dict.
 
     Standard states: ready | running | queued | queued_latest | throttled |
-                     unavailable | timeout | disabled | rules_only | error | schema_error
+                     unavailable | timeout | disabled | rules_only | error | schema_error | json_parse_error
     """
     if isinstance(raw, dict):
         state = raw.get("state") or raw.get("status") or "unavailable"
