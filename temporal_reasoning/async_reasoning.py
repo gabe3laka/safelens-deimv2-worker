@@ -54,6 +54,13 @@ def _cache_ttl_ms() -> int:
     return max(1, _int_env("REASONER_CACHE_TTL_MS", 10000))
 
 
+def _failure_cooldown_ms() -> int:
+    """Suppress re-runs after a terminal failure for this long, independent of the
+    (often short) result cache TTL -- mirrors risk.vlm_reasoner._failure_cooldown_ms.
+    """
+    return max(_cache_ttl_ms(), _int_env("REASONER_FAILURE_COOLDOWN_MS", 30000))
+
+
 # Terminal model-output failures: do not immediately re-run after one of these.
 _TERMINAL_FAILURE_STATES = frozenset({"json_parse_error", "schema_error", "timeout", "error"})
 
@@ -228,14 +235,14 @@ def maybe_trigger(session_id: Optional[str], *, reasons: List[str],
     now = _now_ms()
     force_reason = bool((payload or {}).get("reasoning_preferences", {}).get("force_reason"))
     # Don't re-run immediately after a recent terminal failure (bad JSON / schema /
-    # timeout): surface the cached terminal status until it ages out of the cache
-    # TTL, unless a manual force_reason retry is requested.
+    # timeout): surface the cached terminal status until the failure cooldown
+    # elapses, unless a manual force_reason retry is requested.
     if not force_reason:
         snap = mem.snapshot(sid)
         cached_state = snap.get("pending_reasoner_state")
         age = snap.get("pending_reasoner_state_age_ms")
         if (cached_state in _TERMINAL_FAILURE_STATES
-                and age is not None and age < _cache_ttl_ms()):
+                and age is not None and age < _failure_cooldown_ms()):
             return cached_state
     ctx = {"entities": entities, "tracks": tracks, "frame_b64": frame_b64,
            "payload": payload or {}, "reasons": reasons}
