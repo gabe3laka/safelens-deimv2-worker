@@ -35,7 +35,7 @@ import logging
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import controls, privacy
@@ -292,14 +292,45 @@ def maybe_trigger(session_id: Optional[str], *, frame_b64: Optional[str],
     return draft, ("cached_and_triggered" if draft else "triggered")
 
 
+def _cache_terminal_response(sid: str, resp: Dict[str, Any]) -> None:
+    with _LOCK:
+        _CACHE[sid] = {"response": resp, "ts": _now_ms()}
+        _LAST_STATUS.update(status=resp.get("reasoner_status", "ok"), ts=_now_ms())
+
+
 def _run_and_cache(sid: str, req: Dict[str, Any]) -> None:
+    log.info("qwen_job_started", extra={"session_id": sid, "frame_id": req.get("frame_id")})
+    timeout_s = max(0.05, _timeout_ms() / 1000.0)
     try:
-        resp = reason_sync(req)
-        with _LOCK:
-            _CACHE[sid] = {"response": resp, "ts": _now_ms()}
-            _LAST_STATUS.update(status=resp.get("reasoner_status", "ok"), ts=_now_ms())
+        # Use a one-shot worker so the background /detect orchestration can impose
+        # the same hard deadline as /reason without blocking the bounded trigger pool.
+        ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vlm-reason-timeout")
+        fut = ex.submit(reason_sync, req)
+        try:
+            resp = fut.result(timeout=timeout_s)
+        except FutureTimeout:
+            log.warning("qwen_timeout", extra={"session_id": sid, "frame_id": req.get("frame_id")})
+            resp = ReasonResponse(
+                reasoner_status="timeout", reasoner_model=_model_id(),
+                session_id=sid, frame_id=req.get("frame_id"),
+                error=f"timeout after {timeout_s}s",
+            ).enforce_draft_contract().model_dump()
+            fut.cancel()
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+        _cache_terminal_response(sid, resp)
+        log.info("qwen_result_stored", extra={
+            "session_id": sid, "frame_id": req.get("frame_id"),
+            "reasoner_status": resp.get("reasoner_status"),
+        })
     except Exception as exc:  # noqa: BLE001 -- background must never crash the worker
-        log.warning("vlm: background reason failed: %s", exc)
+        log.warning("qwen_error", extra={"session_id": sid, "frame_id": req.get("frame_id")}, exc_info=True)
+        resp = ReasonResponse(
+            reasoner_status="error", reasoner_model=_model_id(),
+            session_id=sid, frame_id=req.get("frame_id"),
+            error=f"{type(exc).__name__}: {exc}",
+        ).enforce_draft_contract().model_dump()
+        _cache_terminal_response(sid, resp)
     finally:
         with _LOCK:
             _INFLIGHT.discard(sid)
@@ -413,11 +444,14 @@ def _model_reason(req: ReasonRequest, m: str) -> ReasonResponse:
     image = _decode_blurred(req)
     prompt = _build_prompt(req)
     try:
+        log.info("qwen_generate_started", extra={"session_id": req.session_id, "frame_id": req.frame_id})
         raw = adapter["generate"](prompt, image)
+        log.info("qwen_generate_completed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
     except Exception as exc:  # noqa: BLE001
         return ReasonResponse(reasoner_status="error", error=f"generate: {exc}")
     data = _extract_json(raw)
     if data is None:
+        log.warning("qwen_json_parse_failed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
         return ReasonResponse(reasoner_status="error", error="model did not return valid JSON",
                               scene_summary="")
     try:
@@ -426,6 +460,7 @@ def _model_reason(req: ReasonRequest, m: str) -> ReasonResponse:
         resp.reasoner_status = "ok"
         return resp
     except Exception as exc:  # noqa: BLE001
+        log.warning("qwen_schema_failed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
         return ReasonResponse(reasoner_status="error", error=f"schema: {exc}")
 
 
@@ -600,7 +635,9 @@ def _build_adapter(m: str) -> Dict[str, Any]:
         import torch
         with state["lock"]:
             if state["model"] is None:
+                log.info("qwen_model_load_started", extra={"model_id": model_id})
                 state["model"], state["processor"] = _load()
+                log.info("qwen_model_loaded", extra={"model_id": model_id})
         model, processor = state["model"], state["processor"]
         content = []
         if image is not None:

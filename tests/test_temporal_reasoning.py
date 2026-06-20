@@ -353,3 +353,25 @@ def test_detect_attaches_temporal_blocks(server_mod, monkeypatch):
     finally:
         with server_mod._STATE_LOCK:
             server_mod._STATE["status"] = "cold"
+
+
+def test_poll_only_temporal_does_not_replace_pending(monkeypatch):
+    monkeypatch.setenv("REASONER_LATEST_WINS", "true")
+    sid = "cam_poll_temporal"
+    with ar._LOCK:
+        ar._INFLIGHT.add(sid)
+        ar._PENDING[sid] = {"ctx": {"frame_b64": "frame_old"}, "queued_ms": 1}
+    try:
+        out = tr.attach_temporal(
+            {"entities": [{"label": "person", "confidence": 0.9}], "highest_risk_level": "ORANGE", "risks": []},
+            session_id=sid,
+            frame_b64="frame_new",
+            payload={"reasoning_preferences": {"do_not_start_new_reasoning_job": True, "force_reason": False}},
+        )
+        assert out["entities"][0]["label"] == "person"
+        with ar._LOCK:
+            assert ar._PENDING[sid]["ctx"]["frame_b64"] == "frame_old"
+    finally:
+        with ar._LOCK:
+            ar._INFLIGHT.discard(sid)
+            ar._PENDING.pop(sid, None)

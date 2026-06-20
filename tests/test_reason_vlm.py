@@ -446,3 +446,94 @@ def test_debug_state_has_reasoner_blocks(server_mod):
         body = c.get("/debug/state").json()
         assert "reasoner" in body and "enabled" in body["reasoner"]
         assert "open_vocab_scanner" in body and "candidate_only" in body["open_vocab_scanner"]
+
+
+def test_background_qwen_timeout_stores_terminal_cache(monkeypatch):
+    monkeypatch.setenv("REASONER_TIMEOUT_MS", "50")
+    monkeypatch.setattr(vlm, "reason_sync", lambda req: (time.sleep(0.3), {"reasoner_status": "ok"})[1])
+    vlm._run_and_cache("cam_timeout", {"session_id": "cam_timeout", "frame_id": "f_timeout"})
+    cached = vlm.get_cached_draft("cam_timeout")
+    assert cached is not None
+    assert cached["reasoner_status"] == "timeout"
+
+
+def test_background_qwen_exception_stores_terminal_cache(monkeypatch):
+    def boom(req):
+        raise RuntimeError("qwen boom")
+    monkeypatch.setattr(vlm, "reason_sync", boom)
+    vlm._run_and_cache("cam_error", {"session_id": "cam_error", "frame_id": "f_error"})
+    cached = vlm.get_cached_draft("cam_error")
+    assert cached is not None
+    assert cached["reasoner_status"] == "error"
+    assert "qwen boom" in cached.get("error", "")
+
+
+def test_background_qwen_success_stores_ready_cache(monkeypatch):
+    monkeypatch.setattr(vlm, "reason_sync", lambda req: {"reasoner_status": "ok", "session_id": req["session_id"]})
+    vlm._run_and_cache("cam_ok", {"session_id": "cam_ok", "frame_id": "f_ok"})
+    cached = vlm.get_cached_draft("cam_ok")
+    assert cached is not None
+    assert cached["reasoner_status"] == "ok"
+
+
+def test_detect_poll_only_does_not_call_maybe_trigger(server_mod, monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    import vision_backend
+    import risk.vlm_reasoner as _vlm
+    monkeypatch.setenv("RISK_ENGINE_ENABLED", "true")
+    monkeypatch.setattr(vision_backend, "run_inference", lambda **kw: _fake_resp())
+    monkeypatch.setattr(_vlm, "get_cached_draft", lambda sid: {"reasoner_status": "ok", "risks": []})
+    def fail(*args, **kwargs):
+        raise AssertionError("maybe_trigger should not be called for poll-only")
+    monkeypatch.setattr(_vlm, "maybe_trigger", fail)
+    with server_mod._STATE_LOCK:
+        server_mod._STATE["status"] = "ready"
+    try:
+        with TestClient(server_mod.app) as c:
+            r = c.post("/detect", json={
+                "image_b64": _tiny_jpeg_b64(),
+                "session_id": "cam_poll",
+                "reasoning_preferences": {
+                    "do_not_start_new_reasoning_job": True,
+                    "force_reason": False,
+                    "return_reasoner_status": True,
+                },
+            })
+            assert r.status_code == 200
+            assert r.json()["reasoner_status"]["state"] == "ready"
+    finally:
+        with server_mod._STATE_LOCK:
+            server_mod._STATE["status"] = "cold"
+
+
+def test_detect_force_reason_still_calls_maybe_trigger(server_mod, monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    import vision_backend
+    import risk.vlm_reasoner as _vlm
+    calls = {"n": 0}
+    monkeypatch.setenv("RISK_ENGINE_ENABLED", "true")
+    monkeypatch.setattr(vision_backend, "run_inference", lambda **kw: _fake_resp())
+    def called(*args, **kwargs):
+        calls["n"] += 1
+        return None, "triggered"
+    monkeypatch.setattr(_vlm, "maybe_trigger", called)
+    with server_mod._STATE_LOCK:
+        server_mod._STATE["status"] = "ready"
+    try:
+        with TestClient(server_mod.app) as c:
+            r = c.post("/detect", json={
+                "image_b64": _tiny_jpeg_b64(),
+                "session_id": "cam_force",
+                "reasoning_preferences": {
+                    "do_not_start_new_reasoning_job": True,
+                    "force_reason": True,
+                    "return_reasoner_status": True,
+                },
+            })
+            assert r.status_code == 200
+            assert calls["n"] == 1
+    finally:
+        with server_mod._STATE_LOCK:
+            server_mod._STATE["status"] = "cold"
