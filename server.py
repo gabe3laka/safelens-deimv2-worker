@@ -769,6 +769,7 @@ _RAW_TO_REASONER_STATE: Dict[str, str] = {
     "queued":               "queued",
     "queued_latest":        "queued_latest",
     "cached":               "ready",
+    "completed":            "ready",
     "cached_and_triggered": "running",
     "error":                "error",
     "timeout":              "timeout",
@@ -1061,19 +1062,27 @@ async def detect(payload: Dict[str, Any]):
         try:
             import risk.vlm_reasoner as vlm
             if vlm.enabled() and (resp_dict.get("schema_version") or _hse):
-                # For HSE intent, force trigger regardless of current risk level.
-                effective_level = (
-                    vlm.trigger_level() if _hse
-                    else resp_dict.get("highest_risk_level", "GREEN")
-                )
-                draft, raw_status = vlm.maybe_trigger(
-                    session_id, frame_b64=frame_b64,
-                    highest_level=effective_level,
-                    deterministic_risks=resp_dict.get("risks", []),
-                    entities=resp_dict.get("entities", []),
-                    scene_graph=resp_dict.get("scene_graph", {}),
-                    tracks=resp_dict.get("tracks", []), frame_id=frame_id,
-                )
+                prefs = payload.get("reasoning_preferences") or {}
+                do_not_start_new_reasoning_job = prefs.get("do_not_start_new_reasoning_job") is True
+                force_reason = prefs.get("force_reason") is True
+                if do_not_start_new_reasoning_job and not force_reason:
+                    # Poll-only/cached-only live frames must not replace pending Qwen work.
+                    draft = vlm.get_cached_draft(session_id)
+                    raw_status = "cached" if draft else "not_triggered"
+                else:
+                    # For HSE intent, force trigger regardless of current risk level.
+                    effective_level = (
+                        vlm.trigger_level() if (_hse or force_reason)
+                        else resp_dict.get("highest_risk_level", "GREEN")
+                    )
+                    draft, raw_status = vlm.maybe_trigger(
+                        session_id, frame_b64=frame_b64,
+                        highest_level=effective_level,
+                        deterministic_risks=resp_dict.get("risks", []),
+                        entities=resp_dict.get("entities", []),
+                        scene_graph=resp_dict.get("scene_graph", {}),
+                        tracks=resp_dict.get("tracks", []), frame_id=frame_id,
+                    )
                 snap = vlm.status_snapshot()
                 _reasoner_diag = {
                     "model_id": snap.get("model_id"),

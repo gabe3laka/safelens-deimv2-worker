@@ -82,10 +82,17 @@ def attach_temporal(resp_dict: Dict[str, Any], *, session_id: Optional[str] = No
             session_id, entities=entities, tracks=tracks, highest_level=highest_level,
             deterministic_risks=deterministic_risks, edge_risks=edge_risks, payload=payload)
 
-        # 4) NON-BLOCKING: maybe submit an async reasoning job; never wait
-        trigger_status = async_reasoning.maybe_trigger(
-            session_id, reasons=reasons, entities=entities, tracks=tracks,
-            frame_b64=frame_b64, payload=payload)
+        # 4) NON-BLOCKING: maybe submit an async reasoning job; never wait.
+        # Poll-only/cached-only live frames must not replace _PENDING[sid].
+        prefs = payload.get("reasoning_preferences") or {}
+        do_not_start_new_reasoning_job = prefs.get("do_not_start_new_reasoning_job") is True
+        force_reason = prefs.get("force_reason") is True
+        if do_not_start_new_reasoning_job and not force_reason:
+            trigger_status = "not_triggered"
+        else:
+            trigger_status = async_reasoning.maybe_trigger(
+                session_id, reasons=reasons, entities=entities, tracks=tracks,
+                frame_b64=frame_b64, payload=payload)
 
         # 5) attach blocks from the most recent cached result (never blocks)
         snap = mem.snapshot(session_id)
