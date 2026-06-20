@@ -35,7 +35,7 @@ import logging
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import controls, privacy
@@ -249,12 +249,14 @@ def maybe_trigger(session_id: Optional[str], *, frame_b64: Optional[str],
                   entities: Optional[List[Dict[str, Any]]] = None,
                   scene_graph: Optional[Dict[str, Any]] = None,
                   tracks: Optional[List[Dict[str, Any]]] = None,
-                  frame_id: Optional[str] = None) -> Tuple[Optional[Dict[str, Any]], str]:
+                  frame_id: Optional[str] = None,
+                  force_reason: bool = False) -> Tuple[Optional[Dict[str, Any]], str]:
     """Maybe kick an async VLM reason; return (cached_draft_or_None, status).
 
     NEVER blocks: it submits work to a bounded executor and returns the most
     recent cached draft immediately. status is one of:
       disabled | not_triggered | throttled | triggered | cached | cached_and_triggered
+      | timeout | error | schema_error | json_parse_error
     """
     if not enabled():
         return None, "disabled"
@@ -269,11 +271,14 @@ def maybe_trigger(session_id: Optional[str], *, frame_b64: Optional[str],
             draft = dict(entry["response"])
             draft["_cached_at_ms"] = entry["ts"]
             draft["_cache_age_ms"] = now - entry["ts"]
+        cached_status = _cached_reasoner_status(draft)
         if not should:
-            return draft, ("cached" if draft else "not_triggered")
+            return draft, (cached_status if draft else "not_triggered")
+        if draft and _is_terminal_failure_status(cached_status) and not force_reason:
+            return draft, cached_status
         last = _LAST_RUN_MS.get(sid, 0)
         if sid in _INFLIGHT or (now - last) < _min_interval_ms():
-            return draft, ("cached" if draft else "throttled")
+            return draft, (cached_status if draft else "throttled")
         # trigger
         _LAST_RUN_MS[sid] = now
         _INFLIGHT.add(sid)
@@ -288,18 +293,64 @@ def maybe_trigger(session_id: Optional[str], *, frame_b64: Optional[str],
         with _LOCK:
             _INFLIGHT.discard(sid)
         log.warning("vlm: could not submit reason job: %s", exc)
-        return draft, ("cached" if draft else "error")
+        return draft, (cached_status if draft else "error")
     return draft, ("cached_and_triggered" if draft else "triggered")
 
 
+def _is_terminal_failure_status(status: Optional[str]) -> bool:
+    return status in {"schema_error", "json_parse_error", "error", "timeout"}
+
+
+def _cached_reasoner_status(draft: Optional[Dict[str, Any]]) -> str:
+    if not draft:
+        return "cached"
+    status = draft.get("reasoner_status")
+    if status in {"ok", "ready", "completed"}:
+        return "cached"
+    if isinstance(status, str) and status:
+        return status
+    return "cached"
+
+
+def _cache_terminal_response(sid: str, resp: Dict[str, Any]) -> None:
+    with _LOCK:
+        _CACHE[sid] = {"response": resp, "ts": _now_ms()}
+        _LAST_STATUS.update(status=resp.get("reasoner_status", "ok"), ts=_now_ms())
+
+
 def _run_and_cache(sid: str, req: Dict[str, Any]) -> None:
+    log.info("qwen_job_started", extra={"session_id": sid, "frame_id": req.get("frame_id")})
+    timeout_s = max(0.05, _timeout_ms() / 1000.0)
     try:
-        resp = reason_sync(req)
-        with _LOCK:
-            _CACHE[sid] = {"response": resp, "ts": _now_ms()}
-            _LAST_STATUS.update(status=resp.get("reasoner_status", "ok"), ts=_now_ms())
+        # Use a one-shot worker so the background /detect orchestration can impose
+        # the same hard deadline as /reason without blocking the bounded trigger pool.
+        ex = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vlm-reason-timeout")
+        fut = ex.submit(reason_sync, req)
+        try:
+            resp = fut.result(timeout=timeout_s)
+        except FutureTimeout:
+            log.warning("qwen_timeout", extra={"session_id": sid, "frame_id": req.get("frame_id")})
+            resp = ReasonResponse(
+                reasoner_status="timeout", reasoner_model=_model_id(),
+                session_id=sid, frame_id=req.get("frame_id"),
+                error=f"timeout after {timeout_s}s",
+            ).enforce_draft_contract().model_dump()
+            fut.cancel()
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+        _cache_terminal_response(sid, resp)
+        log.info("qwen_result_stored", extra={
+            "session_id": sid, "frame_id": req.get("frame_id"),
+            "reasoner_status": resp.get("reasoner_status"),
+        })
     except Exception as exc:  # noqa: BLE001 -- background must never crash the worker
-        log.warning("vlm: background reason failed: %s", exc)
+        log.warning("qwen_error", extra={"session_id": sid, "frame_id": req.get("frame_id")}, exc_info=True)
+        resp = ReasonResponse(
+            reasoner_status="error", reasoner_model=_model_id(),
+            session_id=sid, frame_id=req.get("frame_id"),
+            error=f"{type(exc).__name__}: {exc}",
+        ).enforce_draft_contract().model_dump()
+        _cache_terminal_response(sid, resp)
     finally:
         with _LOCK:
             _INFLIGHT.discard(sid)
@@ -413,20 +464,45 @@ def _model_reason(req: ReasonRequest, m: str) -> ReasonResponse:
     image = _decode_blurred(req)
     prompt = _build_prompt(req)
     try:
+        log.info("qwen_generate_started", extra={"session_id": req.session_id, "frame_id": req.frame_id})
         raw = adapter["generate"](prompt, image)
+        log.info("qwen_generate_completed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
     except Exception as exc:  # noqa: BLE001
         return ReasonResponse(reasoner_status="error", error=f"generate: {exc}")
     data = _extract_json(raw)
     if data is None:
-        return ReasonResponse(reasoner_status="error", error="model did not return valid JSON",
-                              scene_summary="")
+        excerpt = _safe_raw_output_excerpt(raw)
+        log.warning("qwen_json_parse_failed", extra={
+            "session_id": req.session_id, "frame_id": req.frame_id,
+            "qwen_raw_output_excerpt": excerpt,
+        })
+        try:
+            log.info("qwen_json_repair_started", extra={"session_id": req.session_id, "frame_id": req.frame_id})
+            repair_raw = adapter["generate"](_build_json_repair_prompt(excerpt), None)
+            log.info("qwen_json_repair_completed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
+            data = _extract_json(repair_raw)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("qwen_json_repair_failed", extra={
+                "session_id": req.session_id, "frame_id": req.frame_id,
+                "qwen_raw_output_excerpt": excerpt,
+            })
+            return ReasonResponse(reasoner_status="schema_error", error=f"json repair failed: {exc}",
+                                  scene_summary="")
+        if data is None:
+            log.warning("qwen_json_repair_failed", extra={
+                "session_id": req.session_id, "frame_id": req.frame_id,
+                "qwen_raw_output_excerpt": excerpt,
+            })
+            return ReasonResponse(reasoner_status="schema_error", error="model did not return valid JSON",
+                                  scene_summary="", risks=[], uncertain_items=[])
     try:
         resp = ReasonResponse(**{k: v for k, v in data.items()
                                  if k in ReasonResponse.model_fields})
         resp.reasoner_status = "ok"
         return resp
     except Exception as exc:  # noqa: BLE001
-        return ReasonResponse(reasoner_status="error", error=f"schema: {exc}")
+        log.warning("qwen_schema_failed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
+        return ReasonResponse(reasoner_status="schema_error", error=f"schema: {exc}")
 
 
 def _decode_blurred(req: ReasonRequest):
@@ -451,52 +527,63 @@ def _decode_blurred(req: ReasonRequest):
 
 def _build_prompt(req: ReasonRequest) -> str:
     context = {
-        "deterministic_risks": req.deterministic_risks,
-        "entities": req.entities[:30],
-        "tracks": req.tracks[:30],
-        "scene_graph": {"relations": (req.scene_graph or {}).get("relations", [])[:30]},
-        "known_hse_rules": req.known_hse_rules[:20],
-        "company_profile": req.company_profile,
+        "deterministic_risks": req.deterministic_risks[:10],
+        "entities": req.entities[:20],
+        "tracks": req.tracks[:20],
+        "scene_graph": {"relations": (req.scene_graph or {}).get("relations", [])[:20]},
     }
-    schema_hint = (
-        '{"scene_summary": str, "risks": [{'
-        '"risk_id": str, '
-        '"linked_entity_id": str_or_null, '
-        '"involved_track_ids": [str], '
-        '"involved_detection_ids": [int], '
-        '"bbox": {"x": float, "y": float, "w": float, "h": float}_or_null, '
-        '"approximate_region": str_or_null, '
-        '"hazard_type": str, '
-        '"risk_state": "latent|active", '
-        '"trigger_condition": str_or_null, '
-        '"risk_level": "GREEN|YELLOW|ORANGE|RED", '
-        '"severity": int, "likelihood": int, "risk_score": int, '
-        '"risk_reason": str, "reason": str, '
-        '"evidence": [str], "visual_evidence": [str], '
-        '"recommended_controls": [{"level": str, "action": str}], '
-        '"recommended_action": str, "confidence": float'
-        '}], "uncertain_items": [str]}'
-    )
+    schema_hint = {
+        "scene_summary": "Short visible scene description.",
+        "risks": [
+            {
+                "risk_id": "qwen_1",
+                "hazard_type": "object_near_edge",
+                "risk_level": "YELLOW",
+                "risk_state": "active",
+                "linked_entity_id": "track_1",
+                "involved_track_ids": ["track_1"],
+                "involved_detection_ids": [],
+                "bbox": None,
+                "reason": "The object appears close to an edge.",
+                "visual_evidence": ["object near edge"],
+                "recommended_action": "Move the object away from the edge.",
+                "confidence": 0.7,
+            }
+        ],
+        "uncertain_items": [],
+    }
     return (
-        "You are a senior QHSE manager assisting an automated safety system. "
-        "YOLO/tracking is the coordinate authority. You only provide compact advisory "
-        "JSON linked to current detector/tracker entities.\n\n"
-        "STRICT RULES:\n"
-        "1. Report ONLY risks that are visible in the CURRENT frame.\n"
-        "2. No prose, no markdown, no code fences.\n"
-        "3. Output at most 3 risks and at most 3 uncertain_items.\n"
-        "4. Keep each reason/evidence/action to one short sentence.\n"
-        "5. Do not output authoritative alert actions. All outputs are draft-only.\n"
-        "6. If unsupported/uncertain, return an empty risks list.\n"
-        "7. Keep YOLO boxes authoritative; do not invent final detector boxes.\n"
-        "8. Every risk MUST include at least one of: linked_entity_id, involved_track_ids, "
-        "involved_detection_ids, bbox, or approximate_region. Vague/unlinked risks must NOT "
-        "be emitted -- place them in uncertain_items instead.\n"
-        "9. Return an EMPTY risks list if you are uncertain about any risk.\n"
-        "10. Do NOT fabricate risks. Do NOT inherit should_alert or requires_human_review "
-        "from the deterministic engine.\n\n"
-        "Return STRICT JSON ONLY (no prose, no code fences) matching this schema:\n"
-        + schema_hint + "\nContext:\n" + json.dumps(context)[:6000]
+        "Return JSON only. No markdown. No prose. No code fences. "
+        "If uncertain, return an empty risks array. At most 3 risks. "
+        "Every risk must link to detector evidence using linked_entity_id, "
+        "involved_track_ids, involved_detection_ids, bbox, or approximate_region. "
+        "Do not invent risks; risks: [] is a successful answer. "
+        "Do not set should_alert or requires_human_review. "
+        "Use this small schema shape exactly; omit fields you cannot support.\n"
+        f"Target JSON example: {json.dumps(schema_hint, separators=(',', ':'))}\n"
+        "Detector/tracker context:\n"
+        + json.dumps(context, default=str, separators=(",", ":"))[:4000]
+    )
+
+
+def _safe_raw_output_excerpt(raw: Any, limit: int = 800) -> str:
+    text = "" if raw is None else str(raw)
+    return text[:limit].replace("\r", "\\r").replace("\n", "\\n")
+
+
+def _build_json_repair_prompt(raw_excerpt: str) -> str:
+    return (
+        "You are repairing model output for a production JSON parser.\n\n"
+        "Return valid minified JSON only.\n"
+        "No markdown.\n"
+        "No prose.\n"
+        "No code fences.\n\n"
+        "Required top-level schema:\n"
+        '{"scene_summary":string,"risks":[],"uncertain_items":[]}\n\n'
+        "If a field is missing, use a safe empty value.\n"
+        'If you cannot recover a risk, return "risks": [].\n'
+        "Repair this output into valid JSON only:\n\n"
+        f"{raw_excerpt}"
     )
 
 
@@ -600,7 +687,9 @@ def _build_adapter(m: str) -> Dict[str, Any]:
         import torch
         with state["lock"]:
             if state["model"] is None:
+                log.info("qwen_model_load_started", extra={"model_id": model_id})
                 state["model"], state["processor"] = _load()
+                log.info("qwen_model_loaded", extra={"model_id": model_id})
         model, processor = state["model"], state["processor"]
         content = []
         if image is not None:

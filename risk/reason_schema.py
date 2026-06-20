@@ -85,7 +85,7 @@ class ReasonResponse(BaseModel):
     schema_version: str = REASON_SCHEMA_VERSION
     produced_by: str = "vlm_reasoner"
     reasoner_model: Optional[str] = None
-    # ok | disabled | unavailable | timeout | error | not_triggered
+    # ok | disabled | unavailable | timeout | error | schema_error | json_parse_error | not_triggered
     reasoner_status: str = "ok"
     scene_summary: str = ""
     risks: List[VlmRisk] = Field(default_factory=list)
