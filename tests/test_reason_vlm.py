@@ -181,6 +181,134 @@ def test_reasoner_status_snapshot():
                 "timeout_ms", "active_sessions"):
         assert key in snap, key
     assert snap["mode"] == "mock"
+    assert "diagnostics" in snap
+    assert "vlm.quantization_requested" in snap["diagnostics"]
+    assert "vlm.bitsandbytes_available" in snap["diagnostics"]
+
+
+def test_live_default_model_is_qwen_3b(monkeypatch):
+    monkeypatch.delenv("QWEN_VL_MODEL_ID", raising=False)
+    monkeypatch.setenv("REASONER_MODE", "qwen_vl")
+    assert vlm._model_id() == "Qwen/Qwen2.5-VL-3B-Instruct"
+    assert "7B" not in vlm._model_id()
+
+
+def test_live_default_output_and_image_limits(monkeypatch):
+    monkeypatch.delenv("REASONER_MAX_NEW_TOKENS", raising=False)
+    monkeypatch.delenv("REASONER_MAX_IMAGE_SIDE", raising=False)
+    assert vlm._max_new_tokens() == 128
+    assert vlm._max_image_side() == 512
+
+
+def test_visual_token_pixels_from_env(monkeypatch):
+    monkeypatch.setenv("QWEN_VL_MIN_VISUAL_TOKENS", "256")
+    monkeypatch.setenv("QWEN_VL_MAX_VISUAL_TOKENS", "768")
+    assert vlm._visual_pixels("QWEN_VL_MIN_VISUAL_TOKENS", 256) == 256 * (28 * 28)
+    assert vlm._visual_pixels("QWEN_VL_MAX_VISUAL_TOKENS", 768) == 768 * (28 * 28)
+
+
+def test_processor_receives_min_max_pixels(monkeypatch):
+    monkeypatch.setenv("QWEN_VL_MIN_VISUAL_TOKENS", "300")
+    monkeypatch.setenv("QWEN_VL_MAX_VISUAL_TOKENS", "700")
+    captured = {}
+
+    class _NoGrad:
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+
+    class _Torch:
+        @staticmethod
+        def no_grad():
+            return _NoGrad()
+
+    class _Inputs(dict):
+        def to(self, _device):
+            return self
+
+    class _Ids:
+        shape = (1, 3)
+
+    class _Processor:
+        def __call__(self, **kwargs):
+            return _Inputs({"input_ids": _Ids()})
+
+        def apply_chat_template(self, *_a, **_k):
+            return "prompt"
+
+        def batch_decode(self, *_a, **_k):
+            return ["{}"]
+
+    class _AutoProcessor:
+        @staticmethod
+        def from_pretrained(_model_id, **kwargs):
+            captured["min_pixels"] = kwargs.get("min_pixels")
+            captured["max_pixels"] = kwargs.get("max_pixels")
+            return _Processor()
+
+    class _Model:
+        def __init__(self):
+            self.device = "cpu"
+
+        @staticmethod
+        def from_pretrained(*_a, **_k):
+            return _Model()
+
+        def eval(self):
+            return self
+
+        def to(self, *_a, **_k):
+            return self
+
+        def generate(self, **_kwargs):
+            class _Out:
+                def __getitem__(self, _k):
+                    return [[4]]
+            return _Out()
+
+    fake_transformers = type(
+        "T",
+        (),
+        {
+            "AutoProcessor": _AutoProcessor,
+            "Qwen2_5_VLForConditionalGeneration": _Model,
+        },
+    )
+    monkeypatch.setitem(sys.modules, "torch", _Torch())
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    adapter = vlm._build_adapter("qwen_vl")
+    adapter["generate"]("prompt", None)
+    assert captured["min_pixels"] == 300 * (28 * 28)
+    assert captured["max_pixels"] == 700 * (28 * 28)
+
+
+def test_quantization_requested_and_available_activates(monkeypatch):
+    kwargs = {}
+    diag = {
+        "vlm.quantization_requested": "4bit",
+        "vlm.bitsandbytes_available": True,
+        "vlm.quantization_active": False,
+    }
+
+    class _FakeBnb:
+        def __init__(self, **kw):
+            self.kw = kw
+
+    monkeypatch.setitem(sys.modules, "transformers", type("T", (), {"BitsAndBytesConfig": _FakeBnb}))
+    vlm._configure_quantization(kwargs, diag)
+    assert "quantization_config" in kwargs
+    assert diag["vlm.quantization_active"] is True
+
+
+def test_quantization_requested_but_unavailable_degrades(monkeypatch):
+    kwargs = {}
+    diag = {
+        "vlm.quantization_requested": "4bit",
+        "vlm.bitsandbytes_available": False,
+        "vlm.quantization_active": False,
+    }
+    vlm._configure_quantization(kwargs, diag)
+    assert "quantization_config" not in kwargs
+    assert diag["vlm.quantization_active"] is False
 
 
 # -- server integration: /reason, /scan, /detect resilience, /debug/state ------
@@ -258,7 +386,7 @@ def test_detect_triggers_reasoner_nonblocking(server_mod, monkeypatch):
             rs = body.get("reasoner_status")
             assert isinstance(rs, dict), f"expected dict, got {rs!r}"
             assert rs.get("state") in (
-                "running", "ready", "queued", "rules_only",
+                "running", "ready", "queued", "queued_latest", "throttled", "rules_only",
                 "unavailable", "disabled", "error", "timeout"), rs
             assert body["entities"][0]["label"] == "person"   # detection preserved
     finally:

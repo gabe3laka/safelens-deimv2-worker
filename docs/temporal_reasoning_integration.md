@@ -37,7 +37,9 @@ The detector/tracking/risk run every frame (cheap, deterministic). The VLM runs
 Triggers are rate-limited (`max(TEMPORAL_REASONING_TRIGGER_MIN_INTERVAL_MS,
 REASONER_MIN_INTERVAL_MS)`), one in-flight job per session, global cap
 `TEMPORAL_REASONING_MAX_ASYNC_JOBS`, and each job needs a free GPU slot
-(`gpu_vision.gpu_reasoner_slot`) or it is dropped. **No unbounded queue.**
+(`gpu_vision.gpu_reasoner_slot`) or it is dropped. With
+`REASONER_LATEST_WINS=true`, only the newest pending frame is kept per session
+while a job runs (old pending frames are replaced/dropped). **No unbounded queue.**
 
 ## Non-blocking contract
 
@@ -85,6 +87,10 @@ and vehicles are never flagged as falling objects.
     "last_trigger": "scene_mismatch", "result_age_ms": 2000, "stale": false }
 }
 ```
+
+`reasoner_status.state` vocabulary is compatible with existing clients and may be:
+`idle`, `queued`, `queued_latest`, `running`, `ready`, `cached`, `throttled`,
+`timeout`, `error`, `unavailable`, `disabled`.
 
 `object_near_edge` risks are appended to the deterministic `risks[]` list.
 

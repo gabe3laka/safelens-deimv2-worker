@@ -4,6 +4,9 @@ All knobs are env vars (set in the Dockerfile defaults; override at deploy time)
 None require a real LLM key or DB to run in mock mode. Secrets are NEVER baked
 into the image.
 
+`VLM_REASONER_ENABLED` remains `false` in the image defaults for safety. Set it
+to `true` explicitly for live RunPod heartbeat deployments.
+
 ## Temporal VLM perception (GPU side)
 
 | Env | Default | Meaning |
@@ -13,11 +16,11 @@ into the image.
 | `TEMPORAL_MEMORY_TTL_MS` | `30000` | session sub-record TTL (falls back to `SESSION_TTL_MS`) |
 | `TEMPORAL_MAX_ACTIVE_SESSIONS` | `64` | bounded active temporal sessions |
 | `TEMPORAL_STORE_KEYFRAMES` | `false` | never persist raw frames (keep false) |
-| `TEMPORAL_REASONING_TRIGGER_MIN_INTERVAL_MS` | `5000` | min interval between VLM triggers per session |
-| `TEMPORAL_REASONING_MAX_ASYNC_JOBS` | `2` | global cap on concurrent temporal reasoning jobs |
+| `TEMPORAL_REASONING_TRIGGER_MIN_INTERVAL_MS` | `1500` | min interval between VLM triggers per session |
+| `TEMPORAL_REASONING_MAX_ASYNC_JOBS` | `1` | global cap on concurrent temporal reasoning jobs |
 | `TEMPORAL_LABEL_FLIP_WINDOW_FRAMES` | `8` | window for label-instability detection |
 | `SCENE_CONTEXT_ENABLED` | `true` | enable scene-context refresh |
-| `SCENE_CONTEXT_REFRESH_MS` | `15000` | periodic scene-context refresh interval |
+| `SCENE_CONTEXT_REFRESH_MS` | `2000` | periodic scene-context refresh interval |
 | `SCENE_HINT_ENABLED` | `true` | honor `scene_hint`/`site_context` from the request |
 | `CONTEXTUAL_SUPPRESSION_ENABLED` | `true` | allow indoor suppression of vehicle FPs |
 | `SEMANTIC_CORRECTION_ENABLED` | `true` | enable perception corrections |
@@ -25,7 +28,9 @@ into the image.
 | `OBJECT_EDGE_RISK_ENABLED` | `true` | enable deterministic object-near-edge risk |
 | `OBJECT_EDGE_DISTANCE_THRESHOLD` | `0.10` | normalized near-edge distance |
 | `OBJECT_EDGE_HISTORY_FRAMES` | `6` | frames used for edge-motion |
-| `REASONER_RESULT_STALE_MS` | `12000` | age after which a cached reasoner result is `stale` |
+| `REASONER_RESULT_STALE_MS` | `8000` | age after which a cached reasoner result is `stale` |
+| `REASONER_LATEST_WINS` | `true` | newest-frame replacement queue when a job is running |
+| `REASONER_PENDING_FRAME_MAX_AGE_MS` | `2500` | drop pending frame if it is too old to run |
 | `REASONER_HUMAN_REVIEW_SCORE` | `10` | risk score at/above which escalation favours human review |
 | `GPU_REASONER_MAX_INFLIGHT` | `1` | bounded GPU reasoner slots (drop-if-busy) |
 
@@ -33,6 +38,30 @@ The temporal VLM reuses the `risk.vlm_reasoner` model knobs: `VLM_REASONER_ENABL
 (default `false`), `REASONER_MODE` (`qwen_vl`|`deepseek_vl2`|`mock`|`disabled`),
 `REASONER_MIN_INTERVAL_MS`, `REASONER_CACHE_DIR`, `PRIVACY_BLUR_ENABLED`, etc.
 (unchanged — see the Dockerfile / `docs/runbook.md`).
+
+### Live heartbeat reasoner defaults (24 GB GPU)
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `QWEN_VL_MODEL_ID` | `Qwen/Qwen2.5-VL-3B-Instruct` | live heartbeat model |
+| `QWEN_VL_DEEP_MODEL_ID` | `Qwen/Qwen2.5-VL-7B-Instruct` | optional offline/deep model only |
+| `QWEN_VL_DEEP_ENABLED` | `false` | guardrail; no live dual-model load |
+| `REASONER_MAX_IMAGE_SIDE` | `512` | pre-processor image resize cap |
+| `QWEN_VL_MIN_VISUAL_TOKENS` | `256` | processor `min_pixels=tokens*28*28` |
+| `QWEN_VL_MAX_VISUAL_TOKENS` | `768` | processor `max_pixels=tokens*28*28` (optional accuracy: `1280`) |
+| `REASONER_MAX_NEW_TOKENS` | `128` | compact heartbeat JSON budget (supports 80) |
+| `REASONER_TIMEOUT_MS` | `2500` | hard budget for async reasoner calls |
+| `REASONER_MIN_INTERVAL_MS` | `1500` | per-session trigger throttle |
+| `REASONER_CACHE_TTL_MS` | `10000` | cached draft freshness window |
+| `REASONER_TRIGGER_LEVEL` | `YELLOW` | trigger floor for live heartbeat |
+| `REASONER_MAX_WORKERS` | `1` | single-worker reasoner |
+| `REASONER_MATCH_IOU_MIN` | `0.20` | min IoU for VLM-to-detector linkage |
+| `REASONER_MATCH_CENTER_DIST_MAX` | `0.20` | max normalized center distance for linkage |
+| `REASONER_LINKED_RISK_TTL_MS` | `8000` | linked overlay freshness |
+| `REASONER_UNMATCHED_CANDIDATE_TTL_MS` | `5000` | unmatched advisory candidate freshness |
+| `REASONER_SERVE_BACKEND` | `transformers` | backend hook (`transformers` default) |
+| `QWEN_VLLM_BASE_URL` | `http://127.0.0.1:8001/v1` | future vLLM hook |
+| `QWEN_SGLANG_BASE_URL` | `http://127.0.0.1:30000/v1` | future SGLang hook |
 
 ## CPU agent
 

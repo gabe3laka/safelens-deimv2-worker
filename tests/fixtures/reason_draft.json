@@ -2,7 +2,7 @@
   "_fixture": "/reason response: AI draft only. produced_by=vlm_reasoner, requires_human_review=true, should_alert=false (forced).",
   "schema_version": "reason.v1",
   "produced_by": "vlm_reasoner",
-  "reasoner_model": "Qwen/Qwen2.5-VL-7B-Instruct",
+  "reasoner_model": "Qwen/Qwen2.5-VL-3B-Instruct",
   "reasoner_status": "ok",
   "scene_summary": "A pedestrian is within the operating zone of a forklift.",
   "risks": [

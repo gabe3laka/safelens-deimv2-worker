@@ -763,8 +763,11 @@ def wants_hse_reasoning(payload: Dict[str, Any]) -> bool:
 _RAW_TO_REASONER_STATE: Dict[str, str] = {
     "disabled":             "disabled",
     "not_triggered":        "rules_only",
-    "throttled":            "queued",
+    "throttled":            "throttled",
     "triggered":            "running",
+    "running":              "running",
+    "queued":               "queued",
+    "queued_latest":        "queued_latest",
     "cached":               "ready",
     "cached_and_triggered": "running",
     "error":                "error",
@@ -774,22 +777,61 @@ _RAW_TO_REASONER_STATE: Dict[str, str] = {
 }
 
 
-def _normalize_reasoner_status(raw: Any, model_id: Optional[str] = None) -> Dict[str, Any]:
+def _normalize_reasoner_status(raw: Any, model_id: Optional[str] = None,
+                               diagnostics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Convert a raw (string or dict) reasoner status to the standard app-facing dict.
 
-    Standard states: ready | running | queued | unavailable | timeout |
-                     disabled | rules_only | error
+    Standard states: ready | running | queued | queued_latest | throttled |
+                     unavailable | timeout | disabled | rules_only | error
     """
     if isinstance(raw, dict):
         state = raw.get("state") or raw.get("status") or "unavailable"
         out = dict(raw)
         out["state"] = _RAW_TO_REASONER_STATE.get(state, state)
+        if model_id and not out.get("model"):
+            out["model"] = model_id
+        if diagnostics:
+            out.update(diagnostics)
         return out
     state = _RAW_TO_REASONER_STATE.get(raw or "", raw or "unavailable")
     d: Dict[str, Any] = {"state": state}
     if model_id:
         d["model"] = model_id
+    if diagnostics:
+        d.update(diagnostics)
     return d
+
+
+def _iou(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    """Compute IoU for normalized bbox dicts shaped as {x,y,w,h}."""
+    try:
+        ax, ay = float(a.get("x", 0.0)), float(a.get("y", 0.0))
+        aw, ah = float(a.get("w", 0.0)), float(a.get("h", 0.0))
+        bx, by = float(b.get("x", 0.0)), float(b.get("y", 0.0))
+        bw, bh = float(b.get("w", 0.0)), float(b.get("h", 0.0))
+    except Exception:  # noqa: BLE001
+        return 0.0
+    if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+        return 0.0
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    union = (aw * ah) + (bw * bh) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _center_dist(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    """Compute normalized Euclidean distance between bbox centers."""
+    try:
+        ax = float(a.get("x", 0.0)) + float(a.get("w", 0.0)) / 2.0
+        ay = float(a.get("y", 0.0)) + float(a.get("h", 0.0)) / 2.0
+        bx = float(b.get("x", 0.0)) + float(b.get("w", 0.0)) / 2.0
+        by = float(b.get("y", 0.0)) + float(b.get("h", 0.0)) / 2.0
+    except Exception:  # noqa: BLE001
+        return 1.0
+    dx, dy = ax - bx, ay - by
+    return (dx * dx + dy * dy) ** 0.5
 
 
 def _is_linkable(risk: Dict[str, Any]) -> bool:
@@ -831,23 +873,85 @@ def _build_scene_risks(
 
     # 2. VLM draft risks -- enrich with track bbox if not already linked
     if vlm_draft and vlm_draft.get("risks"):
+        now_ms = int(time.time() * 1000)
+        try:
+            linked_ttl_ms = int(os.getenv("REASONER_LINKED_RISK_TTL_MS", "8000"))
+        except (TypeError, ValueError):
+            linked_ttl_ms = 8000
+        try:
+            unmatched_ttl_ms = int(os.getenv("REASONER_UNMATCHED_CANDIDATE_TTL_MS", "5000"))
+        except (TypeError, ValueError):
+            unmatched_ttl_ms = 5000
+        try:
+            iou_min = float(os.getenv("REASONER_MATCH_IOU_MIN", "0.20"))
+        except (TypeError, ValueError):
+            iou_min = 0.20
+        try:
+            center_max = float(os.getenv("REASONER_MATCH_CENTER_DIST_MAX", "0.20"))
+        except (TypeError, ValueError):
+            center_max = 0.20
+        try:
+            cache_ts = int(vlm_draft.get("_cached_at_ms", now_ms))
+        except (TypeError, ValueError):
+            cache_ts = now_ms
+        cache_age = max(0, now_ms - cache_ts)
         track_map = {t.get("track_id"): t
                      for t in (tracks or []) if t.get("track_id")}
+        det_map = {str(t.get("detection_id")): t for t in (tracks or [])
+                   if t.get("detection_id") is not None}
         vlm_model = vlm_draft.get("reasoner_model", "")
         for r in vlm_draft["risks"]:
             try:
                 risk_dict = r.model_dump() if hasattr(r, "model_dump") else dict(r)
             except Exception:
                 continue
-            # Try to fill bbox from the first matching track
-            if not risk_dict.get("bbox") and risk_dict.get("involved_track_ids"):
-                for tid in risk_dict["involved_track_ids"]:
-                    if tid in track_map and track_map[tid].get("bbox"):
-                        risk_dict = dict(risk_dict)
-                        risk_dict["bbox"] = track_map[tid]["bbox"]
+            matched_track = None
+            for tid in risk_dict.get("involved_track_ids") or []:
+                if tid in track_map:
+                    matched_track = track_map[tid]
+                    break
+            if matched_track is None and risk_dict.get("linked_entity_id"):
+                linked = str(risk_dict.get("linked_entity_id"))
+                matched_track = track_map.get(linked) or det_map.get(linked)
+            if matched_track is None:
+                for did in (risk_dict.get("involved_detection_ids") or []):
+                    matched_track = det_map.get(str(did))
+                    if matched_track is not None:
                         break
+            if matched_track is None and risk_dict.get("bbox"):
+                best = None
+                best_iou = 0.0
+                for t in (tracks or []):
+                    tb = t.get("bbox") or {}
+                    ov = _iou(risk_dict.get("bbox") or {}, tb)
+                    cd = _center_dist(risk_dict.get("bbox") or {}, tb)
+                    if ov >= iou_min or cd <= center_max:
+                        if ov > best_iou:
+                            best_iou = ov
+                            best = t
+                matched_track = best
+
+            risk_dict = dict(risk_dict)
+            if matched_track and cache_age <= linked_ttl_ms:
+                if matched_track.get("track_id"):
+                    risk_dict["involved_track_ids"] = [str(matched_track["track_id"])]
+                    risk_dict.setdefault("linked_entity_id", str(matched_track["track_id"]))
+                if matched_track.get("detection_id") is not None:
+                    risk_dict.setdefault("involved_detection_ids", [matched_track["detection_id"]])
+                if matched_track.get("bbox"):
+                    risk_dict["bbox"] = matched_track["bbox"]  # detector authority
+                risk_dict["candidate_only"] = False
+            else:
+                # Keep unmatched/stale VLM-only regions advisory and non-authoritative.
+                risk_dict.pop("bbox", None)
+                risk_dict["candidate_only"] = True
+                risk_dict["unmatched"] = True
+                risk_dict["requires_human_review"] = True
+                risk_dict["should_alert"] = False
+                if cache_age > unmatched_ttl_ms:
+                    continue
             if not _is_linkable(risk_dict):
-                continue  # exclude vague/unlinked VLM risk
+                continue
             risk_dict = dict(risk_dict)
             risk_dict.setdefault("produced_by", "vlm_reasoner")
             risk_dict.setdefault("reasoner_model", vlm_model)
@@ -953,6 +1057,7 @@ async def detect(payload: Dict[str, Any]):
         # VLM risks and ONLY include linkable (non-vague) items.
         _hse = wants_hse_reasoning(payload)
         _vlm_unavailable = False
+        _reasoner_diag: Dict[str, Any] = {}
         try:
             import risk.vlm_reasoner as vlm
             if vlm.enabled() and (resp_dict.get("schema_version") or _hse):
@@ -969,14 +1074,23 @@ async def detect(payload: Dict[str, Any]):
                     scene_graph=resp_dict.get("scene_graph", {}),
                     tracks=resp_dict.get("tracks", []), frame_id=frame_id,
                 )
+                snap = vlm.status_snapshot()
+                _reasoner_diag = {
+                    "model_id": snap.get("model_id"),
+                    "quantization_requested": (snap.get("diagnostics") or {}).get("vlm.quantization_requested"),
+                    "quantization_active": (snap.get("diagnostics") or {}).get("vlm.quantization_active"),
+                    "quantization_backend": (snap.get("diagnostics") or {}).get("vlm.quantization_backend"),
+                    "bitsandbytes_available": (snap.get("diagnostics") or {}).get("vlm.bitsandbytes_available"),
+                    "last_status": snap.get("last_status"),
+                }
                 resp_dict["reasoner_status"] = _normalize_reasoner_status(
-                    raw_status, vlm._model_id())
+                    raw_status, vlm._model_id(), diagnostics=_reasoner_diag)
                 resp_dict["scene_risks"] = _build_scene_risks(
                     resp_dict.get("risks", []), draft, resp_dict.get("tracks", []))
             elif _hse:
                 # HSE mode requested but VLM is disabled -- degrade gracefully.
                 _vlm_unavailable = True
-                resp_dict["reasoner_status"] = _normalize_reasoner_status("unavailable")
+                resp_dict["reasoner_status"] = _normalize_reasoner_status("unavailable", diagnostics=_reasoner_diag)
                 resp_dict["scene_risks"] = _build_scene_risks(
                     resp_dict.get("risks", []), None, resp_dict.get("tracks", []))
                 _add_warning(resp_dict, "qwen_unavailable")
@@ -984,7 +1098,7 @@ async def detect(payload: Dict[str, Any]):
             log.warning("detect: vlm trigger failed: %s", vexc)
             if _hse:
                 _vlm_unavailable = True
-                resp_dict["reasoner_status"] = _normalize_reasoner_status("error")
+                resp_dict["reasoner_status"] = _normalize_reasoner_status("error", diagnostics=_reasoner_diag)
                 resp_dict["scene_risks"] = _build_scene_risks(
                     resp_dict.get("risks", []), None, resp_dict.get("tracks", []))
                 _add_warning(resp_dict, "qwen_unavailable")

@@ -90,17 +90,25 @@ Disable (`RISK_ENGINE_ENABLED=false`) → `/detect` returns the legacy shape
 ```env
 VLM_REASONER_ENABLED=true    # event-driven; NEVER per-frame; never blocks /detect
 REASONER_MODE=qwen_vl        # qwen_vl | deepseek_vl2 | mock
-QWEN_VL_MODEL_ID=Qwen/Qwen2.5-VL-7B-Instruct
+QWEN_VL_MODEL_ID=Qwen/Qwen2.5-VL-3B-Instruct
+QWEN_VL_DEEP_MODEL_ID=Qwen/Qwen2.5-VL-7B-Instruct
+QWEN_VL_DEEP_ENABLED=false
 REASONER_QUANTIZATION=4bit
-REASONER_TRIGGER_LEVEL=ORANGE
-REASONER_MIN_INTERVAL_MS=5000
-REASONER_TIMEOUT_MS=8000
+REASONER_MAX_IMAGE_SIDE=512
+QWEN_VL_MIN_VISUAL_TOKENS=256
+QWEN_VL_MAX_VISUAL_TOKENS=768
+REASONER_MAX_NEW_TOKENS=128
+REASONER_TRIGGER_LEVEL=YELLOW
+REASONER_MIN_INTERVAL_MS=1500
+REASONER_TIMEOUT_MS=2500
 REASONER_CACHE_DIR=/runpod-volume/models/qwen-vl
 ```
 
 - `REASONER_MODE=mock` → CPU, weight-free draft contract (integration without GPU).
 - VLM output is always an **AI draft** (`requires_human_review=true`,
   `should_alert=false`); it never becomes the safety authority.
+- `bitsandbytes` backs 4-bit/8-bit quantization; missing quantization support
+  degrades gracefully to full precision with diagnostics in `/debug/state`.
 - Open-vocab scanner (separate, optional): `OPEN_VOCAB_SCANNER_ENABLED=true`
   (GroundingDINO; candidate-only). Both degrade to a clear status if weights/deps
   are missing.
@@ -149,7 +157,7 @@ mode (auth disabled) — never run production without it.
 | `/detect` 503 `shutting_down` | graceful shutdown in progress | expected during redeploy; gateway drains/retries elsewhere |
 | `warning: risk_engine_error...`, `degradation_mode:no_risk` | risk layer failed | detection is preserved; inspect logs; risk auto-degrades (never 500) |
 | `reasoner_status:unavailable` | Qwen deps/weights absent or GPU OOM | expected fallback; install/resolve weights on the volume, lower `REASONER_QUANTIZATION`, or use a 3B model / `mock` |
-| `reasoner_status:timeout` | VLM slower than `REASONER_TIMEOUT_MS` | raise the timeout or reduce `REASONER_MAX_IMAGE_SIDE`; `/detect` is unaffected |
+| `reasoner_status:timeout` | VLM slower than `REASONER_TIMEOUT_MS` | raise timeout slightly, lower `QWEN_VL_MAX_VISUAL_TOKENS`, or use `REASONER_MAX_NEW_TOKENS=80`; `/detect` is unaffected |
 | backend shows `edgecrafter` when `yolo26` requested | YOLO load failed → auto-fallback | see `backend_status.fallback_reason`; fix YOLO weights/licensing |
 | volume write errors at runtime | `/runpod-volume` not writable by uid 10001 | chown the volume / mount writable (non-root container) |
 
