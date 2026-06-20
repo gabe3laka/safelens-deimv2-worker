@@ -375,3 +375,78 @@ def test_poll_only_temporal_does_not_replace_pending(monkeypatch):
         with ar._LOCK:
             ar._INFLIGHT.discard(sid)
             ar._PENDING.pop(sid, None)
+
+
+# -- Fix 4: temporal parse failure is json_parse_error, never unavailable -------
+
+class _FakeVLM:
+    """Stand-in for risk.vlm_reasoner in the real (non-mock) temporal path."""
+    def __init__(self, *, data=None, available=True, mode_="qwen_vl"):
+        self._data, self._available, self._mode = data, available, mode_
+    def mode(self): return self._mode
+    def enabled(self): return True
+    def generate_json(self, *a, **k): return self._data
+    def adapter_available(self): return self._available
+
+
+def test_temporal_parse_failure_sets_json_parse_error(monkeypatch):
+    # generate_json returns None but the model IS available -> json_parse_error.
+    monkeypatch.setattr(ar, "_vlm", lambda: _FakeVLM(data=None, available=True))
+    sid = "cam_tjpe"
+    with ar._LOCK:
+        ar._INFLIGHT.add(sid)
+    ar._run_job(sid, {"entities": [{"label": "x"}], "tracks": [], "frame_b64": None,
+                      "payload": {}, "reasons": ["scene_mismatch"]})
+    assert mem.snapshot(sid)["pending_reasoner_state"] == "json_parse_error"
+
+
+def test_temporal_unavailable_when_model_truly_unavailable(monkeypatch):
+    # generate_json returns None AND the model is unavailable -> unavailable.
+    monkeypatch.setattr(ar, "_vlm", lambda: _FakeVLM(data=None, available=False))
+    sid = "cam_tunavail"
+    with ar._LOCK:
+        ar._INFLIGHT.add(sid)
+    ar._run_job(sid, {"entities": [{"label": "x"}], "tracks": [], "frame_b64": None,
+                      "payload": {}, "reasons": ["scene_mismatch"]})
+    assert mem.snapshot(sid)["pending_reasoner_state"] == "unavailable"
+
+
+def test_attach_temporal_does_not_overwrite_hse_json_parse_error(monkeypatch):
+    # The HSE /detect block already set reasoner_status -> temporal must preserve it.
+    monkeypatch.setattr(ar, "maybe_trigger", lambda *a, **k: "not_triggered")
+    out = tr.attach_temporal(
+        {"entities": [{"label": "person", "confidence": 0.9}], "highest_risk_level": "YELLOW",
+         "risks": [], "reasoner_status": {"state": "json_parse_error", "model": "Qwen"}},
+        session_id="cam_preserve", frame_b64="f", payload={})
+    assert out["reasoner_status"]["state"] == "json_parse_error"
+
+
+# -- Fix 5: cached terminal failure prevents immediate temporal retrigger -------
+
+def test_temporal_cached_terminal_failure_blocks_retrigger(monkeypatch):
+    monkeypatch.setenv("REASONER_CACHE_TTL_MS", "10000")
+    monkeypatch.setattr(ar, "_vlm", lambda: _FakeVLM(data=None, available=True))
+    sid = "cam_tguard"
+    mem.set_reasoner_state(sid, "json_parse_error")
+    submitted = {"n": 0}
+    monkeypatch.setattr(ar, "_submit_job",
+                        lambda s, c: submitted.__setitem__("n", submitted["n"] + 1) or True)
+    status = ar.maybe_trigger(sid, reasons=["scene_mismatch"], entities=[{"label": "x"}],
+                              tracks=[], frame_b64=None, payload={})
+    assert status == "json_parse_error"
+    assert submitted["n"] == 0
+
+
+def test_temporal_force_reason_retries_after_terminal_failure(monkeypatch):
+    monkeypatch.setenv("REASONER_CACHE_TTL_MS", "10000")
+    monkeypatch.setattr(ar, "_vlm", lambda: _FakeVLM(data=None, available=True))
+    sid = "cam_tforce"
+    mem.set_reasoner_state(sid, "json_parse_error")
+    submitted = {"n": 0}
+    monkeypatch.setattr(ar, "_submit_job",
+                        lambda s, c: submitted.__setitem__("n", submitted["n"] + 1) or True)
+    status = ar.maybe_trigger(sid, reasons=["scene_mismatch"], entities=[{"label": "x"}],
+                              tracks=[], frame_b64=None,
+                              payload={"reasoning_preferences": {"force_reason": True}})
+    assert status == "triggered"
+    assert submitted["n"] == 1

@@ -471,29 +471,38 @@ def _model_reason(req: ReasonRequest, m: str) -> ReasonResponse:
         return ReasonResponse(reasoner_status="error", error=f"generate: {exc}")
     data = _extract_json(raw)
     if data is None:
+        # Log as a message string (not extra={}) so the deployed log formatter,
+        # which does not render extra fields, actually shows the raw excerpt.
         excerpt = _safe_raw_output_excerpt(raw)
-        log.warning("qwen_json_parse_failed", extra={
-            "session_id": req.session_id, "frame_id": req.frame_id,
-            "qwen_raw_output_excerpt": excerpt,
-        })
+        log.warning(
+            "qwen_json_parse_failed session_id=%s frame_id=%s qwen_raw_output_excerpt=%r",
+            req.session_id, req.frame_id, excerpt,
+        )
+        repair_raw = None
         try:
-            log.info("qwen_json_repair_started", extra={"session_id": req.session_id, "frame_id": req.frame_id})
+            log.info("qwen_json_repair_started session_id=%s frame_id=%s",
+                     req.session_id, req.frame_id)
             repair_raw = adapter["generate"](_build_json_repair_prompt(excerpt), None)
-            log.info("qwen_json_repair_completed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
+            log.info("qwen_json_repair_completed session_id=%s frame_id=%s",
+                     req.session_id, req.frame_id)
             data = _extract_json(repair_raw)
         except Exception as exc:  # noqa: BLE001
-            log.warning("qwen_json_repair_failed", extra={
-                "session_id": req.session_id, "frame_id": req.frame_id,
-                "qwen_raw_output_excerpt": excerpt,
-            })
-            return ReasonResponse(reasoner_status="json_parse_error", error=f"json repair failed: {exc}",
-                                  scene_summary="")
+            log.warning(
+                "qwen_json_repair_failed session_id=%s frame_id=%s "
+                "qwen_raw_output_excerpt=%r qwen_repair_output_excerpt=%r",
+                req.session_id, req.frame_id, excerpt, _safe_raw_output_excerpt(repair_raw),
+            )
+            return ReasonResponse(reasoner_status="json_parse_error",
+                                  error=f"json repair failed: {exc}",
+                                  scene_summary="", risks=[], uncertain_items=[])
         if data is None:
-            log.warning("qwen_json_repair_failed", extra={
-                "session_id": req.session_id, "frame_id": req.frame_id,
-                "qwen_raw_output_excerpt": excerpt,
-            })
-            return ReasonResponse(reasoner_status="json_parse_error", error="model did not return valid JSON",
+            log.warning(
+                "qwen_json_repair_failed session_id=%s frame_id=%s "
+                "qwen_raw_output_excerpt=%r qwen_repair_output_excerpt=%r",
+                req.session_id, req.frame_id, excerpt, _safe_raw_output_excerpt(repair_raw),
+            )
+            return ReasonResponse(reasoner_status="json_parse_error",
+                                  error="model did not return valid JSON",
                                   scene_summary="", risks=[], uncertain_items=[])
     try:
         resp = ReasonResponse(**{k: v for k, v in data.items()
@@ -578,8 +587,8 @@ def _build_json_repair_prompt(raw_excerpt: str) -> str:
         "No markdown.\n"
         "No prose.\n"
         "No code fences.\n\n"
-        "Required top-level schema:\n"
-        '{"scene_summary":string,"risks":[],"uncertain_items":[]}\n\n'
+        "Required top-level schema (valid JSON, empty values shown):\n"
+        '{"scene_summary":"","risks":[],"uncertain_items":[]}\n\n'
         "If a field is missing, use a safe empty value.\n"
         'If you cannot recover a risk, return "risks": [].\n'
         "Repair this output into valid JSON only:\n\n"
@@ -587,24 +596,99 @@ def _build_json_repair_prompt(raw_excerpt: str) -> str:
     )
 
 
-def _extract_json(raw: str) -> Optional[Dict[str, Any]]:
+def _json_candidates(s: str) -> List[str]:
+    """Return balanced ``{...}`` substrings in order, respecting strings/escapes.
+
+    Unlike a naive ``find('{')`` / ``rfind('}')`` span (which breaks when the
+    model emits more than one object or trailing prose), this walks the text with
+    a brace-depth counter and skips braces inside string literals.
+    """
+    out: List[str] = []
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start != -1:
+                    out.append(s[start:i + 1])
+                    start = -1
+    return out
+
+
+def _strip_code_fences(s: str) -> str:
+    """Return the body of the first ``` fenced block, else the input unchanged."""
+    if "```" not in s:
+        return s
+    for body in s.split("```")[1:]:
+        body = body.strip()
+        if not body:
+            continue
+        # drop an optional leading language tag (e.g. ```json\n{...})
+        nl = body.find("\n")
+        if nl != -1 and "{" not in body[:nl] and " " not in body[:nl].strip():
+            body = body[nl + 1:]
+        if "{" in body:
+            return body
+    return s
+
+
+def _extract_json(raw: Any) -> Optional[Dict[str, Any]]:
+    """Best-effort parse of model output into a JSON object.
+
+    Order: direct parse -> first markdown-fenced block -> balanced-brace
+    candidate scan. Tolerates code fences, prose before/after the JSON, and
+    multiple or nested objects. Prefers a candidate with the expected top-level
+    keys. Returns None only when no balanced object parses.
+    """
     if not raw:
         return None
-    s = raw.strip()
-    if "```" in s:  # strip code fences
-        parts = s.split("```")
-        for p in parts:
-            p = p.strip()
-            if p.startswith("{") or p.startswith("json"):
-                s = p[4:].strip() if p.startswith("json") else p
-                break
-    a, b = s.find("{"), s.rfind("}")
-    if a == -1 or b == -1 or b <= a:
+    s = (raw if isinstance(raw, str) else str(raw)).strip()
+    if not s:
         return None
-    try:
-        return json.loads(s[a:b + 1])
-    except (ValueError, TypeError):
+
+    def _as_obj(text: str) -> Optional[Dict[str, Any]]:
+        try:
+            val = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        return val if isinstance(val, dict) else None
+
+    # 1) plain JSON object
+    obj = _as_obj(s)
+    if obj is not None:
+        return obj
+    # 2) first markdown-fenced block (```json ... ``` or ``` ... ```)
+    fenced = _strip_code_fences(s)
+    if fenced is not s:
+        obj = _as_obj(fenced.strip())
+        if obj is not None:
+            return obj
+    # 3) balanced-brace candidates (handles prose / multiple / nested objects)
+    candidates = _json_candidates(fenced) or _json_candidates(s)
+    parsed = [o for o in (_as_obj(c) for c in candidates) if o is not None]
+    if not parsed:
         return None
+    for o in parsed:
+        if "scene_summary" in o or "risks" in o or "scene_context" in o:
+            return o
+    return parsed[0]
 
 
 def _get_adapter(m: str) -> Dict[str, Any]:
@@ -738,6 +822,25 @@ def generate_json(prompt: str, *, frame_b64: Optional[str] = None,
         log.warning("vlm: generate_json failed: %s", exc)
         return None
     return _extract_json(raw)
+
+
+def adapter_available() -> bool:
+    """True when the configured real model adapter is loaded and available.
+
+    Lets callers (e.g. the temporal layer) distinguish a JSON parse failure from
+    a genuinely unavailable model/deps: when this is True but the parse produced
+    no usable JSON, the correct status is ``json_parse_error`` -- not
+    ``unavailable``. Returns False in mock/disabled modes. Never raises.
+    """
+    if not enabled():
+        return False
+    m = mode()
+    if m not in ("qwen_vl", "deepseek_vl2"):
+        return False
+    try:
+        return bool(_get_adapter(m).get("available"))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # -- status (for /debug/state) -------------------------------------------------

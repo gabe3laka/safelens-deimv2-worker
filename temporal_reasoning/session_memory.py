@@ -101,6 +101,7 @@ def _blank(sid: str) -> Dict[str, Any]:
         "pending_reasoner_state": "idle",
         "last_reasoner_trigger_ms": 0,
         "last_reasoner_result_ms": 0,
+        "last_reasoner_state_ms": 0,
     }
 
 
@@ -201,6 +202,7 @@ def set_reasoner_state(session_id: Optional[str], state: str,
     with _LOCK:
         rec = _get(session_id)
         rec["pending_reasoner_state"] = state
+        rec["last_reasoner_state_ms"] = _now_ms()
         if trigger is not None:
             rec["last_reasoner_trigger_ms"] = _now_ms()
             rec["last_trigger"] = trigger
@@ -217,6 +219,7 @@ def store_vlm_result(session_id: Optional[str], *, scene_context: Dict[str, Any]
         rec["latest_vlm_result"] = vlm_result or {}
         rec["last_reasoner_result_ms"] = _now_ms()
         rec["pending_reasoner_state"] = "ready"
+        rec["last_reasoner_state_ms"] = _now_ms()
 
 
 def snapshot(session_id: Optional[str]) -> Dict[str, Any]:
@@ -227,6 +230,7 @@ def snapshot(session_id: Optional[str]) -> Dict[str, Any]:
             return {}
         now = _now_ms()
         result_ms = rec.get("last_reasoner_result_ms", 0)
+        state_ms = rec.get("last_reasoner_state_ms", 0)
         return {
             "session_id": rec["session_id"],
             "camera_id": rec.get("camera_id"),
@@ -236,6 +240,7 @@ def snapshot(session_id: Optional[str]) -> Dict[str, Any]:
             "latest_scene_context": dict(rec.get("latest_scene_context") or {}),
             "latest_semantic_corrections": list(rec.get("latest_semantic_corrections") or []),
             "pending_reasoner_state": rec.get("pending_reasoner_state", "idle"),
+            "pending_reasoner_state_age_ms": (now - state_ms) if state_ms else None,
             "last_trigger": rec.get("last_trigger"),
             "last_reasoner_result_ms": result_ms,
             "result_age_ms": (now - result_ms) if result_ms else None,

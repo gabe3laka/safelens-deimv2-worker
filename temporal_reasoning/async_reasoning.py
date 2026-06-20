@@ -50,6 +50,14 @@ def _min_interval_ms() -> int:
                _int_env("REASONER_MIN_INTERVAL_MS", 1500))
 
 
+def _cache_ttl_ms() -> int:
+    return max(1, _int_env("REASONER_CACHE_TTL_MS", 10000))
+
+
+# Terminal model-output failures: do not immediately re-run after one of these.
+_TERMINAL_FAILURE_STATES = frozenset({"json_parse_error", "schema_error", "timeout", "error"})
+
+
 def _latest_wins_enabled() -> bool:
     return _int_env("REASONER_LATEST_WINS", 1) != 0
 
@@ -89,12 +97,25 @@ def _load_prompt() -> str:
 
 def _build_prompt(ctx: Dict[str, Any]) -> str:
     import json
-    schema_hint = (
-        '{"scene_context": {"scene_type": str, "environment_type": str, '
-        '"confidence": float, "reason": str}, "semantic_corrections": '
-        '[{"track_id": str, "raw_label": str, "corrected_label": str, '
-        '"correction_type": "false_positive|relabel|suppress", "action": str, '
-        '"confidence": float, "reason": str}]}')
+    # Concrete VALID-JSON example (not type literals like `str`/`float`, which are
+    # not valid JSON and lead the model to echo unparseable output).
+    schema_hint = json.dumps({
+        "scene_context": {
+            "scene_type": "cafe",
+            "environment_type": "indoor_public",
+            "confidence": 0.8,
+            "reason": "Short reason.",
+        },
+        "semantic_corrections": [{
+            "track_id": "track_1",
+            "raw_label": "bus",
+            "corrected_label": "ceiling panel",
+            "correction_type": "false_positive",
+            "action": "suppress_from_hse_alerts",
+            "confidence": 0.7,
+            "reason": "Short reason.",
+        }],
+    }, separators=(",", ":"))
     context = {
         "scene_hint": ctx.get("payload", {}).get("scene_hint"),
         "site_context": ctx.get("payload", {}).get("site_context"),
@@ -151,7 +172,11 @@ def _run_job(sid: str, ctx: Dict[str, Any]) -> None:
         data = vlm.generate_json(_build_prompt(ctx),
                                  frame_b64=ctx.get("frame_b64"), entities=entities)
         if not data:
-            mem.set_reasoner_state(sid, "unavailable")
+            # generate_json returns None on a JSON parse failure too -- only call
+            # it "unavailable" when the model/deps are genuinely missing, so the
+            # app sees json_parse_error (a terminal model-output failure) instead.
+            mem.set_reasoner_state(
+                sid, "json_parse_error" if vlm.adapter_available() else "unavailable")
             return
         sc = scenectx.from_vlm_json(data) or scenectx.mock_scene_context(entities, payload)
         corr = corrections.from_vlm_json(data, entities)
@@ -201,6 +226,17 @@ def maybe_trigger(session_id: Optional[str], *, reasons: List[str],
         return "not_triggered"
     sid = session_id or "__default__"
     now = _now_ms()
+    force_reason = bool((payload or {}).get("reasoning_preferences", {}).get("force_reason"))
+    # Don't re-run immediately after a recent terminal failure (bad JSON / schema /
+    # timeout): surface the cached terminal status until it ages out of the cache
+    # TTL, unless a manual force_reason retry is requested.
+    if not force_reason:
+        snap = mem.snapshot(sid)
+        cached_state = snap.get("pending_reasoner_state")
+        age = snap.get("pending_reasoner_state_age_ms")
+        if (cached_state in _TERMINAL_FAILURE_STATES
+                and age is not None and age < _cache_ttl_ms()):
+            return cached_state
     ctx = {"entities": entities, "tracks": tracks, "frame_b64": frame_b64,
            "payload": payload or {}, "reasons": reasons}
     with _LOCK:
