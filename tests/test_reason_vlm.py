@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -633,3 +635,130 @@ def test_background_repair_failure_stores_json_parse_error(monkeypatch):
     assert cached["reasoner_status"] == "json_parse_error"
     assert cached["error"] == "model did not return valid JSON"
     assert cached["risks"] == []
+
+
+# -- Fix 1: raw/repair excerpts must appear in the LOG MESSAGE text (not extra={}) --
+
+def test_parse_failure_logs_raw_excerpt_in_message_text(monkeypatch, caplog):
+    def generate(prompt, image):
+        return "PROSE_NOT_JSON_MARKER_12345 the model rambled"
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "qwen_vl", {"available": True, "generate": generate})
+    with caplog.at_level(logging.WARNING, logger="safelens-vision-worker.vlm"):
+        resp = vlm._model_reason(vlm.ReasonRequest(session_id="cam_log", frame_id="f1"), "qwen_vl")
+    assert resp.reasoner_status == "json_parse_error"
+    parse_msgs = [r.getMessage() for r in caplog.records if "qwen_json_parse_failed" in r.getMessage()]
+    assert parse_msgs, "qwen_json_parse_failed not logged"
+    # excerpt is part of the formatted message string, not only record.extra
+    assert "qwen_raw_output_excerpt=" in parse_msgs[0]
+    assert "PROSE_NOT_JSON_MARKER_12345" in parse_msgs[0]
+
+
+def test_repair_failure_logs_both_excerpts_in_message_text(monkeypatch, caplog):
+    calls = []
+    def generate(prompt, image):
+        calls.append(1)
+        return "RAW_BAD_MARKER" if len(calls) == 1 else "REPAIR_BAD_MARKER"
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "qwen_vl", {"available": True, "generate": generate})
+    with caplog.at_level(logging.WARNING, logger="safelens-vision-worker.vlm"):
+        resp = vlm._model_reason(vlm.ReasonRequest(session_id="cam_log2", frame_id="f1"), "qwen_vl")
+    assert resp.reasoner_status == "json_parse_error"
+    repair_msgs = [r.getMessage() for r in caplog.records if "qwen_json_repair_failed" in r.getMessage()]
+    assert repair_msgs, "qwen_json_repair_failed not logged"
+    assert "qwen_raw_output_excerpt=" in repair_msgs[0] and "RAW_BAD_MARKER" in repair_msgs[0]
+    assert "qwen_repair_output_excerpt=" in repair_msgs[0] and "REPAIR_BAD_MARKER" in repair_msgs[0]
+
+
+def test_safe_raw_output_excerpt_caps_and_escapes_newlines():
+    # newlines are escaped so the excerpt stays single-line in the log message
+    esc = vlm._safe_raw_output_excerpt("a\nb\rc")
+    assert "\n" not in esc and "\r" not in esc
+    assert "\\n" in esc and "\\r" in esc
+    # at most the first 800 chars of the SOURCE text are included
+    assert vlm._safe_raw_output_excerpt("x" * 2000) == "x" * 800
+
+
+# -- Fix 2: the repair prompt embeds VALID JSON (no `scene_summary":string`) --
+
+def test_repair_prompt_embeds_valid_json_and_no_type_literals():
+    rp = vlm._build_json_repair_prompt("some raw output")
+    assert 'scene_summary":string' not in rp
+    head = rp.split("Repair this output")[0]
+    obj = vlm._extract_json(head)
+    assert obj == {"scene_summary": "", "risks": [], "uncertain_items": []}
+    assert "some raw output" in rp  # the excerpt is still included for repair
+
+
+# -- Fix 3: robust JSON extraction (fenced / prose / multiple / nested) --
+
+def test_qwen_parser_handles_fenced_without_language_tag():
+    raw = "```\n{\"scene_summary\":\"x\",\"risks\":[]}\n```"
+    assert vlm._extract_json(raw)["scene_summary"] == "x"
+
+
+def test_qwen_parser_handles_prose_before_and_after_json():
+    assert vlm._extract_json('Here you go: {"scene_summary":"x","risks":[]}')["scene_summary"] == "x"
+    assert vlm._extract_json('{"scene_summary":"y","risks":[]} -- done')["scene_summary"] == "y"
+
+
+def test_qwen_parser_prefers_object_with_expected_keys_among_multiple():
+    raw = '{"unrelated":1} then {"scene_summary":"real","risks":[]}'
+    assert vlm._extract_json(raw)["scene_summary"] == "real"
+
+
+def test_qwen_parser_handles_nested_objects_and_braces_in_strings():
+    raw = 'noise {"scene_summary":"a } and { brace","risks":[{"bbox":{"x":0.1,"y":0.2}}]} tail'
+    out = vlm._extract_json(raw)
+    assert out["risks"][0]["bbox"]["x"] == 0.1
+    assert out["scene_summary"] == "a } and { brace"
+
+
+def test_qwen_parser_returns_none_on_unrecoverable_output():
+    assert vlm._extract_json("no json here at all") is None
+    assert vlm._extract_json('{"scene_summary":"x","risks":[') is None  # truncated -> repair path
+
+
+# -- Fix 4 / 5: status surfacing + no immediate retrigger (HSE risk.vlm_reasoner) --
+
+def test_cached_json_parse_error_prevents_immediate_retrigger(monkeypatch):
+    monkeypatch.setenv("REASONER_CACHE_TTL_MS", "10000")
+    monkeypatch.setenv("REASONER_MIN_INTERVAL_MS", "1")
+    with vlm._LOCK:
+        vlm._CACHE["cam_jpe"] = {"response": {"reasoner_status": "json_parse_error", "risks": []},
+                                 "ts": vlm._now_ms()}
+    called = {"submit": 0}
+    class NoSubmit:
+        def submit(self, *args, **kwargs):
+            called["submit"] += 1
+    monkeypatch.setattr(vlm, "_executor", lambda: NoSubmit())
+    draft, status = vlm.maybe_trigger(
+        "cam_jpe", frame_b64=None, highest_level="ORANGE", deterministic_risks=[DET_RISK])
+    assert status == "json_parse_error"
+    assert called["submit"] == 0
+
+
+def test_detect_surfaces_json_parse_error_not_unavailable(server_mod, monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    import vision_backend
+    import risk.vlm_reasoner as _vlm
+    monkeypatch.setenv("RISK_ENGINE_ENABLED", "true")
+    monkeypatch.setenv("TEMPORAL_REASONING_ENABLED", "false")
+    monkeypatch.setattr(vision_backend, "run_inference", lambda **kw: _fake_resp())
+    with _vlm._LOCK:
+        _vlm._CACHE["cam_jpe2"] = {"response": {
+            "reasoner_status": "json_parse_error", "risks": [],
+            "error": "model did not return valid JSON"}, "ts": _vlm._now_ms()}
+    with server_mod._STATE_LOCK:
+        server_mod._STATE["status"] = "ready"
+    try:
+        with TestClient(server_mod.app) as c:
+            r = c.post("/detect", json={"image_b64": _tiny_jpeg_b64(),
+                                        "session_id": "cam_jpe2", "hse": True})
+            assert r.status_code == 200
+            rs = r.json().get("reasoner_status")
+            assert isinstance(rs, dict), f"expected dict, got {rs!r}"
+            assert rs.get("state") == "json_parse_error"
+            assert rs.get("state") != "unavailable"
+    finally:
+        with server_mod._STATE_LOCK:
+            server_mod._STATE["status"] = "cold"

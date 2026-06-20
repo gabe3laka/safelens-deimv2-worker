@@ -31,6 +31,10 @@ log = logging.getLogger("safelens-vision-worker.temporal")
 _LEVEL = {"GREEN": 0, "YELLOW": 1, "ORANGE": 2, "RED": 3}
 _LEVEL_NAME = {v: k for k, v in _LEVEL.items()}
 
+# Terminal model-output failures the temporal layer must surface (not overwrite).
+_TERMINAL_FAILURE_STATES = frozenset(
+    {"json_parse_error", "schema_error", "error", "timeout"})
+
 
 def _result_stale_ms() -> int:
     return _int_env("REASONER_RESULT_STALE_MS", 8000)
@@ -112,6 +116,13 @@ def attach_temporal(resp_dict: Dict[str, Any], *, session_id: Optional[str] = No
             # additive; raw detector entities are preserved untouched
             resp_dict["semantic_corrections"] = cached_corr
 
+        # A terminal model-output failure already surfaced by the HSE /detect
+        # block (risk.vlm_reasoner) must NOT be downgraded to unavailable/idle by
+        # the temporal layer -- capture it before we recompute the state below.
+        prior = resp_dict.get("reasoner_status")
+        prior_state = (prior.get("state") if isinstance(prior, dict)
+                       else prior if isinstance(prior, str) else None)
+
         result_age = snap.get("result_age_ms")
         state = snap.get("pending_reasoner_state", "idle")
         if trigger_status == "disabled":
@@ -126,6 +137,10 @@ def attach_temporal(resp_dict: Dict[str, Any], *, session_id: Optional[str] = No
             state = "running"
         elif trigger_status in ("schema_error", "json_parse_error", "error", "timeout", "unavailable"):
             state = trigger_status
+        # Preserve a terminal failure (json_parse_error/schema_error/error/timeout)
+        # from the HSE block rather than clobbering it with a non-terminal state.
+        if prior_state in _TERMINAL_FAILURE_STATES and state not in _TERMINAL_FAILURE_STATES:
+            state = prior_state
         resp_dict["reasoner_status"] = {
             "enabled": _vlm_enabled(),
             "mode": _vlm_mode(),
