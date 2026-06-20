@@ -552,7 +552,6 @@ def _build_adapter(m: str) -> Dict[str, Any]:
     model_id = _model_id()
     cache_dir = os.getenv("REASONER_CACHE_DIR", "/runpod-volume/models/qwen-vl")
     device = os.getenv("REASONER_DEVICE", "cuda")
-    quant = quant_diag["vlm.quantization_requested"]
 
     def _load():
         import torch

@@ -432,7 +432,7 @@ ENV HF_HOME="/runpod-volume/.cache/huggingface"
 # needs is present in the image. Fails the build fast (not at runtime).
 # Must NOT start uvicorn, download weights, or call /warmup.
 RUN python - <<'PY'
-import importlib, os, sys
+import importlib, os, subprocess, sys
 sys.path.insert(0, "/app")
 import bitsandbytes as bnb  # noqa: F401
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration  # noqa: F401
@@ -450,11 +450,24 @@ for mod in ["worker_guards", "worker_runtime", "worker_security",
             "shared", "gpu_vision", "temporal_reasoning", "agentic_cpu"]:
     importlib.import_module(mod)
     print("import OK:", mod)
-# CPU agent must build its router without pulling any GPU dep into the image.
-import agentic_cpu
-agentic_cpu.get_router()
-for _gpu in ("torch", "ultralytics", "cv2", "transformers"):
-    assert _gpu not in sys.modules, f"agentic_cpu leaked GPU dep at build: {_gpu}"
+# CPU agent import guard must run in a CLEAN subprocess so earlier imports of
+# transformers/bitsandbytes/torch in this smoke test do not cause false positives.
+probe = "\n".join([
+    "import sys",
+    "sys.path.insert(0, '/app')",
+    "import agentic_cpu",
+    "r = agentic_cpu.get_router()",
+    "paths = sorted({route.path for route in r.routes})",
+    "assert any(p.endswith('/health') for p in paths), paths",
+    "forbidden = ['torch', 'torchvision', 'ultralytics', 'cv2', 'transformers']",
+    "leaked = sorted(m for m in forbidden if m in sys.modules)",
+    "print('LEAKED:' + ','.join(leaked))",
+    "sys.exit(1 if leaked else 0)",
+])
+proc = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+out = (proc.stdout + proc.stderr).strip()
+assert proc.returncode == 0, f"agentic_cpu leaked GPU deps in clean subprocess -> {out}"
+print(proc.stdout.strip())
 print("SafeLens worker startup import smoke test passed")
 PY
 
