@@ -550,7 +550,8 @@ def _build_adapter(m: str) -> Dict[str, Any]:
         }
 
     model_id = _model_id()
-    cache_dir = os.getenv("REASONER_CACHE_DIR", "/runpod-volume/models/qwen-vl")
+    # Prefer QWEN_VL_CACHE_DIR, fallback to REASONER_CACHE_DIR
+    cache_dir = os.getenv("QWEN_VL_CACHE_DIR") or os.getenv("REASONER_CACHE_DIR", "/runpod-volume/models/qwen-vl-3b")
     device = os.getenv("REASONER_DEVICE", "cuda")
 
     def _load():

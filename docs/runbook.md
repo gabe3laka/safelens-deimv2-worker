@@ -101,10 +101,12 @@ REASONER_MAX_NEW_TOKENS=128
 REASONER_TRIGGER_LEVEL=YELLOW
 REASONER_MIN_INTERVAL_MS=1500
 REASONER_TIMEOUT_MS=2500
-REASONER_CACHE_DIR=/runpod-volume/models/qwen-vl
+QWEN_VL_CACHE_DIR=/runpod-volume/models/qwen-vl-3b
+REASONER_CACHE_DIR=/runpod-volume/models/qwen-vl-3b
 ```
 
 - `REASONER_MODE=mock` → CPU, weight-free draft contract (integration without GPU).
+- Cache precedence: `QWEN_VL_CACHE_DIR` overrides `REASONER_CACHE_DIR` (legacy fallback).
 - VLM output is always an **AI draft** (`requires_human_review=true`,
   `should_alert=false`); it never becomes the safety authority.
 - `bitsandbytes` backs 4-bit/8-bit quantization; missing quantization support

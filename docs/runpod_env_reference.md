@@ -46,6 +46,8 @@ The temporal VLM reuses the `risk.vlm_reasoner` model knobs: `VLM_REASONER_ENABL
 | `QWEN_VL_MODEL_ID` | `Qwen/Qwen2.5-VL-3B-Instruct` | live heartbeat model |
 | `QWEN_VL_DEEP_MODEL_ID` | `Qwen/Qwen2.5-VL-7B-Instruct` | optional offline/deep model only |
 | `QWEN_VL_DEEP_ENABLED` | `false` | guardrail; no live dual-model load |
+| `QWEN_VL_CACHE_DIR` | `/runpod-volume/models/qwen-vl-3b` | preferred Qwen cache path (overrides `REASONER_CACHE_DIR`) |
+| `REASONER_CACHE_DIR` | `/runpod-volume/models/qwen-vl-3b` | legacy shared cache fallback |
 | `REASONER_MAX_IMAGE_SIDE` | `512` | pre-processor image resize cap |
 | `QWEN_VL_MIN_VISUAL_TOKENS` | `256` | processor `min_pixels=tokens*28*28` |
 | `QWEN_VL_MAX_VISUAL_TOKENS` | `768` | processor `max_pixels=tokens*28*28` (optional accuracy: `1280`) |
