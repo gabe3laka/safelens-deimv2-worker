@@ -1161,9 +1161,12 @@ def test_safe_id_part_sanitizes_special_chars():
     assert vlm._safe_id_part("obj-edge_1") == "obj-edge_1"
     assert vlm._safe_id_part(None) == "unknown"
     assert vlm._safe_id_part("") == "unknown"
-    # Length capped at 80 chars
-    long_val = "x" * 100
-    assert len(vlm._safe_id_part(long_val)) == 80
+    # Length capped at 80 chars and all chars still valid after truncation.
+    long_val = "x/y" * 50  # mix of valid and invalid chars
+    result = vlm._safe_id_part(long_val)
+    assert len(result) == 80
+    assert all(ch.isalnum() or ch in ("-", "_") for ch in result), (
+        f"Truncated result contains invalid chars: {result!r}")
 
 
 def test_call_generate_uses_typed_config_first(monkeypatch):

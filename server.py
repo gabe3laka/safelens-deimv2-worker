@@ -996,10 +996,12 @@ def _stamp_entities_with_risks(
         for eid_key in candidate_ids:
             eid_key = str(eid_key)
             existing = entity_risk.get(eid_key)
+            existing_level_order = _level_order.get(
+                str((existing or {}).get("risk_level", "GREEN")).upper(), 0)
             if existing is None or (
-                _level_order.get(level, 0) > _level_order.get(str(existing.get("risk_level", "GREEN")).upper(), 0)
+                _level_order.get(level, 0) > existing_level_order
                 or (
-                    _level_order.get(level, 0) == _level_order.get(str(existing.get("risk_level", "GREEN")).upper(), 0)
+                    _level_order.get(level, 0) == existing_level_order
                     and score > int(existing.get("risk_score", 0) or 0)
                 )
             ):
@@ -1180,8 +1182,8 @@ async def detect(payload: Dict[str, Any]):
             try:
                 resp_dict["entities"] = _stamp_entities_with_risks(
                     resp_dict.get("entities") or [], resp_dict["scene_risks"])
-            except Exception as sexc:  # noqa: BLE001 -- stamping must never break /detect
-                log.warning("detect: entity risk stamp failed: %s", sexc)
+            except Exception as stamp_exc:  # noqa: BLE001 -- stamping must never break /detect
+                log.warning("detect: entity risk stamp failed: %s", stamp_exc)
         # Event-triggered temporal perception (PR: single-worker GPU+CPU). ADDITIVE
         # + NON-BLOCKING: folds the frame into per-session memory, adds deterministic
         # object-near-edge risk, and (rarely, rate-limited) kicks an async VLM job
