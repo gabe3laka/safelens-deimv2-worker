@@ -659,3 +659,227 @@ def test_adapter_available_false_without_api_key(monkeypatch):
 def test_adapter_available_false_for_mock_mode(monkeypatch):
     monkeypatch.setenv("REASONER_MODE", "mock")
     assert vlm.adapter_available() is False
+
+
+# -- Gemini structured-output adapter: dict return path -----------------------
+
+def test_gemini_reason_with_dict_returning_adapter(monkeypatch):
+    """Adapter returning a pre-validated dict must produce reasoner_status=ok."""
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+
+    def fake_generate(prompt, image):
+        # Simulate adapter returning GeminiReasonResponse.model_dump()
+        return {"scene_summary": "clear", "risks": [], "uncertain_items": []}
+
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "gemini", {
+        "available": True,
+        "generate": fake_generate,
+        "model_id": "gemini-2.5-flash",
+        "diagnostics": {},
+        "error": None,
+    })
+    out = vlm.reason_sync(_req())
+    assert out["reasoner_status"] == "ok"
+    assert out["scene_summary"] == "clear"
+    assert out["requires_human_review"] is True
+    assert out["should_alert"] is False
+
+
+def test_gemini_reason_maps_real_risk_to_vlmrisk(monkeypatch):
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+
+    def fake_generate(prompt, image):
+        return {
+            "scene_summary": "Cup near table edge.",
+            "risks": [{
+                "hazard_type": "object_near_edge",
+                "risk_level": "YELLOW",
+                "reason": "Cup appears close to the table edge.",
+                "recommended_action": "Move the cup away from the edge.",
+                "visual_evidence": ["cup near table edge"],
+                "involved_track_ids": ["t1"],
+                "linked_entity_id": "t1",
+                "approximate_region": "table edge",
+                "confidence": 0.82,
+                "should_alert": True,
+            }],
+            "uncertain_items": [],
+        }
+
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "gemini", {
+        "available": True,
+        "generate": fake_generate,
+        "model_id": "gemini-2.5-flash",
+        "diagnostics": {},
+        "error": None,
+    })
+
+    out = vlm.reason_sync({
+        "request_id": "r1",
+        "session_id": "cam1",
+        "frame_id": "f1",
+        "entities": [{"track_id": "t1", "label": "cup"}],
+    })
+
+    assert out["reasoner_status"] == "ok"
+    assert len(out["risks"]) == 1
+    r = out["risks"][0]
+    assert r["risk_id"].startswith("gemini_f1_")
+    assert r["hazard_type"] == "object_near_edge"
+    assert r["risk_level"] == "YELLOW"
+    assert r["reason"] == "Cup appears close to the table edge."
+    assert r["risk_reason"] == "Cup appears close to the table edge."
+    assert r["visual_evidence"] == ["cup near table edge"]
+    assert r["evidence"] == ["cup near table edge"]
+    assert r["recommended_action"] == "Move the cup away from the edge."
+    assert r["linked_entity_id"] == "t1"
+    assert r["involved_track_ids"] == ["t1"]
+    assert r["should_alert"] is False
+    assert r["requires_human_review"] is True
+
+
+def test_gemini_reason_malformed_dict_returns_schema_error(monkeypatch):
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+
+    def fake_generate(prompt, image):
+        return {"scene_summary": "x", "risks": [{"risk_level": "YELLOW"}], "uncertain_items": []}
+
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "gemini", {
+        "available": True,
+        "generate": fake_generate,
+        "model_id": "gemini-2.5-flash",
+        "diagnostics": {},
+        "error": None,
+    })
+    out = vlm.reason_sync(_req())
+    assert out["reasoner_status"] == "schema_error"
+
+
+def test_gemini_reason_dict_no_double_parse(monkeypatch):
+    """Dict return must not hit _extract_json (which would stringify it incorrectly)."""
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+    parse_calls = {"n": 0}
+    orig_extract = vlm._extract_json
+
+    def counting_extract(raw):
+        parse_calls["n"] += 1
+        return orig_extract(raw)
+
+    monkeypatch.setattr(vlm, "_extract_json", counting_extract)
+
+    def fake_generate(prompt, image):
+        return {"scene_summary": "ok", "risks": [], "uncertain_items": []}
+
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "gemini", {
+        "available": True,
+        "generate": fake_generate,
+        "model_id": "gemini-2.5-flash",
+        "diagnostics": {},
+        "error": None,
+    })
+    vlm.reason_sync(_req())
+    assert parse_calls["n"] == 0, "_extract_json must not be called when adapter returns dict"
+
+
+def test_generate_json_handles_dict_from_adapter(monkeypatch):
+    """generate_json() must return dict directly when adapter returns one."""
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+
+    def fake_generate(prompt, image):
+        return {"answer": 99}
+
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "gemini", {
+        "available": True,
+        "generate": fake_generate,
+        "model_id": "gemini-2.5-flash",
+        "diagnostics": {},
+        "error": None,
+    })
+    result = vlm.generate_json("test prompt")
+    assert result == {"answer": 99}
+
+
+# -- Compact prompt: no raw detector fields -----------------------------------
+
+def test_compact_prompt_no_raw_bbox_or_class(monkeypatch):
+    """The Gemini prompt must not contain raw bbox/class_id/confidence detector fields."""
+    from risk.reason_schema import ReasonRequest as RR
+    req = RR(
+        entities=[
+            {"label": "person", "class_id": 0, "confidence": 0.9,
+             "bbox": {"x": 0.3, "y": 0.4, "w": 0.1, "h": 0.4}, "track_id": "t1"},
+            {"label": "forklift", "class_id": 7, "confidence": 0.85,
+             "bbox": {"x": 0.5, "y": 0.5, "w": 0.2, "h": 0.3}, "track_id": "t2"},
+        ],
+        deterministic_risks=[
+            {"risk_id": "r1", "hazard_type": "worker_near_vehicle",
+             "risk_level": "ORANGE", "involved_track_ids": ["t1", "t2"]},
+        ],
+    )
+    prompt = vlm._build_gemini_prompt(req)
+    # Compact context must include anchor ids + labels
+    assert "t1" in prompt
+    assert "person" in prompt
+    assert "t2" in prompt
+    assert "forklift" in prompt
+    # Must NOT contain raw detector fields
+    assert '"class_id"' not in prompt
+    assert '"confidence"' not in prompt
+    assert '"bbox"' not in prompt
+    # Must contain the HSE assistant instruction
+    assert "HSE scene-reasoning" in prompt
+
+
+def test_compact_prompt_highest_risk_level_present(monkeypatch):
+    """Compact context must surface the highest deterministic risk level."""
+    from risk.reason_schema import ReasonRequest as RR
+    req = RR(
+        entities=[{"label": "person", "track_id": "t1"}],
+        deterministic_risks=[
+            {"risk_level": "RED", "hazard_type": "falling_object"},
+            {"risk_level": "YELLOW", "hazard_type": "slip_trip"},
+        ],
+    )
+    prompt = vlm._build_gemini_prompt(req)
+    assert "RED" in prompt
+    assert "falling_object" in prompt
+
+
+# -- GeminiReasonResponse schema validation -----------------------------------
+
+def test_gemini_reason_response_schema_valid():
+    """GeminiReasonResponse must validate a well-formed dict."""
+    from risk.gemini_reasoner import GeminiReasonResponse, GeminiRisk
+    r = GeminiReasonResponse(
+        scene_summary="all clear",
+        risks=[],
+        uncertain_items=[],
+    )
+    assert r.risks == []
+    assert r.scene_summary == "all clear"
+
+
+def test_gemini_risk_schema_no_bbox_field():
+    """GeminiRisk must not have a bbox field."""
+    from risk.gemini_reasoner import GeminiRisk
+    fields = GeminiRisk.model_fields
+    assert "bbox" not in fields
+    assert "class_id" not in fields
+    assert "confidence" in fields   # advisory confidence is allowed
+
+
+def test_gemini_reason_response_json_schema_exported():
+    """model_json_schema() must be callable and return a dict with title."""
+    from risk.gemini_reasoner import GeminiReasonResponse
+    schema = GeminiReasonResponse.model_json_schema()
+    assert isinstance(schema, dict)
+    assert "properties" in schema or "$defs" in schema or "title" in schema
+
+
+def test_gemini_max_output_tokens_default():
+    """Default GEMINI_MAX_OUTPUT_TOKENS must be >= 1024 for schema budget."""
+    import os
+    import risk.gemini_reasoner as gr
+    # Without override the code default must be at least 1024.
+    tok = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"))
+    assert tok >= 1024

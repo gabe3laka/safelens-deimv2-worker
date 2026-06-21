@@ -2,7 +2,7 @@
 risk/gemini_reasoner.py -- Google Gemini API vision reasoner adapter.
 
 Implements the same adapter contract as vlm_reasoner._build_adapter():
-  {"available": bool, "generate": callable(prompt, image) -> str,
+  {"available": bool, "generate": callable(prompt, image) -> dict | str,
    "model_id": str, "diagnostics": dict, "error": str|None}
 
 Design rules (inherited from vlm_reasoner):
@@ -10,7 +10,9 @@ Design rules (inherited from vlm_reasoner):
   * Scene-level only: Gemini must NOT output bbox, class_id, confidence, or
     raw detector coordinates. YOLO remains the coordinate/detection truth.
   * On any import/API failure -> available=False, never raises into the caller.
-  * Structured output requests JSON via response_mime_type; falls back
+  * generate() returns a validated dict (GeminiReasonResponse.model_dump())
+    when Pydantic parse succeeds; falls back to raw str for _extract_json().
+  * _call_generate() uses response_schema structured output; falls back
     gracefully if the installed SDK version uses a different config shape.
 """
 
@@ -18,9 +20,64 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
+
+from pydantic import BaseModel, Field
 
 log = logging.getLogger("safelens-vision-worker.gemini")
+
+# ---------------------------------------------------------------------------
+# Gemini structured-output schema
+# (scene-level only; no bbox / class_id / detector confidence)
+# ---------------------------------------------------------------------------
+
+RiskLevel = Literal["GREEN", "YELLOW", "ORANGE", "RED"]
+HazardType = Literal[
+    "object_near_edge",
+    "slip_trip",
+    "blocked_path",
+    "falling_object",
+    "ppe_missing",
+    "unsafe_interaction",
+    "worker_near_vehicle",
+    "broken_object",
+    "other",
+]
+
+
+class GeminiRisk(BaseModel):
+    """Scene-level HSE risk returned by Gemini.
+
+    Deliberately omits bbox, class_id, and detector confidence — YOLO remains
+    the coordinate/detection truth.  Risks must be linked back to the anchor
+    ids supplied in the prompt's detected_object_anchors list.
+    """
+
+    hazard_type: HazardType = Field(description="Visible HSE hazard category.")
+    risk_level: RiskLevel = Field(
+        description="Risk level based only on current-frame visual evidence."
+    )
+    reason: str = Field(default="", max_length=240)
+    recommended_action: str = Field(default="", max_length=180)
+    visual_evidence: List[str] = Field(default_factory=list, max_length=3)
+    involved_track_ids: List[str] = Field(default_factory=list, max_length=3)
+    linked_entity_id: Optional[str] = None
+    approximate_region: Optional[str] = None
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class GeminiReasonResponse(BaseModel):
+    """Top-level structured output schema for Gemini's HSE scene analysis.
+
+    Enforces that risks are linked to detected_object_anchors supplied in the
+    prompt.  This is the schema passed to Gemini via response_schema so the
+    model is constrained to emit exactly these fields.  The worker maps this
+    into ReasonResponse and calls enforce_draft_contract() before returning.
+    """
+
+    scene_summary: str = Field(default="", max_length=240)
+    risks: List[GeminiRisk] = Field(default_factory=list, max_length=3)
+    uncertain_items: List[str] = Field(default_factory=list, max_length=5)
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -43,9 +100,9 @@ def _timeout_ms() -> int:
 
 def _max_output_tokens() -> int:
     try:
-        return max(64, int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "512")))
+        return max(64, int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024")))
     except (TypeError, ValueError):
-        return 512
+        return 1024
 
 
 def _temperature() -> float:
@@ -142,8 +199,14 @@ def build_adapter() -> Dict[str, Any]:
     max_side = _max_image_side()
     retries = _request_retries()
 
-    def generate(prompt: str, image: Any) -> str:
-        """Call Gemini and return raw text. Raises on API error (caller handles)."""
+    def generate(prompt: str, image: Any) -> Any:
+        """Call Gemini and return a validated dict or raw text on fallback.
+
+        Returns GeminiReasonResponse.model_dump() when Pydantic validation
+        succeeds so the caller can skip JSON re-parsing.  Falls back to raw
+        str so _extract_json() in vlm_reasoner can still recover.  Raises on
+        API error (caller handles).
+        """
         import io
 
         parts: List[Any] = []
@@ -173,7 +236,12 @@ def build_adapter() -> Dict[str, Any]:
         for attempt in range(retries + 1):
             try:
                 response = _call_generate(client, types, mid, parts)
-                return response.text or ""
+                raw_text = response.text or ""
+                # Prefer validated Pydantic dict; fall back to raw str.
+                try:
+                    return GeminiReasonResponse.model_validate_json(raw_text).model_dump()
+                except Exception:  # noqa: BLE001
+                    return raw_text
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 if attempt < retries:
@@ -190,34 +258,53 @@ def build_adapter() -> Dict[str, Any]:
 
 
 def _call_generate(client: Any, types: Any, mid: str, parts: List[Any]) -> Any:
-    """Call client.models.generate_content with structured JSON config.
+    """Call client.models.generate_content with structured JSON schema output.
 
-    Tries the documented response_format dict first; falls back to
-    types.GenerateContentConfig if the SDK rejects the dict shape.
+    Tries the documented response_format dict first (newer SDK); falls back to
+    types.GenerateContentConfig with response_schema (older SDK style).
+    Both paths enforce the GeminiReasonResponse schema so Gemini is constrained
+    to emit only the fields we need and nothing the model should not invent.
     """
+    schema_dict = GeminiReasonResponse.model_json_schema()
+
     # Attempt 1: response_format dict (documented pattern for newer SDKs)
     try:
         response = client.models.generate_content(
             model=mid,
             contents=parts,
             config={
-                "response_mime_type": "application/json",
+                "response_format": {
+                    "text": {
+                        "mime_type": "application/json",
+                        "schema": schema_dict,
+                    }
+                },
                 "temperature": _temperature(),
                 "max_output_tokens": _max_output_tokens(),
             },
         )
         return response
     except (TypeError, ValueError, AttributeError):
-        pass  # SDK may not accept plain dict; fall through to types.GenerateContentConfig
+        pass  # SDK may not accept this dict shape; fall through
 
-    # Attempt 2: types.GenerateContentConfig (older SDK style)
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        temperature=_temperature(),
-        max_output_tokens=_max_output_tokens(),
-    )
+    # Attempt 2: types.GenerateContentConfig with response_schema
+    try:
+        cfg = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=GeminiReasonResponse,
+            temperature=_temperature(),
+            max_output_tokens=_max_output_tokens(),
+        )
+    except (TypeError, ValueError, AttributeError):
+        # Older SDK may not accept a Pydantic class; pass the JSON Schema dict.
+        cfg = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema_dict,
+            temperature=_temperature(),
+            max_output_tokens=_max_output_tokens(),
+        )
     return client.models.generate_content(
         model=mid,
         contents=parts,
-        config=config,
+        config=cfg,
     )

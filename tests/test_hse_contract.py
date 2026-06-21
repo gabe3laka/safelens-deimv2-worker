@@ -472,9 +472,12 @@ def test_gemini_prompt_includes_linkability_fields(monkeypatch):
     req = ReasonRequest(entities=[PERSON, FORKLIFT],
                         deterministic_risks=[DET_RISK_LINKED])
     prompt = _build_gemini_prompt(req)
-    for field in ("linked_entity_id", "involved_track_ids", "involved_detection_ids",
-                  "bbox", "approximate_region"):
-        assert field in prompt, f"'{field}' missing from Gemini prompt"
+    # New compact prompt passes anchor ids so Gemini can link risks to them.
+    # Field names are enforced via structured-output schema, not spelled out in prompt text.
+    assert "detected_object_anchors" in prompt, "'detected_object_anchors' missing from Gemini prompt"
+    # At least one anchor id should be present (from PERSON / FORKLIFT entities)
+    assert any(kw in prompt for kw in ("person", "forklift", "trk_")), \
+        "No entity anchor found in prompt"
 
 
 def test_gemini_prompt_includes_strict_linkability_rule(monkeypatch):
@@ -482,7 +485,13 @@ def test_gemini_prompt_includes_strict_linkability_rule(monkeypatch):
     from risk.reason_schema import ReasonRequest
     req = ReasonRequest(entities=[PERSON])
     prompt = _build_gemini_prompt(req)
-    assert "STRICT RULES" in prompt or "MUST include" in prompt
+    # New prompt expresses the linking rule as "Link risks only to ids in detected_object_anchors"
+    assert (
+        "STRICT RULES" in prompt
+        or "MUST include" in prompt
+        or "detected_object_anchors" in prompt
+        or "Link risks only" in prompt
+    )
 
 
 def test_vlm_schema_linkability_fields_on_vmlrisk():
