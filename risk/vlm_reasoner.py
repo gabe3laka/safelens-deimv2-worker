@@ -413,7 +413,7 @@ def _gemini_reason(req: ReasonRequest) -> ReasonResponse:
 
 
 def _build_gemini_prompt(req: ReasonRequest) -> str:
-    max_labels = int(os.getenv("GEMINI_MAX_DETECTED_LABELS", "20"))
+    max_labels = gemini_reasoner._max_detected_labels()
     context = {
         "deterministic_risks": req.deterministic_risks[:10],
         "entities": req.entities[:max_labels],
@@ -566,9 +566,9 @@ def status_snapshot() -> Dict[str, Any]:
     }
     if m == "gemini":
         snap.update({
-            "gemini_max_output_tokens": int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "512")),
-            "gemini_temperature": float(os.getenv("GEMINI_TEMPERATURE", "0")),
-            "gemini_max_detected_labels": int(os.getenv("GEMINI_MAX_DETECTED_LABELS", "20")),
+            "gemini_max_output_tokens": gemini_reasoner._max_output_tokens(),
+            "gemini_temperature": gemini_reasoner._temperature(),
+            "gemini_max_detected_labels": gemini_reasoner._max_detected_labels(),
         })
     return snap
 

@@ -465,10 +465,6 @@ def test_neither_frame_b64_nor_image_b64_rejected(monkeypatch):
 # Part 6 -- VLM prompt/schema includes linkability requirements
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Part 6 -- VLM prompt/schema includes linkability requirements
-# ---------------------------------------------------------------------------
-
 def test_gemini_prompt_includes_linkability_fields(monkeypatch):
     monkeypatch.setenv("REASONER_MODE", "gemini")
     from risk.vlm_reasoner import _build_gemini_prompt
