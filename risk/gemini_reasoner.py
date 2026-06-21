@@ -80,6 +80,24 @@ def _request_retries() -> int:
 # Adapter builder
 # ---------------------------------------------------------------------------
 
+
+def config() -> Dict[str, Any]:
+    """Return public Gemini configuration values (safe to expose in status snapshots)."""
+    return {
+        "max_output_tokens": _max_output_tokens(),
+        "temperature": _temperature(),
+        "max_detected_labels": _max_detected_labels(),
+        "max_image_side": _max_image_side(),
+        "timeout_ms": _timeout_ms(),
+        "request_retries": _request_retries(),
+    }
+
+
+def max_detected_labels() -> int:
+    """Public accessor for GEMINI_MAX_DETECTED_LABELS (number of entity labels in prompts)."""
+    return _max_detected_labels()
+
+
 def build_adapter() -> Dict[str, Any]:
     """Build and return a Gemini generate adapter dict.
 

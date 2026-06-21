@@ -213,7 +213,7 @@ def test_deepseek_vl2_mode_is_unavailable(monkeypatch):
     assert out["reasoner_status"] == "unavailable"
 
 
-def test_qwen_deep_env_preserved_in_dockerfile():
+def test_qwen_deep_env_vars_preserved_as_inert_placeholders_in_dockerfile():
     """QWEN_VL_DEEP_* must remain declared in Dockerfile as inert placeholder."""
     from pathlib import Path
     dockerfile = (Path(__file__).parent.parent / "Dockerfile").read_text()
