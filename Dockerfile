@@ -125,8 +125,8 @@ print("stack preserved + ultralytics", ultralytics.__version__,
 PY
 
 # Hardening (B10): NO model weights are baked into the image and NONE are
-# downloaded at build time -- not YOLO, EdgeCrafter, DEIMv2, Qwen-VL,
-# DeepSeek-VL2, or GroundingDINO. Weights resolve at RUNTIME only, from
+# downloaded at build time -- not YOLO, EdgeCrafter, DEIMv2, or GroundingDINO.
+# Gemini is API-only (no weights). Weights resolve at RUNTIME only, from
 # YOLO26_CACHE_DIR / EDGECRAFTER_CACHE_DIR / the HF cache on /runpod-volume, or
 # an approved registry. We still create the cache dir so the runtime can write
 # into it (auto-download / volume mount). Operators may pre-populate the volume
@@ -292,7 +292,7 @@ ENV DEPTH_CACHE_DIR="/runpod-volume/models/depth"
 # deterministic engine (the safety signal) adds tracks/scene_graph/risks +
 # schema_version. Per-session tracker state is keyed by session_id/camera_id
 # with TTL eviction (Build Mode pattern). No weights, no GPU, no VLM here --
-# the event-driven Qwen-VL reasoner / GroundingDINO scanner are a later PR.
+# the event-driven Gemini reasoner / GroundingDINO scanner are additive.
 ENV RISK_ENGINE_ENABLED="false"
 ENV RISK_TRACKING_ENABLED="true"
 ENV RISK_SCENE_GRAPH_ENABLED="true"
@@ -314,45 +314,43 @@ ENV PRIVACY_BLUR_RADIUS="24"
 # Validation gate (validation/run_validation.py): min critical-hazard recall.
 ENV VALIDATION_MIN_RECALL_CRITICAL="0.90"
 
-# ------- Event-driven VLM reasoning (Qwen-VL / DeepSeek-VL2) ------------------
+# ------- Event-driven VLM reasoning (Gemini API) ----------------------------
 # REAL adapter, but OFF by default and NEVER per-frame: /reason runs it on
 # demand and /detect triggers it asynchronously (rate-limited, above
 # REASONER_TRIGGER_LEVEL) and never waits for it. VLM output is an AI DRAFT
 # only (produced_by=vlm_reasoner, requires_human_review=true, should_alert=false)
 # -- it never becomes the safety authority. The deterministic engine remains the
-# signal. Weights are NOT baked into the image and NOT downloaded at build; they
-# resolve at runtime into REASONER_CACHE_DIR / the HF cache. REASONER_MODE=mock
-# gives a CPU, weight-free contract for app integration.
-ENV VLM_REASONER_ENABLED="false"
-ENV REASONER_MODE="qwen_vl"
-ENV QWEN_VL_MODEL_ID="Qwen/Qwen2.5-VL-3B-Instruct"
+# signal. REASONER_MODE=mock gives a CPU, weight-free contract for app integration.
+# GEMINI_API_KEY is intentionally NOT set here (never bake secrets).
+# Supported live modes: gemini | mock | disabled.
+# Removed modes (degrade to unavailable): qwen_vl | deepseek_vl2.
+ENV VLM_REASONER_ENABLED="true"
+ENV REASONER_MODE="gemini"
+# QWEN_VL_DEEP_* kept as inert future/deep/offline placeholders (not used live).
 ENV QWEN_VL_DEEP_MODEL_ID="Qwen/Qwen2.5-VL-7B-Instruct"
 ENV QWEN_VL_DEEP_ENABLED="false"
-ENV DEEPSEEK_VL_MODEL_ID="deepseek-ai/deepseek-vl2-small"
-ENV REASONER_SERVE_BACKEND="transformers"
-ENV QWEN_VLLM_BASE_URL="http://127.0.0.1:8001/v1"
-ENV QWEN_SGLANG_BASE_URL="http://127.0.0.1:30000/v1"
 ENV REASONER_DEVICE="cuda"
-ENV REASONER_DTYPE="auto"
-ENV REASONER_QUANTIZATION="4bit"
 ENV REASONER_MAX_IMAGE_SIDE="512"
-ENV QWEN_VL_MIN_VISUAL_TOKENS="256"
-ENV QWEN_VL_MAX_VISUAL_TOKENS="768"
-ENV REASONER_MAX_NEW_TOKENS="128"
 ENV REASONER_TIMEOUT_MS="2500"
 ENV REASONER_MIN_INTERVAL_MS="1500"
 ENV REASONER_CACHE_TTL_MS="10000"
 ENV REASONER_TRIGGER_LEVEL="YELLOW"
 ENV REASONER_MAX_WORKERS="1"
 ENV REASONER_MAX_SESSIONS="64"
-ENV REASONER_CACHE_DIR="/runpod-volume/models/qwen-vl-3b"
-ENV QWEN_VL_CACHE_DIR="/runpod-volume/models/qwen-vl-3b"
 ENV REASONER_MATCH_IOU_MIN="0.20"
 ENV REASONER_MATCH_CENTER_DIST_MAX="0.20"
 ENV REASONER_LINKED_RISK_TTL_MS="8000"
 ENV REASONER_UNMATCHED_CANDIDATE_TTL_MS="5000"
 ENV REASONER_LATEST_WINS="true"
 ENV REASONER_PENDING_FRAME_MAX_AGE_MS="2500"
+# Gemini-specific knobs (set GEMINI_API_KEY at deploy time, never here).
+ENV GEMINI_MODEL_ID="gemini-2.5-flash"
+ENV GEMINI_TIMEOUT_MS="12000"
+ENV GEMINI_MAX_OUTPUT_TOKENS="512"
+ENV GEMINI_TEMPERATURE="0"
+ENV GEMINI_MAX_IMAGE_SIDE="512"
+ENV GEMINI_MAX_DETECTED_LABELS="20"
+ENV GEMINI_REQUEST_RETRIES="1"
 
 # ------- Open-vocabulary scanner (GroundingDINO) -----------------------------
 # Optional, OFF by default, NEVER per-frame. Candidate-only output (requires
@@ -436,8 +434,8 @@ RUN python - <<'PY'
 import importlib, os, subprocess, sys
 sys.path.insert(0, "/app")
 import bitsandbytes as bnb  # noqa: F401
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration  # noqa: F401
-print("bitsandbytes OK")
+from transformers import AutoProcessor  # noqa: F401
+print("bitsandbytes and transformers OK (used by detector/build paths)")
 required = [
     "/app/worker_guards.py", "/app/worker_runtime.py", "/app/worker_security.py",
     "/app/server.py", "/app/bootstrap.py",

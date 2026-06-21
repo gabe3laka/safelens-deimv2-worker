@@ -40,3 +40,7 @@ pycocotools
 # ----- Build Mode (lightweight blueprint processing) -------------------------
 # CPU-only; NO new packages and NO GPU/model deps. Build Mode reuses Pillow and
 # numpy (above) plus opencv-python-headless (above) for edge/contour extraction.
+
+# ----- Gemini API (live vision reasoner) -------------------------------------
+# google-genai replaces the deprecated google-generativeai. API-only; no weights.
+google-genai>=1.0.0

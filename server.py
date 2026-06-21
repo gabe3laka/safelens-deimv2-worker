@@ -1092,10 +1092,6 @@ async def detect(payload: Dict[str, Any]):
                 snap = vlm.status_snapshot()
                 _reasoner_diag = {
                     "model_id": snap.get("model_id"),
-                    "quantization_requested": (snap.get("diagnostics") or {}).get("vlm.quantization_requested"),
-                    "quantization_active": (snap.get("diagnostics") or {}).get("vlm.quantization_active"),
-                    "quantization_backend": (snap.get("diagnostics") or {}).get("vlm.quantization_backend"),
-                    "bitsandbytes_available": (snap.get("diagnostics") or {}).get("vlm.bitsandbytes_available"),
                     "last_status": snap.get("last_status"),
                 }
                 resp_dict["reasoner_status"] = _normalize_reasoner_status(
