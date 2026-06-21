@@ -17,8 +17,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
-import json
-import logging
 import sys
 import time
 from pathlib import Path
