@@ -193,7 +193,7 @@ def test_corrections_skipped_outdoors():
 def test_detect_never_waits_on_vlm(monkeypatch):
     """attach_temporal returns immediately even if the VLM would take seconds."""
     import risk.vlm_reasoner as vlm
-    monkeypatch.setenv("REASONER_MODE", "qwen_vl")   # real path -> uses generate_json
+    monkeypatch.setenv("REASONER_MODE", "gemini")   # real path -> uses generate_json
 
     def _slow(*a, **k):
         time.sleep(2.0)
@@ -275,7 +275,7 @@ def test_privacy_blur_applied_before_vlm_frame_send(monkeypatch):
     np = pytest.importorskip("numpy")
     from PIL import Image
     import risk.vlm_reasoner as vlm
-    monkeypatch.setenv("REASONER_MODE", "qwen_vl")
+    monkeypatch.setenv("REASONER_MODE", "gemini")
     monkeypatch.setenv("PRIVACY_BLUR_ENABLED", "true")
     arr = np.zeros((80, 80, 3), dtype=np.uint8); arr[:, 40:] = 255
     buf = io.BytesIO(); Image.fromarray(arr).save(buf, format="JPEG")
@@ -381,7 +381,7 @@ def test_poll_only_temporal_does_not_replace_pending(monkeypatch):
 
 class _FakeVLM:
     """Stand-in for risk.vlm_reasoner in the real (non-mock) temporal path."""
-    def __init__(self, *, data=None, available=True, mode_="qwen_vl"):
+    def __init__(self, *, data=None, available=True, mode_="gemini"):
         self._data, self._available, self._mode = data, available, mode_
     def mode(self): return self._mode
     def enabled(self): return True

@@ -18,7 +18,6 @@ import asyncio
 import base64
 import io
 import json
-import logging
 import sys
 import time
 from pathlib import Path
@@ -183,161 +182,14 @@ def test_reasoner_status_snapshot():
                 "timeout_ms", "active_sessions"):
         assert key in snap, key
     assert snap["mode"] == "mock"
-    assert "diagnostics" in snap
-    assert "vlm.quantization_requested" in snap["diagnostics"]
-    assert "vlm.bitsandbytes_available" in snap["diagnostics"]
-
-
-def test_live_default_model_is_qwen_3b(monkeypatch):
-    monkeypatch.delenv("QWEN_VL_MODEL_ID", raising=False)
-    monkeypatch.setenv("REASONER_MODE", "qwen_vl")
-    assert vlm._model_id() == "Qwen/Qwen2.5-VL-3B-Instruct"
-    assert "7B" not in vlm._model_id()
+    assert snap["serve_backend"] == "mock"
 
 
 def test_live_default_output_and_image_limits(monkeypatch):
-    monkeypatch.delenv("REASONER_MAX_NEW_TOKENS", raising=False)
     monkeypatch.delenv("REASONER_MAX_IMAGE_SIDE", raising=False)
-    assert vlm._max_new_tokens() == 128
     assert vlm._max_image_side() == 512
 
 
-def test_visual_token_pixels_from_env(monkeypatch):
-    monkeypatch.setenv("QWEN_VL_MIN_VISUAL_TOKENS", "256")
-    monkeypatch.setenv("QWEN_VL_MAX_VISUAL_TOKENS", "768")
-    assert vlm._visual_pixels("QWEN_VL_MIN_VISUAL_TOKENS", 256) == 256 * (28 * 28)
-    assert vlm._visual_pixels("QWEN_VL_MAX_VISUAL_TOKENS", 768) == 768 * (28 * 28)
-
-
-def test_processor_receives_min_max_pixels(monkeypatch):
-    monkeypatch.setenv("REASONER_MODE", "qwen_vl")
-    monkeypatch.setenv("QWEN_VL_MIN_VISUAL_TOKENS", "300")
-    monkeypatch.setenv("QWEN_VL_MAX_VISUAL_TOKENS", "700")
-    monkeypatch.setenv("QWEN_VL_CACHE_DIR", "/cache/qwen")
-    monkeypatch.setenv("REASONER_CACHE_DIR", "/cache/reasoner")
-    captured = {}
-
-    class _NoGrad:
-        def __enter__(self): return self
-        def __exit__(self, *_): return False
-
-    class _Torch:
-        @staticmethod
-        def no_grad():
-            return _NoGrad()
-
-    class _Inputs(dict):
-        def to(self, _device):
-            return self
-
-    class _Ids:
-        shape = (1, 3)
-
-    class _Processor:
-        def __call__(self, **kwargs):
-            return _Inputs({"input_ids": _Ids()})
-
-        def apply_chat_template(self, *_a, **_k):
-            return "prompt"
-
-        def batch_decode(self, *_a, **_k):
-            return ["{}"]
-
-    class _AutoProcessor:
-        @staticmethod
-        def from_pretrained(_model_id, **kwargs):
-            captured["min_pixels"] = kwargs.get("min_pixels")
-            captured["max_pixels"] = kwargs.get("max_pixels")
-            captured["processor_cache_dir"] = kwargs.get("cache_dir")
-            return _Processor()
-
-    class _Model:
-        def __init__(self):
-            self.device = "cpu"
-
-        @staticmethod
-        def from_pretrained(*_a, **_k):
-            captured["model_cache_dir"] = _k.get("cache_dir")
-            return _Model()
-
-        def eval(self):
-            return self
-
-        def to(self, *_a, **_k):
-            return self
-
-        def generate(self, **_kwargs):
-            class _Out:
-                def __getitem__(self, _k):
-                    return [[4]]
-            return _Out()
-
-    fake_transformers = type(
-        "T",
-        (),
-        {
-            "AutoProcessor": _AutoProcessor,
-            "Qwen2_5_VLForConditionalGeneration": _Model,
-        },
-    )
-    monkeypatch.setitem(sys.modules, "torch", _Torch())
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    adapter = vlm._build_adapter("qwen_vl")
-    adapter["generate"]("prompt", None)
-    assert captured["min_pixels"] == 300 * (28 * 28)
-    assert captured["max_pixels"] == 700 * (28 * 28)
-    assert captured["processor_cache_dir"] == "/cache/qwen"
-    assert captured["model_cache_dir"] == "/cache/qwen"
-
-    monkeypatch.delenv("QWEN_VL_CACHE_DIR", raising=False)
-    monkeypatch.setenv("REASONER_CACHE_DIR", "/cache/reasoner-fallback")
-    captured.clear()
-    adapter = vlm._build_adapter("qwen_vl")
-    adapter["generate"]("prompt", None)
-    assert captured["processor_cache_dir"] == "/cache/reasoner-fallback"
-    assert captured["model_cache_dir"] == "/cache/reasoner-fallback"
-
-    monkeypatch.delenv("REASONER_CACHE_DIR", raising=False)
-    captured.clear()
-    adapter = vlm._build_adapter("qwen_vl")
-    adapter["generate"]("prompt", None)
-    assert captured["processor_cache_dir"] == "/runpod-volume/models/qwen-vl-3b"
-    assert captured["model_cache_dir"] == "/runpod-volume/models/qwen-vl-3b"
-
-
-def test_quantization_requested_and_available_activates(monkeypatch):
-    kwargs = {}
-    diag = {
-        "vlm.quantization_requested": "4bit",
-        "vlm.bitsandbytes_available": True,
-        "vlm.quantization_active": False,
-    }
-
-    class _FakeBnb:
-        def __init__(self, **kw):
-            self.kw = kw
-
-    monkeypatch.setitem(sys.modules, "transformers", type("T", (), {"BitsAndBytesConfig": _FakeBnb}))
-    vlm._configure_quantization(kwargs, diag)
-    assert "quantization_config" in kwargs
-    assert diag["vlm.quantization_active"] is True
-
-
-def test_quantization_requested_but_unavailable_degrades(monkeypatch):
-    kwargs = {}
-    diag = {
-        "vlm.quantization_requested": "4bit",
-        "vlm.bitsandbytes_available": False,
-        "vlm.quantization_active": False,
-    }
-    vlm._configure_quantization(kwargs, diag)
-    assert "quantization_config" not in kwargs
-    assert diag["vlm.quantization_active"] is False
-
-
-# -- server integration: /reason, /scan, /detect resilience, /debug/state ------
-
-@pytest.fixture()
 def server_mod(monkeypatch):
     import importlib
     monkeypatch.setenv("SKIP_WARMUP", "true")
@@ -450,7 +302,7 @@ def test_debug_state_has_reasoner_blocks(server_mod):
         assert "open_vocab_scanner" in body and "candidate_only" in body["open_vocab_scanner"]
 
 
-def test_background_qwen_timeout_stores_terminal_cache(monkeypatch):
+def test_background_reasoner_timeout_stores_terminal_cache(monkeypatch):
     monkeypatch.setenv("REASONER_TIMEOUT_MS", "50")
     monkeypatch.setattr(vlm, "reason_sync", lambda req: (time.sleep(0.3), {"reasoner_status": "ok"})[1])
     vlm._run_and_cache("cam_timeout", {"session_id": "cam_timeout", "frame_id": "f_timeout"})
@@ -459,18 +311,18 @@ def test_background_qwen_timeout_stores_terminal_cache(monkeypatch):
     assert cached["reasoner_status"] == "timeout"
 
 
-def test_background_qwen_exception_stores_terminal_cache(monkeypatch):
+def test_background_reasoner_exception_stores_terminal_cache(monkeypatch):
     def boom(req):
-        raise RuntimeError("qwen boom")
+        raise RuntimeError("reasoner boom")
     monkeypatch.setattr(vlm, "reason_sync", boom)
     vlm._run_and_cache("cam_error", {"session_id": "cam_error", "frame_id": "f_error"})
     cached = vlm.get_cached_draft("cam_error")
     assert cached is not None
     assert cached["reasoner_status"] == "error"
-    assert "qwen boom" in cached.get("error", "")
+    assert "reasoner boom" in cached.get("error", "")
 
 
-def test_background_qwen_success_stores_ready_cache(monkeypatch):
+def test_background_reasoner_success_stores_ready_cache(monkeypatch):
     monkeypatch.setattr(vlm, "reason_sync", lambda req: {"reasoner_status": "ok", "session_id": req["session_id"]})
     vlm._run_and_cache("cam_ok", {"session_id": "cam_ok", "frame_id": "f_ok"})
     cached = vlm.get_cached_draft("cam_ok")
@@ -541,41 +393,14 @@ def test_detect_force_reason_still_calls_maybe_trigger(server_mod, monkeypatch):
             server_mod._STATE["status"] = "cold"
 
 
-def test_qwen_markdown_code_fenced_json_extracts():
+def test_json_markdown_code_fenced_json_extracts():
     raw = '```json\n{"scene_summary":"ok","risks":[],"uncertain_items":[]}\n```'
     assert vlm._extract_json(raw)["scene_summary"] == "ok"
 
 
-def test_qwen_prose_plus_json_extracts():
+def test_json_prose_plus_json_extracts():
     raw = 'Here is the result: {"scene_summary":"ok","risks":[],"uncertain_items":[]} thanks'
     assert vlm._extract_json(raw)["risks"] == []
-
-
-def test_qwen_bad_json_repair_success(monkeypatch):
-    calls = []
-    def generate(prompt, image):
-        calls.append((prompt, image))
-        if len(calls) == 1:
-            return 'not json at all'
-        return '{"scene_summary":"repaired","risks":[],"uncertain_items":[]}'
-    monkeypatch.setitem(vlm._ADAPTER_STATE, "qwen_vl", {"available": True, "generate": generate})
-    resp = vlm._model_reason(vlm.ReasonRequest(session_id="cam_repair", frame_id="f1"), "qwen_vl")
-    assert resp.reasoner_status == "ok"
-    assert resp.scene_summary == "repaired"
-    assert len(calls) == 2
-    assert calls[1][1] is None
-    assert "Repair this output into valid JSON only" in calls[1][0]
-
-
-def test_qwen_bad_json_repair_failure_json_parse_error(monkeypatch):
-    def generate(prompt, image):
-        return 'still not json'
-    monkeypatch.setitem(vlm._ADAPTER_STATE, "qwen_vl", {"available": True, "generate": generate})
-    resp = vlm._model_reason(vlm.ReasonRequest(session_id="cam_bad", frame_id="f1"), "qwen_vl")
-    assert resp.reasoner_status == "json_parse_error"
-    assert resp.error == "model did not return valid JSON"
-    assert resp.risks == []
-    assert resp.uncertain_items == []
 
 
 def test_parse_failure_statuses_are_not_mapped_to_unavailable(server_mod):
@@ -639,80 +464,29 @@ def test_background_repair_failure_stores_json_parse_error(monkeypatch):
 
 # -- Fix 1: raw/repair excerpts must appear in the LOG MESSAGE text (not extra={}) --
 
-def test_parse_failure_logs_raw_excerpt_in_message_text(monkeypatch, caplog):
-    def generate(prompt, image):
-        return "PROSE_NOT_JSON_MARKER_12345 the model rambled"
-    monkeypatch.setitem(vlm._ADAPTER_STATE, "qwen_vl", {"available": True, "generate": generate})
-    with caplog.at_level(logging.WARNING, logger="safelens-vision-worker.vlm"):
-        resp = vlm._model_reason(vlm.ReasonRequest(session_id="cam_log", frame_id="f1"), "qwen_vl")
-    assert resp.reasoner_status == "json_parse_error"
-    parse_msgs = [r.getMessage() for r in caplog.records if "qwen_json_parse_failed" in r.getMessage()]
-    assert parse_msgs, "qwen_json_parse_failed not logged"
-    # excerpt is part of the formatted message string, not only record.extra
-    assert "qwen_raw_output_excerpt=" in parse_msgs[0]
-    assert "PROSE_NOT_JSON_MARKER_12345" in parse_msgs[0]
-
-
-def test_repair_failure_logs_both_excerpts_in_message_text(monkeypatch, caplog):
-    calls = []
-    def generate(prompt, image):
-        calls.append(1)
-        return "RAW_BAD_MARKER" if len(calls) == 1 else "REPAIR_BAD_MARKER"
-    monkeypatch.setitem(vlm._ADAPTER_STATE, "qwen_vl", {"available": True, "generate": generate})
-    with caplog.at_level(logging.WARNING, logger="safelens-vision-worker.vlm"):
-        resp = vlm._model_reason(vlm.ReasonRequest(session_id="cam_log2", frame_id="f1"), "qwen_vl")
-    assert resp.reasoner_status == "json_parse_error"
-    repair_msgs = [r.getMessage() for r in caplog.records if "qwen_json_repair_failed" in r.getMessage()]
-    assert repair_msgs, "qwen_json_repair_failed not logged"
-    assert "qwen_raw_output_excerpt=" in repair_msgs[0] and "RAW_BAD_MARKER" in repair_msgs[0]
-    assert "qwen_repair_output_excerpt=" in repair_msgs[0] and "REPAIR_BAD_MARKER" in repair_msgs[0]
-
-
-def test_safe_raw_output_excerpt_caps_and_escapes_newlines():
-    # newlines are escaped so the excerpt stays single-line in the log message
-    esc = vlm._safe_raw_output_excerpt("a\nb\rc")
-    assert "\n" not in esc and "\r" not in esc
-    assert "\\n" in esc and "\\r" in esc
-    # at most the first 800 chars of the SOURCE text are included
-    assert vlm._safe_raw_output_excerpt("x" * 2000) == "x" * 800
-
-
-# -- Fix 2: the repair prompt embeds VALID JSON (no `scene_summary":string`) --
-
-def test_repair_prompt_embeds_valid_json_and_no_type_literals():
-    rp = vlm._build_json_repair_prompt("some raw output")
-    assert 'scene_summary":string' not in rp
-    head = rp.split("Repair this output")[0]
-    obj = vlm._extract_json(head)
-    assert obj == {"scene_summary": "", "risks": [], "uncertain_items": []}
-    assert "some raw output" in rp  # the excerpt is still included for repair
-
-
-# -- Fix 3: robust JSON extraction (fenced / prose / multiple / nested) --
-
-def test_qwen_parser_handles_fenced_without_language_tag():
+def test_json_parser_handles_fenced_without_language_tag():
     raw = "```\n{\"scene_summary\":\"x\",\"risks\":[]}\n```"
     assert vlm._extract_json(raw)["scene_summary"] == "x"
 
 
-def test_qwen_parser_handles_prose_before_and_after_json():
+def test_json_parser_handles_prose_before_and_after_json():
     assert vlm._extract_json('Here you go: {"scene_summary":"x","risks":[]}')["scene_summary"] == "x"
     assert vlm._extract_json('{"scene_summary":"y","risks":[]} -- done')["scene_summary"] == "y"
 
 
-def test_qwen_parser_prefers_object_with_expected_keys_among_multiple():
+def test_json_parser_prefers_object_with_expected_keys_among_multiple():
     raw = '{"unrelated":1} then {"scene_summary":"real","risks":[]}'
     assert vlm._extract_json(raw)["scene_summary"] == "real"
 
 
-def test_qwen_parser_handles_nested_objects_and_braces_in_strings():
+def test_json_parser_handles_nested_objects_and_braces_in_strings():
     raw = 'noise {"scene_summary":"a } and { brace","risks":[{"bbox":{"x":0.1,"y":0.2}}]} tail'
     out = vlm._extract_json(raw)
     assert out["risks"][0]["bbox"]["x"] == 0.1
     assert out["scene_summary"] == "a } and { brace"
 
 
-def test_qwen_parser_returns_none_on_unrecoverable_output():
+def test_json_parser_returns_none_on_unrecoverable_output():
     assert vlm._extract_json("no json here at all") is None
     assert vlm._extract_json('{"scene_summary":"x","risks":[') is None  # truncated -> repair path
 

@@ -327,60 +327,30 @@ detector entities → per-session tracker (IoU/centroid) → scene graph (geomet
 
 `/debug/state` reports a `risk_engine` block (flags, matrix profile/version,
 active sessions, and the last evaluation's risk/alert counts + highest level).
-## Event-driven reasoning (Qwen-VL) + open-vocab scanner (GroundingDINO)
+## Event-driven reasoning (Gemini) + open-vocab scanner (GroundingDINO)
 
-`risk/vlm_reasoner.py` is a **real** Qwen-VL (and optional DeepSeek-VL2) reasoner
-behind `POST /reason`, plus a non-blocking trigger from `/detect`. It is **not**
-the safety authority — the deterministic engine is. The VLM only **explains /
-verifies / drafts** *after* the deterministic engine produces a candidate, and
-its output is always an **AI draft**: `produced_by="vlm_reasoner"`,
-`requires_human_review=true`, `should_alert=false` (enforced by the schema, not
-trusted from the model).
+`risk/vlm_reasoner.py` uses the Gemini API as the only live `/detect` vision reasoner. Supported live modes are `gemini`, `mock`, and `disabled`; removed transformer modes such as `qwen_vl` and `deepseek_vl2` degrade to `reasoner_status=unavailable` without loading weights. YOLO remains the coordinate truth and runs locally in real time.
 
-- **Never per-frame.** `/detect` calls `maybe_trigger()`: rate-limited
-  (`REASONER_MIN_INTERVAL_MS`), fired only at/above `REASONER_TRIGGER_LEVEL`
-  (default `ORANGE`), run on a bounded background executor. `/detect` **never
-  waits** — it attaches the most recent cached draft (if any) as `scene_risks`
-  plus a `reasoner_status` and returns. If the VLM is slow/unavailable the live
-  loop is unaffected.
-- **Real but lazy.** `torch`/`transformers` import only on first model use;
-  Qwen weights resolve at runtime into `REASONER_CACHE_DIR`/the HF cache and are
-  **never baked into the image or downloaded at Docker build**. Missing
-  deps/weights → `reasoner_status="unavailable"`; over-budget → `"timeout"`;
-  disabled → `"disabled"` — it never raises into the request path.
-- **`REASONER_MODE=mock`** gives a CPU, weight-free implementation of the full
-  `/reason` contract so the app can integrate before a GPU/Qwen deployment.
-- **Privacy.** When `PRIVACY_BLUR_ENABLED`, the frame is blurred (persons)
-  **before** it is passed to the model — no un-blurred frame reaches the VLM.
-
-`POST /reason` validates strictly against `risk/reason_schema.py`
-(`schema_version: "reason.v1"`). `POST /scan` is the optional open-vocabulary
-**GroundingDINO** scanner (`risk/grounding_dino_scanner.py`): disabled by
-default, throttled (never per-frame), output is **candidate-only**
-(`produced_by="open_vocab_scanner"`, `candidate_only=true`,
-`requires_human_review=true`) and can **never** trigger an official HSE alert.
-
-4-bit/8-bit quantization uses `bitsandbytes` (installed in the image and checked
-at build time). If quantization is requested but unavailable at runtime, the
-worker logs diagnostics and falls back to full precision without breaking `/detect`.
+Key safety properties:
+- **Event-driven, non-blocking.** `/detect` triggers reasoning only at/above `REASONER_TRIGGER_LEVEL` and never waits for Gemini.
+- **Scene-level only.** Gemini drafts summaries and linkable safety explanations; it must not emit raw detector dumps, entity boxes, class IDs, or confidences.
+- **Draft-only.** VLM output is always `produced_by=vlm_reasoner`, `requires_human_review=true`, and `should_alert=false`.
+- **Mock mode.** `REASONER_MODE=mock` remains CPU/weight-free for app integration.
+- **Deep placeholder.** `QWEN_VL_DEEP_MODEL_ID` / `QWEN_VL_DEEP_ENABLED=false` remain declared only as inert future/offline placeholders; they are not a live `/detect` path.
 
 | Env | Default | Notes |
-|-----|---------|-------|
-| `VLM_REASONER_ENABLED` | `false` | master switch for `/reason` + `/detect` trigger |
-| `REASONER_MODE` | `qwen_vl` | `qwen_vl` \| `deepseek_vl2` \| `mock` |
-| `QWEN_VL_MODEL_ID` | `Qwen/Qwen2.5-VL-3B-Instruct` | live default on 24GB GPUs; cache path precedence: `QWEN_VL_CACHE_DIR` → `REASONER_CACHE_DIR` |
-| `QWEN_VL_DEEP_MODEL_ID` / `QWEN_VL_DEEP_ENABLED` | `Qwen/Qwen2.5-VL-7B-Instruct` / `false` | optional offline/deep analysis only (not loaded on live `/detect`) |
-| `REASONER_TRIGGER_LEVEL` / `REASONER_MIN_INTERVAL_MS` | `YELLOW` / `1500` | live heartbeat trigger + cadence |
-| `REASONER_TIMEOUT_MS` | `2500` | hard cap; over-budget → `reasoner_status:"timeout"` |
-| `REASONER_MAX_IMAGE_SIDE` / `REASONER_MAX_NEW_TOKENS` | `512` / `128` | heartbeat-safe response latency |
-| `REASONER_QUANTIZATION` | `4bit` | `none` \| `8bit` \| `4bit` (GPU memory) |
-| `QWEN_VL_MIN_VISUAL_TOKENS` / `QWEN_VL_MAX_VISUAL_TOKENS` | `256` / `768` | processor `min_pixels`/`max_pixels`; optional accuracy mode: max `1280` |
-| `REASONER_SERVE_BACKEND` | `transformers` | hooks for future `vllm` / `sglang` backends |
-| `OPEN_VOCAB_SCANNER_ENABLED` | `false` | GroundingDINO scanner (candidate-only) |
+| --- | --- | --- |
+| `VLM_REASONER_ENABLED` | `true` | enables event-driven live reasoning |
+| `REASONER_MODE` | `gemini` | `gemini` \| `mock` \| `disabled`; removed modes return unavailable |
+| `GEMINI_MODEL_ID` | `gemini-2.5-flash` | live Gemini model |
+| `GEMINI_TIMEOUT_MS` | `12000` | Gemini request timeout budget |
+| `GEMINI_MAX_OUTPUT_TOKENS` | `512` | structured JSON response cap |
+| `GEMINI_TEMPERATURE` | `0` | deterministic scene-level output |
+| `GEMINI_MAX_IMAGE_SIDE` | `512` | Gemini image resize cap |
+| `GEMINI_MAX_DETECTED_LABELS` | `20` | label summary cap |
+| `QWEN_VL_DEEP_MODEL_ID` / `QWEN_VL_DEEP_ENABLED` | `Qwen/Qwen2.5-VL-7B-Instruct` / `false` | inert future/offline placeholder only |
 
-`/debug/state` reports `reasoner` and `open_vocab_scanner` blocks. **Deferred to
-a later PR:** fine-tuning, running the VLM every frame, and using the VLM as the
-alert authority (all explicitly out of scope).
+Do not set `GEMINI_API_KEY` in the Dockerfile; provide it as a runtime secret.
 
 ## Docker image
 
@@ -441,14 +411,9 @@ explicitly per deployment:
 
 ```env
 VLM_REASONER_ENABLED=true
-QWEN_VL_MODEL_ID=Qwen/Qwen2.5-VL-3B-Instruct
 QWEN_VL_DEEP_MODEL_ID=Qwen/Qwen2.5-VL-7B-Instruct
 QWEN_VL_DEEP_ENABLED=false
-REASONER_QUANTIZATION=4bit
 REASONER_MAX_IMAGE_SIDE=512
-QWEN_VL_MIN_VISUAL_TOKENS=256
-QWEN_VL_MAX_VISUAL_TOKENS=768
-REASONER_MAX_NEW_TOKENS=128
 REASONER_TIMEOUT_MS=2500
 REASONER_MIN_INTERVAL_MS=1500
 REASONER_RESULT_STALE_MS=8000
@@ -465,9 +430,6 @@ REASONER_MATCH_IOU_MIN=0.20
 REASONER_MATCH_CENTER_DIST_MAX=0.20
 REASONER_LINKED_RISK_TTL_MS=8000
 REASONER_UNMATCHED_CANDIDATE_TTL_MS=5000
-REASONER_SERVE_BACKEND=transformers
-QWEN_VLLM_BASE_URL=http://127.0.0.1:8001/v1
-QWEN_SGLANG_BASE_URL=http://127.0.0.1:30000/v1
 ```
 
 ## Files

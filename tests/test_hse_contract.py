@@ -465,26 +465,6 @@ def test_neither_frame_b64_nor_image_b64_rejected(monkeypatch):
 # Part 6 -- VLM prompt/schema includes linkability requirements
 # ---------------------------------------------------------------------------
 
-def test_vlm_prompt_includes_linkability_fields(monkeypatch):
-    monkeypatch.setenv("REASONER_MODE", "mock")
-    from risk.vlm_reasoner import _build_prompt
-    from risk.reason_schema import ReasonRequest
-    req = ReasonRequest(entities=[PERSON, FORKLIFT],
-                        deterministic_risks=[DET_RISK_LINKED])
-    prompt = _build_prompt(req)
-    for field in ("linked_entity_id", "involved_track_ids", "involved_detection_ids",
-                  "bbox", "approximate_region", "risk_reason", "evidence"):
-        assert field in prompt, f"'{field}' missing from VLM prompt"
-
-
-def test_vlm_prompt_includes_strict_linkability_rule(monkeypatch):
-    from risk.vlm_reasoner import _build_prompt
-    from risk.reason_schema import ReasonRequest
-    req = ReasonRequest(entities=[PERSON])
-    prompt = _build_prompt(req)
-    assert "STRICT RULES" in prompt or "MUST include" in prompt
-
-
 def test_vlm_schema_linkability_fields_on_vmlrisk():
     """VlmRisk model must carry all required linkability fields."""
     r = VlmRisk(
