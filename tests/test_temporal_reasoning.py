@@ -416,7 +416,7 @@ def test_attach_temporal_does_not_overwrite_hse_json_parse_error(monkeypatch):
     monkeypatch.setattr(ar, "maybe_trigger", lambda *a, **k: "not_triggered")
     out = tr.attach_temporal(
         {"entities": [{"label": "person", "confidence": 0.9}], "highest_risk_level": "YELLOW",
-         "risks": [], "reasoner_status": {"state": "json_parse_error", "model": "Qwen"}},
+         "risks": [], "reasoner_status": {"state": "json_parse_error", "model": "gemini-2.5-flash"}},
         session_id="cam_preserve", frame_b64="f", payload={})
     assert out["reasoner_status"]["state"] == "json_parse_error"
 

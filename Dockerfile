@@ -435,7 +435,7 @@ import importlib, os, subprocess, sys
 sys.path.insert(0, "/app")
 import bitsandbytes as bnb  # noqa: F401
 from transformers import AutoProcessor  # noqa: F401
-print("bitsandbytes and transformers OK (used by detector/build paths)")
+print("bitsandbytes and transformers OK (used by grounding_dino_scanner + DEIMv2 detector paths)")
 required = [
     "/app/worker_guards.py", "/app/worker_runtime.py", "/app/worker_security.py",
     "/app/server.py", "/app/bootstrap.py",

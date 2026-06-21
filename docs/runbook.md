@@ -158,8 +158,8 @@ mode (auth disabled) — never run production without it.
 | `/detect` 503 `model_not_ready` | cold worker | gateway should retry with backoff; `/warmup` |
 | `/detect` 503 `shutting_down` | graceful shutdown in progress | expected during redeploy; gateway drains/retries elsewhere |
 | `warning: risk_engine_error...`, `degradation_mode:no_risk` | risk layer failed | detection is preserved; inspect logs; risk auto-degrades (never 500) |
-| `reasoner_status:unavailable` | Qwen deps/weights absent or GPU OOM | expected fallback; install/resolve weights on the volume, lower `REASONER_QUANTIZATION`, or use a 3B model / `mock` |
-| `reasoner_status:timeout` | VLM slower than `REASONER_TIMEOUT_MS` | raise timeout slightly, lower `QWEN_VL_MAX_VISUAL_TOKENS`, or use `REASONER_MAX_NEW_TOKENS=80`; `/detect` is unaffected |
+| `reasoner_status:unavailable` | `GEMINI_API_KEY` not set, or Gemini API unreachable | set `GEMINI_API_KEY` at deploy time; use `REASONER_MODE=mock` for CPU integration without an API key |
+| `reasoner_status:timeout` | Gemini API slower than `GEMINI_TIMEOUT_MS` | raise `GEMINI_TIMEOUT_MS`; `/detect` is always unaffected |
 | backend shows `edgecrafter` when `yolo26` requested | YOLO load failed → auto-fallback | see `backend_status.fallback_reason`; fix YOLO weights/licensing |
 | volume write errors at runtime | `/runpod-volume` not writable by uid 10001 | chown the volume / mount writable (non-root container) |
 

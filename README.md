@@ -327,9 +327,9 @@ detector entities → per-session tracker (IoU/centroid) → scene graph (geomet
 
 `/debug/state` reports a `risk_engine` block (flags, matrix profile/version,
 active sessions, and the last evaluation's risk/alert counts + highest level).
-## Event-driven reasoning (Qwen-VL) + open-vocab scanner (GroundingDINO)
+## Event-driven reasoning (Gemini API) + open-vocab scanner (GroundingDINO)
 
-`risk/vlm_reasoner.py` is a **real** Qwen-VL (and optional DeepSeek-VL2) reasoner
+`risk/vlm_reasoner.py` is a **Gemini API** vision reasoner
 behind `POST /reason`, plus a non-blocking trigger from `/detect`. It is **not**
 the safety authority — the deterministic engine is. The VLM only **explains /
 verifies / drafts** *after* the deterministic engine produces a candidate, and
@@ -343,13 +343,12 @@ trusted from the model).
   waits** — it attaches the most recent cached draft (if any) as `scene_risks`
   plus a `reasoner_status` and returns. If the VLM is slow/unavailable the live
   loop is unaffected.
-- **Real but lazy.** `torch`/`transformers` import only on first model use;
-  Qwen weights resolve at runtime into `REASONER_CACHE_DIR`/the HF cache and are
-  **never baked into the image or downloaded at Docker build**. Missing
-  deps/weights → `reasoner_status="unavailable"`; over-budget → `"timeout"`;
+- **API-only, no weights.** Gemini is called via `google-genai`; no transformer
+  weights are ever loaded or baked into the image. Missing `GEMINI_API_KEY` →
+  `reasoner_status="unavailable"`; over-budget → `"timeout"`;
   disabled → `"disabled"` — it never raises into the request path.
 - **`REASONER_MODE=mock`** gives a CPU, weight-free implementation of the full
-  `/reason` contract so the app can integrate before a GPU/Qwen deployment.
+  `/reason` contract so the app can integrate before a Gemini API key is available.
 - **Privacy.** When `PRIVACY_BLUR_ENABLED`, the frame is blurred (persons)
   **before** it is passed to the model — no un-blurred frame reaches the VLM.
 

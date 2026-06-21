@@ -62,9 +62,6 @@ The temporal VLM reuses the `risk.vlm_reasoner` model knobs: `VLM_REASONER_ENABL
 | `REASONER_MATCH_CENTER_DIST_MAX` | `0.20` | max normalized center distance for linkage |
 | `REASONER_LINKED_RISK_TTL_MS` | `8000` | linked overlay freshness |
 | `REASONER_UNMATCHED_CANDIDATE_TTL_MS` | `5000` | unmatched advisory candidate freshness |
-| `REASONER_SERVE_BACKEND` | `transformers` | backend hook (`transformers` default) |
-| `QWEN_VLLM_BASE_URL` | `http://127.0.0.1:8001/v1` | future vLLM hook |
-| `QWEN_SGLANG_BASE_URL` | `http://127.0.0.1:30000/v1` | future SGLang hook |
 
 ## CPU agent
 
