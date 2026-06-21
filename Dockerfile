@@ -354,6 +354,23 @@ ENV REASONER_UNMATCHED_CANDIDATE_TTL_MS="5000"
 ENV REASONER_LATEST_WINS="true"
 ENV REASONER_PENDING_FRAME_MAX_AGE_MS="2500"
 
+# ------- Gemini API live vision reasoner (REASONER_MODE=gemini) ---------------
+# Recommended LIVE HSE scene-reasoning backend. Replaces only the live vision
+# model: YOLO stays the coordinate authority and the Qwen/DeepSeek transformer
+# paths above remain as legacy/fallback modes. Set REASONER_MODE=gemini +
+# VLM_REASONER_ENABLED=true at deploy time to use it.
+#
+# GEMINI_API_KEY is a DEPLOY-TIME SECRET: it is NOT set here, NOT baked into the
+# image, never logged, and never exposed in /debug/state. Provide it via the
+# RunPod environment/secret at deploy time.
+ENV GEMINI_MODEL_ID="gemini-2.5-flash"
+ENV GEMINI_TIMEOUT_MS="12000"
+ENV GEMINI_MAX_OUTPUT_TOKENS="512"
+ENV GEMINI_TEMPERATURE="0"
+ENV GEMINI_MAX_IMAGE_SIDE="512"
+ENV GEMINI_MAX_DETECTED_LABELS="20"
+ENV GEMINI_REQUEST_RETRIES="1"
+
 # ------- Open-vocabulary scanner (GroundingDINO) -----------------------------
 # Optional, OFF by default, NEVER per-frame. Candidate-only output (requires
 # human review); never triggers official HSE alerts. Weights resolve at runtime

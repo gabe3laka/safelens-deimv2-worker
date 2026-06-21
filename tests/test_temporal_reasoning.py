@@ -450,3 +450,59 @@ def test_temporal_force_reason_retries_after_terminal_failure(monkeypatch):
                               payload={"reasoning_preferences": {"force_reason": True}})
     assert status == "triggered"
     assert submitted["n"] == 1
+
+
+# -- Gemini live reasoner integration (temporal still works) -------------------
+
+def test_temporal_works_with_gemini_mode(monkeypatch):
+    import risk.gemini_reasoner as gr
+    import risk.vlm_reasoner as vlm
+
+    class _Resp:
+        def __init__(self, t):
+            self.text = t
+
+    class _Models:
+        def generate_content(self, model, contents, config):
+            return _Resp('{"scene_context":{"scene_type":"cafe",'
+                         '"environment_type":"indoor_public","confidence":0.8},'
+                         '"semantic_corrections":[]}')
+
+    class _Client:
+        def __init__(self, api_key=None):
+            self.models = _Models()
+
+    class _Parts:
+        @staticmethod
+        def from_bytes(data, mime_type):
+            return {}
+
+    class _Http:
+        def __init__(self, timeout=None):
+            pass
+
+    class _Cfg:
+        def __init__(self, **kw):
+            pass
+
+    class _Genai:
+        Client = _Client
+
+    class _Types:
+        Part = _Parts
+        HttpOptions = _Http
+        GenerateContentConfig = _Cfg
+
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setattr(gr, "_load_genai", lambda: (_Genai, _Types))
+    vlm._ADAPTER_STATE.pop("gemini", None)
+
+    sid = "cam_gem_temporal"
+    with ar._LOCK:
+        ar._INFLIGHT.add(sid)
+    ar._run_job(sid, {"entities": [{"label": "chair"}], "tracks": [], "frame_b64": None,
+                      "payload": {}, "reasons": ["scene_mismatch"]})
+    snap = mem.snapshot(sid)
+    assert snap["pending_reasoner_state"] == "ready"
+    assert snap["latest_scene_context"].get("scene_type") == "cafe"

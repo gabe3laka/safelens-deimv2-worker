@@ -38,7 +38,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import controls, privacy
+from . import controls, gemini_reasoner, privacy
 from .reason_schema import ReasonRequest, ReasonResponse, VlmRisk
 
 log = logging.getLogger("safelens-vision-worker.vlm")
@@ -58,6 +58,8 @@ def mode() -> str:
 
 def _model_id() -> str:
     m = mode()
+    if m == "gemini":
+        return gemini_reasoner.model_id()
     if m == "deepseek_vl2":
         return os.getenv("DEEPSEEK_VL_MODEL_ID", "deepseek-ai/deepseek-vl2-small")
     if m == "mock":
@@ -119,6 +121,8 @@ def _quantization_requested() -> str:
 
 
 def _serve_backend() -> str:
+    if mode() == "gemini":
+        return gemini_reasoner.SERVE_BACKEND
     return os.getenv("REASONER_SERVE_BACKEND", "transformers").strip().lower()
 
 
@@ -376,6 +380,8 @@ def reason_sync(payload: Any) -> Dict[str, Any]:
     try:
         if m == "mock":
             resp = _mock_reason(req)
+        elif m == "gemini":
+            resp = _gemini_reason(req)
         elif m in ("qwen_vl", "deepseek_vl2"):
             resp = _model_reason(req, m)
         else:
@@ -456,6 +462,88 @@ def _mock_reason(req: ReasonRequest) -> ReasonResponse:
 _ADAPTER_STATE: Dict[str, Any] = {}  # mode -> {"loaded": bool, "error": str, model/proc}
 
 
+# -- Gemini API live reasoner (REASONER_MODE=gemini) --------------------------
+
+def _build_gemini_prompt(req: ReasonRequest) -> str:
+    """Compact prompt for Gemini. Only object LABELS + the highest deterministic
+    risk level / types -- never raw bbox, class_id, confidence, or track history.
+    YOLO is the only coordinate authority; Gemini must not create boxes."""
+    labels: List[str] = []
+    seen = set()
+    for e in req.entities:
+        lbl = str(e.get("label") or "").strip()
+        if lbl and lbl not in seen:
+            seen.add(lbl)
+            labels.append(lbl)
+        if len(labels) >= gemini_reasoner.max_detected_labels():
+            break
+    highest = "GREEN"
+    det_types: List[str] = []
+    seen_types = set()
+    for dr in req.deterministic_risks:
+        lvl = str(dr.get("risk_level", "GREEN")).upper()
+        if _LEVEL.get(lvl, 0) > _LEVEL.get(highest, 0):
+            highest = lvl
+        ht = str(dr.get("hazard_type") or "").strip()
+        if ht and ht not in seen_types:
+            seen_types.add(ht)
+            det_types.append(ht)
+    objs = ", ".join(labels) if labels else "none"
+    det = ", ".join(det_types[:10]) if det_types else "none"
+    return (
+        "You are an HSE scene-reasoning assistant.\n"
+        "Analyze the current image for visible physical safety risks.\n"
+        "YOLO already provides object boxes and coordinates. Do not output "
+        "detector entities, bbox coordinates, class IDs, or confidence values.\n"
+        "Return only scene-level HSE reasoning using the provided JSON schema.\n"
+        "Rules:\n"
+        "- If no visible supported risk exists, return risks: [].\n"
+        "- Do not invent hazards.\n"
+        "- Do not assume danger from object presence alone.\n"
+        "- Use current-frame visual evidence only.\n"
+        "- Keep explanations short.\n"
+        "- Risks are AI drafts only and require human review.\n\n"
+        f"Detected object labels: {objs}\n"
+        f"Highest deterministic risk level: {highest}\n"
+        f"Known deterministic risk types: {det}"
+    )
+
+
+def _gemini_reason(req: ReasonRequest) -> ReasonResponse:
+    """Live HSE scene reasoning via the Gemini API (structured JSON output)."""
+    adapter = _get_adapter("gemini")
+    if not adapter.get("available"):
+        return ReasonResponse(reasoner_status="unavailable",
+                              error=adapter.get("error", "gemini unavailable"))
+    image = _decode_blurred(req, max_side=gemini_reasoner.max_image_side())
+    prompt = _build_gemini_prompt(req)
+    model_id_str = _model_id()
+    retries = gemini_reasoner._retries()
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            log.info("gemini_generate_started session_id=%s frame_id=%s attempt=%s",
+                     req.session_id, req.frame_id, attempt)
+            raw = adapter["generate"](
+                prompt, image, response_schema=gemini_reasoner.GeminiReasonResponse)
+            log.info("gemini_generate_completed session_id=%s frame_id=%s",
+                     req.session_id, req.frame_id)
+            return gemini_reasoner.to_reason_response(raw, model_id_str=model_id_str)
+        except Exception as exc:  # noqa: BLE001 -- never raise into the request path
+            last_exc = exc
+            if gemini_reasoner._is_timeout_error(exc):
+                log.warning("gemini_timeout session_id=%s frame_id=%s",
+                            req.session_id, req.frame_id)
+                return ReasonResponse(reasoner_status="timeout", reasoner_model=model_id_str,
+                                      error=f"gemini timeout: {exc}",
+                                      scene_summary="", risks=[], uncertain_items=[])
+    log.warning("gemini_error session_id=%s frame_id=%s: %s",
+                req.session_id, req.frame_id, last_exc)
+    return ReasonResponse(reasoner_status="error", reasoner_model=model_id_str,
+                          error=f"gemini: {last_exc}",
+                          scene_summary="", risks=[], uncertain_items=[])
+
+
 def _model_reason(req: ReasonRequest, m: str) -> ReasonResponse:
     adapter = _get_adapter(m)
     if not adapter["available"]:
@@ -514,7 +602,7 @@ def _model_reason(req: ReasonRequest, m: str) -> ReasonResponse:
         return ReasonResponse(reasoner_status="schema_error", error=f"schema: {exc}")
 
 
-def _decode_blurred(req: ReasonRequest):
+def _decode_blurred(req: ReasonRequest, *, max_side: Optional[int] = None):
     """Decode frame_b64 and blur persons before the model sees it (privacy)."""
     if not req.frame_b64:
         return None
@@ -522,7 +610,7 @@ def _decode_blurred(req: ReasonRequest):
         from PIL import Image
         raw = base64.b64decode(req.frame_b64)
         img = Image.open(io.BytesIO(raw)).convert("RGB")
-        side = _max_image_side()
+        side = max_side or _max_image_side()
         if max(img.size) > side:
             img.thumbnail((side, side))
         # Privacy egress guard (B8): no un-blurred frame may reach the VLM.
@@ -704,9 +792,12 @@ def _get_adapter(m: str) -> Dict[str, Any]:
 
 
 def _build_adapter(m: str) -> Dict[str, Any]:
-    """Import torch/transformers and load the model lazily. Returns a dict with
-    available + generate(prompt, image) or an error string. Heavy + best-effort:
-    on any import/load failure -> available=False so the worker degrades."""
+    """Build a generate() adapter for the mode. Returns a dict with
+    available + generate(prompt, image) or an error string. Best-effort: on any
+    import/load failure -> available=False so the worker degrades."""
+    if m == "gemini":
+        # Gemini is an API call -- no torch/transformers needed.
+        return gemini_reasoner.build_adapter()
     quant_diag = _quantization_diagnostics()
     try:
         import torch  # noqa: F401
@@ -835,7 +926,7 @@ def adapter_available() -> bool:
     if not enabled():
         return False
     m = mode()
-    if m not in ("qwen_vl", "deepseek_vl2"):
+    if m not in ("qwen_vl", "deepseek_vl2", "gemini"):
         return False
     try:
         return bool(_get_adapter(m).get("available"))
@@ -847,15 +938,36 @@ def adapter_available() -> bool:
 
 def status_snapshot() -> Dict[str, Any]:
     diag = _quantization_diagnostics()
-    adapter = _ADAPTER_STATE.get(mode())
+    m = mode()
+    adapter = _ADAPTER_STATE.get(m)
     if isinstance(adapter, dict):
         diag.update(adapter.get("diagnostics") or {})
     with _LOCK:
         active = len(_CACHE)
         last = dict(_LAST_STATUS)
+    if m == "gemini":
+        # Gemini live reasoner: non-secret config only (NEVER GEMINI_API_KEY).
+        return {
+            "enabled": enabled(),
+            "mode": "gemini",
+            "model_id": gemini_reasoner.model_id(),
+            "serve_backend": gemini_reasoner.SERVE_BACKEND,
+            "trigger_level": trigger_level(),
+            "min_interval_ms": _min_interval_ms(),
+            "timeout_ms": gemini_reasoner._timeout_ms(),
+            "cache_ttl_ms": _cache_ttl_ms(),
+            "max_image_side": gemini_reasoner.max_image_side(),
+            "max_output_tokens": gemini_reasoner._max_output_tokens(),
+            "max_detected_labels": gemini_reasoner.max_detected_labels(),
+            "privacy_blur_enabled": privacy.blur_enabled(),
+            "active_sessions": active,
+            "last_status": last,
+            "diagnostics": diag,
+            "note": "AI draft only; requires_human_review=true; never blocks /detect.",
+        }
     return {
         "enabled": enabled(),
-        "mode": mode(),
+        "mode": m,
         "model_id": _model_id(),
         "serve_backend": _serve_backend(),
         "trigger_level": trigger_level(),

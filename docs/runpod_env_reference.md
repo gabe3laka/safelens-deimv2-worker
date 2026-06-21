@@ -35,9 +35,38 @@ to `true` explicitly for live RunPod heartbeat deployments.
 | `GPU_REASONER_MAX_INFLIGHT` | `1` | bounded GPU reasoner slots (drop-if-busy) |
 
 The temporal VLM reuses the `risk.vlm_reasoner` model knobs: `VLM_REASONER_ENABLED`
-(default `false`), `REASONER_MODE` (`qwen_vl`|`deepseek_vl2`|`mock`|`disabled`),
+(default `false`), `REASONER_MODE` (`gemini`|`qwen_vl`|`deepseek_vl2`|`mock`|`disabled`),
 `REASONER_MIN_INTERVAL_MS`, `REASONER_CACHE_DIR`, `PRIVACY_BLUR_ENABLED`, etc.
 (unchanged — see the Dockerfile / `docs/runbook.md`).
+
+## Live vision reasoner: Gemini API (recommended)
+
+`REASONER_MODE=gemini` is the recommended LIVE HSE scene-reasoning backend. It
+replaces only the live vision-reasoning model — **YOLO stays the coordinate
+authority and remains local + real-time**, the **CPU agent stays separate**, and
+the **Qwen 7B/deep/offline path is untouched**. Qwen-VL / DeepSeek-VL2 remain
+available as legacy/fallback live modes. Gemini never creates boxes and never
+outputs detector entities / bbox / class_id / confidence — only scene-level
+reasoning, still emitted as an AI draft (`requires_human_review=true`,
+`should_alert=false`). Empty risks (`{"scene_summary":"","risks":[],"uncertain_items":[]}`)
+is a successful `ok`/`ready` result, not an error.
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `GEMINI_API_KEY` | _(unset)_ | **deploy-time secret**; required for `gemini`. Never baked, logged, or shown in `/debug/state`. Missing → `reasoner_status=unavailable` |
+| `GEMINI_MODEL_ID` | `gemini-2.5-flash` | Gemini model (env-driven; not hardcoded) |
+| `GEMINI_TIMEOUT_MS` | `12000` | per-request hard timeout → `reasoner_status=timeout` |
+| `GEMINI_MAX_OUTPUT_TOKENS` | `512` | structured-output token budget |
+| `GEMINI_TEMPERATURE` | `0` | sampling temperature |
+| `GEMINI_MAX_IMAGE_SIDE` | `512` | resize cap before inline JPEG bytes are sent |
+| `GEMINI_MAX_DETECTED_LABELS` | `20` | max distinct detector labels passed as compact context (no bbox/conf) |
+| `GEMINI_REQUEST_RETRIES` | `1` | retries on transient API errors |
+
+Uses the current official Google GenAI SDK (`google-genai>=1.0.0`,
+`from google import genai`), inline image bytes via `types.Part.from_bytes(...)`,
+and structured JSON output (`response_mime_type=application/json` +
+`response_schema`). Failure mapping: missing key → `unavailable`; API timeout →
+`timeout`; non-JSON → `json_parse_error`; schema mismatch → `schema_error`.
 
 ### Live heartbeat reasoner defaults (24 GB GPU)
 

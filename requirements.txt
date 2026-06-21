@@ -21,6 +21,11 @@ numpy>=1.24.0
 torch==2.6.0
 torchvision==0.21.0
 
+# Gemini API live HSE vision reasoner (REASONER_MODE=gemini -- recommended live
+# scene-reasoning backend). Imported lazily; the Qwen/DeepSeek transformer paths
+# below remain available as legacy/fallback live reasoners.
+google-genai>=1.0.0
+
 # Transformers stack (used by the DEIMv2 legacy fallback backend).
 transformers>=4.46.0,<4.50.0
 huggingface-hub>=0.26.0

@@ -30,6 +30,7 @@ import pytest
 
 pytest.importorskip("pydantic")
 
+import risk.gemini_reasoner as gemini_reasoner
 import risk.open_vocab_scanner as ovs
 import risk.vlm_reasoner as vlm
 from risk.reason_schema import ReasonResponse
@@ -762,3 +763,192 @@ def test_detect_surfaces_json_parse_error_not_unavailable(server_mod, monkeypatc
     finally:
         with server_mod._STATE_LOCK:
             server_mod._STATE["status"] = "cold"
+
+
+# -- Gemini live reasoner (REASONER_MODE=gemini) ------------------------------
+
+def _install_fake_gemini(monkeypatch, *, response_text="", raise_exc=None):
+    """Install a fake google-genai SDK so Gemini tests need no network/key/SDK.
+
+    Records calls so tests can assert the current SDK usage (Client(api_key=...),
+    types.Part.from_bytes, client.models.generate_content, structured config).
+    """
+    rec = {"generate": [], "parts": [], "client_keys": [], "configs": []}
+
+    class _Resp:
+        def __init__(self, text):
+            self.text = text
+
+    class _Models:
+        def generate_content(self, model, contents, config):
+            rec["generate"].append({"model": model, "contents": contents})
+            rec["configs"].append(config)
+            if raise_exc is not None:
+                raise raise_exc
+            return _Resp(response_text)
+
+    class _Client:
+        def __init__(self, api_key=None):
+            rec["client_keys"].append(api_key)
+            self.models = _Models()
+
+    class _Parts:
+        @staticmethod
+        def from_bytes(data, mime_type):
+            rec["parts"].append({"mime_type": mime_type, "len": len(data)})
+            return {"_part": mime_type}
+
+    class _Http:
+        def __init__(self, timeout=None):
+            self.timeout = timeout
+
+    class _Cfg:
+        def __init__(self, **kw):
+            self.kw = kw
+
+    class _Genai:
+        Client = _Client
+
+    class _Types:
+        Part = _Parts
+        HttpOptions = _Http
+        GenerateContentConfig = _Cfg
+
+    monkeypatch.setenv("VLM_REASONER_ENABLED", "true")
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(gemini_reasoner, "_load_genai", lambda: (_Genai, _Types))
+    vlm._ADAPTER_STATE.pop("gemini", None)
+    return rec
+
+
+def _gemini_req():
+    return {"session_id": "cam_g", "frame_id": "f1", "frame_b64": _tiny_jpeg_b64(),
+            "entities": [PERSON, FORKLIFT],
+            "deterministic_risks": [{"risk_level": "YELLOW", "hazard_type": "object_near_edge"}]}
+
+
+_GEMINI_OK = ('{"scene_summary":"a chair near a step",'
+              '"risks":[{"hazard_type":"object_near_edge","risk_level":"YELLOW",'
+              '"reason":"chair near edge","recommended_action":"move it",'
+              '"visual_evidence":["near edge"],"confidence":0.6}],"uncertain_items":[]}')
+
+
+def test_gemini_mode_selects_adapter_and_ok(monkeypatch):
+    _install_fake_gemini(monkeypatch, response_text=_GEMINI_OK)
+    out = vlm.reason_sync(_gemini_req())
+    assert out["reasoner_status"] == "ok"
+    assert out["reasoner_model"] == "gemini-2.5-flash"
+    assert len(out["risks"]) == 1
+    ReasonResponse(**out)  # strict schema-valid
+
+
+def test_gemini_missing_key_unavailable(monkeypatch):
+    monkeypatch.setenv("VLM_REASONER_ENABLED", "true")
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    vlm._ADAPTER_STATE.pop("gemini", None)
+    out = vlm.reason_sync(_gemini_req())
+    assert out["reasoner_status"] == "unavailable"
+    assert "GEMINI_API_KEY" in (out.get("error") or "")
+    assert vlm.adapter_available() is False
+
+
+def test_gemini_uses_current_sdk_inline_bytes_and_generate_content(monkeypatch):
+    rec = _install_fake_gemini(monkeypatch, response_text=_GEMINI_OK)
+    vlm.reason_sync(_gemini_req())
+    assert rec["client_keys"] == ["test-key"]                 # genai.Client(api_key=...)
+    assert rec["generate"], "client.models.generate_content was not called"
+    assert rec["parts"] and rec["parts"][-1]["mime_type"] == "image/jpeg"  # Part.from_bytes
+    cfg = rec["configs"][-1].kw
+    assert cfg["response_mime_type"] == "application/json"
+    assert cfg.get("response_schema") is gemini_reasoner.GeminiReasonResponse  # structured output
+
+
+def test_gemini_risks_forced_to_draft_contract(monkeypatch):
+    _install_fake_gemini(monkeypatch, response_text=_GEMINI_OK)
+    out = vlm.reason_sync(_gemini_req())
+    assert out["produced_by"] == "vlm_reasoner"
+    assert out["requires_human_review"] is True and out["should_alert"] is False
+    for r in out["risks"]:
+        assert r["requires_human_review"] is True and r["should_alert"] is False
+
+
+def test_gemini_empty_risks_is_success(monkeypatch):
+    _install_fake_gemini(monkeypatch,
+                         response_text='{"scene_summary":"","risks":[],"uncertain_items":[]}')
+    out = vlm.reason_sync(_gemini_req())
+    assert out["reasoner_status"] == "ok"
+    assert out["risks"] == []
+
+
+def test_gemini_malformed_returns_json_parse_error(monkeypatch):
+    _install_fake_gemini(monkeypatch, response_text="totally not json")
+    out = vlm.reason_sync(_gemini_req())
+    assert out["reasoner_status"] == "json_parse_error"
+
+
+def test_gemini_schema_mismatch_returns_schema_error(monkeypatch):
+    _install_fake_gemini(monkeypatch, response_text=(
+        '{"scene_summary":"x","risks":[{"hazard_type":"not_a_valid_type",'
+        '"risk_level":"YELLOW"}],"uncertain_items":[]}'))
+    out = vlm.reason_sync(_gemini_req())
+    assert out["reasoner_status"] == "schema_error"
+
+
+def test_gemini_timeout(monkeypatch):
+    _install_fake_gemini(monkeypatch, raise_exc=TimeoutError("deadline exceeded"))
+    out = vlm.reason_sync(_gemini_req())
+    assert out["reasoner_status"] == "timeout"
+
+
+def test_gemini_output_has_no_detector_keys(monkeypatch):
+    _install_fake_gemini(monkeypatch, response_text=_GEMINI_OK)
+    out = vlm.reason_sync(_gemini_req())
+    for k in ("entities", "bbox", "class_id"):
+        assert k not in out
+
+
+def test_generate_json_uses_gemini(monkeypatch):
+    _install_fake_gemini(monkeypatch,
+                         response_text='{"scene_context":{"scene_type":"cafe"},"semantic_corrections":[]}')
+    data = vlm.generate_json("temporal prompt", frame_b64=_tiny_jpeg_b64(), entities=[{"label": "cup"}])
+    assert data == {"scene_context": {"scene_type": "cafe"}, "semantic_corrections": []}
+
+
+def test_gemini_status_snapshot_hides_secret(monkeypatch):
+    _install_fake_gemini(monkeypatch, response_text=_GEMINI_OK)
+    snap = vlm.status_snapshot()
+    assert snap["mode"] == "gemini"
+    assert snap["serve_backend"] == "google_genai"
+    assert snap["model_id"] == "gemini-2.5-flash"
+    blob = json.dumps(snap)
+    assert "GEMINI_API_KEY" not in blob and "test-key" not in blob
+
+
+def test_gemini_prompt_forbids_detector_data_and_omits_numbers(monkeypatch):
+    p = vlm._build_gemini_prompt(vlm.ReasonRequest(
+        entities=[{"label": "chair", "class_id": 56, "confidence": 0.7753851413726807,
+                   "bbox": {"x": 0.32068837403009337}}],
+        deterministic_risks=[{"risk_level": "YELLOW", "hazard_type": "object_near_edge"}]))
+    assert "Do not output detector entities" in p
+    assert "chair" in p
+    assert "0.7753851413726807" not in p and "0.32068837403009337" not in p
+    assert "Highest deterministic risk level: YELLOW" in p
+
+
+def test_qwen_vl_mode_still_routes_to_transformer_path(monkeypatch):
+    # qwen_vl remains a legacy/fallback live mode -- not Gemini.
+    monkeypatch.setenv("REASONER_MODE", "qwen_vl")
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "qwen_vl", {
+        "available": True,
+        "generate": lambda p, i: '{"scene_summary":"q","risks":[],"uncertain_items":[]}'})
+    out = vlm.reason_sync(_req())
+    assert out["reasoner_status"] == "ok"
+    assert out["reasoner_model"] == "Qwen/Qwen2.5-VL-3B-Instruct"
+
+
+def test_qwen_deep_env_preserved_in_dockerfile():
+    df = (REPO_ROOT / "Dockerfile").read_text()
+    assert 'QWEN_VL_DEEP_MODEL_ID="Qwen/Qwen2.5-VL-7B-Instruct"' in df
+    assert 'QWEN_VL_DEEP_ENABLED="false"' in df
