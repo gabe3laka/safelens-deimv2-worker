@@ -46,6 +46,13 @@ HazardType = Literal[
 
 
 class GeminiRisk(BaseModel):
+    """Scene-level HSE risk returned by Gemini.
+
+    Deliberately omits bbox, class_id, and detector confidence — YOLO remains
+    the coordinate/detection truth.  Risks must be linked back to the anchor
+    ids supplied in the prompt's detected_object_anchors list.
+    """
+
     hazard_type: HazardType = Field(description="Visible HSE hazard category.")
     risk_level: RiskLevel = Field(
         description="Risk level based only on current-frame visual evidence."
@@ -60,6 +67,14 @@ class GeminiRisk(BaseModel):
 
 
 class GeminiReasonResponse(BaseModel):
+    """Top-level structured output schema for Gemini's HSE scene analysis.
+
+    Enforces that risks are linked to detected_object_anchors supplied in the
+    prompt.  This is the schema passed to Gemini via response_schema so the
+    model is constrained to emit exactly these fields.  The worker maps this
+    into ReasonResponse and calls enforce_draft_contract() before returning.
+    """
+
     scene_summary: str = Field(default="", max_length=240)
     risks: List[GeminiRisk] = Field(default_factory=list, max_length=3)
     uncertain_items: List[str] = Field(default_factory=list, max_length=5)

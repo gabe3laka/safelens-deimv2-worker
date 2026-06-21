@@ -449,7 +449,7 @@ def _compact_risk_context(req: ReasonRequest) -> Dict[str, Any]:
     levels = [str(r.get("risk_level", "GREEN")).upper() for r in risks if isinstance(r, dict)]
     highest = max(
         levels,
-        key=lambda x: {"GREEN": 0, "YELLOW": 1, "ORANGE": 2, "RED": 3}.get(x, 0),
+        key=lambda x: _LEVEL.get(x, 0),
         default="GREEN",
     )
     hazard_types = sorted({
