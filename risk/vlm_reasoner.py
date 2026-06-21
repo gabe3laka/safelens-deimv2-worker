@@ -115,6 +115,7 @@ _LAST_RUN_MS: Dict[str, int] = {}
 _INFLIGHT: set = set()
 _LAST_STATUS: Dict[str, Any] = {"status": "idle", "ts": 0}
 _EXECUTOR: Optional[ThreadPoolExecutor] = None
+_ADAPTER_STATE: Dict[str, Any] = {}         # mode -> built adapter dict
 
 
 def _executor() -> ThreadPoolExecutor:
@@ -377,8 +378,6 @@ def _mock_reason(req: ReasonRequest) -> ReasonResponse:
 
 
 # -- Gemini vision reasoner ---------------------------------------------------
-
-_ADAPTER_STATE: Dict[str, Any] = {}  # mode -> adapter dict
 
 
 def _gemini_reason(req: ReasonRequest) -> ReasonResponse:
