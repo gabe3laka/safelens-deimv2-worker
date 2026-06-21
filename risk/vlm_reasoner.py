@@ -490,7 +490,7 @@ def _render_annotated_reasoner_frame(
     if image is None or not anchors:
         return image
     try:
-        from PIL import Image as _PILImage, ImageDraw, ImageFont
+        from PIL import ImageDraw, ImageFont
 
         # Build entity_id → bbox mapping for quick lookup
         id_to_entity: Dict[str, Dict[str, Any]] = {}
