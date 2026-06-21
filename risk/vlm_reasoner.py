@@ -393,7 +393,12 @@ def _gemini_reason(req: ReasonRequest) -> ReasonResponse:
         log.info("gemini_generate_completed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
     except Exception as exc:  # noqa: BLE001
         return ReasonResponse(reasoner_status="error", error=f"gemini generate: {exc}")
-    data = _extract_json(raw)
+    # Adapter may return a pre-validated dict (GeminiReasonResponse.model_dump())
+    # or a raw string for legacy/fallback paths.
+    if isinstance(raw, dict):
+        data = raw
+    else:
+        data = _extract_json(raw)
     if data is None:
         log.warning(
             "gemini_json_parse_failed session_id=%s frame_id=%s raw_excerpt=%r",
@@ -412,46 +417,76 @@ def _gemini_reason(req: ReasonRequest) -> ReasonResponse:
         return ReasonResponse(reasoner_status="schema_error", error=f"schema: {exc}")
 
 
+def _compact_entity_anchors(req: ReasonRequest, limit: int) -> List[Dict[str, str]]:
+    """Return compact {id, label} anchors from req.entities (no bbox/conf/class_id)."""
+    anchors: List[Dict[str, str]] = []
+    for idx, e in enumerate(req.entities or []):
+        if not isinstance(e, dict):
+            continue
+        label = str(
+            e.get("semantic_label")
+            or e.get("display_label")
+            or e.get("label")
+            or e.get("class_name")
+            or "object"
+        ).strip() or "object"
+        track = (
+            e.get("track_id")
+            or e.get("id")
+            or e.get("entity_id")
+            or e.get("detection_id")
+            or f"entity_{idx}"
+        )
+        anchors.append({"id": str(track), "label": label[:50]})
+        if len(anchors) >= limit:
+            break
+    return anchors
+
+
+def _compact_risk_context(req: ReasonRequest) -> Dict[str, Any]:
+    """Return a compact scene context without raw detector dumps."""
+    risks = req.deterministic_risks or []
+    levels = [str(r.get("risk_level", "GREEN")).upper() for r in risks if isinstance(r, dict)]
+    highest = max(
+        levels,
+        key=lambda x: {"GREEN": 0, "YELLOW": 1, "ORANGE": 2, "RED": 3}.get(x, 0),
+        default="GREEN",
+    )
+    hazard_types = sorted({
+        str(r.get("hazard_type") or r.get("hazard") or "other")
+        for r in risks
+        if isinstance(r, dict)
+    })[:8]
+    return {
+        "detected_object_anchors": _compact_entity_anchors(req, gemini_reasoner.max_detected_labels()),
+        "highest_deterministic_risk_level": highest,
+        "known_deterministic_risk_types": hazard_types,
+        "scene_hint": "live_hse_monitoring",
+    }
+
+
 def _build_gemini_prompt(req: ReasonRequest) -> str:
-    max_labels = gemini_reasoner.max_detected_labels()
-    context = {
-        "deterministic_risks": req.deterministic_risks[:10],
-        "entities": req.entities[:max_labels],
-        "tracks": req.tracks[:20],
-        "scene_graph": {"relations": (req.scene_graph or {}).get("relations", [])[:20]},
-    }
-    schema_hint = {
-        "scene_summary": "Short visible scene description.",
-        "risks": [
-            {
-                "risk_id": "gemini_1",
-                "hazard_type": "object_near_edge",
-                "risk_level": "YELLOW",
-                "risk_state": "active",
-                "linked_entity_id": "track_1",
-                "involved_track_ids": ["track_1"],
-                "involved_detection_ids": [],
-                "bbox": None,
-                "reason": "The object appears close to an edge.",
-                "visual_evidence": ["object near edge"],
-                "recommended_action": "Move the object away from the edge.",
-                "confidence": 0.7,
-            }
-        ],
-        "uncertain_items": [],
-    }
+    context = _compact_risk_context(req)
     return (
-        "Return JSON only. No markdown. No prose. No code fences. "
-        "If uncertain, return an empty risks array. At most 3 risks. "
-        "Every risk MUST include at least one linkability field: "
-        "linked_entity_id, involved_track_ids, involved_detection_ids, bbox, or approximate_region. "
-        "STRICT RULES: Do not invent risks; risks: [] is a successful answer. "
-        "Do not set should_alert or requires_human_review. "
-        "Do not output bbox coordinates for detections -- YOLO is the coordinate truth. "
-        "Use this small schema shape exactly; omit fields you cannot support.\n"
-        f"Target JSON example: {json.dumps(schema_hint, separators=(',', ':'))}\n"
-        "Detector/tracker context:\n"
-        + json.dumps(context, default=str, separators=(",", ":"))[:4000]
+        "You are an HSE scene-reasoning assistant.\n"
+        "Analyze the current image for visible physical safety risks.\n"
+        "YOLO already provides object boxes and coordinates. "
+        "Do not output detector entities, bounding boxes, class IDs, "
+        "detector confidence values, or track geometry.\n"
+        "Return only JSON matching the provided schema.\n"
+        "Rules:\n"
+        '- If no visible supported risk exists, return {"scene_summary":"","risks":[],"uncertain_items":[]}.\n'
+        "- Do not invent hazards.\n"
+        "- Do not assume danger from object presence alone.\n"
+        "- Use current-frame visual evidence only.\n"
+        "- Keep reasons and actions short.\n"
+        "- At most 3 risks.\n"
+        "- Link risks only to ids in detected_object_anchors.\n"
+        "- If a risk cannot be visually supported and linked, "
+        "put it in uncertain_items or return no risk.\n"
+        "- The model is advisory only; the worker will enforce human-review metadata.\n"
+        "Compact context:\n"
+        + json.dumps(context, default=str, separators=(",", ":"))
     )
 
 
@@ -526,6 +561,8 @@ def generate_json(prompt: str, *, frame_b64: Optional[str] = None,
     except Exception as exc:  # noqa: BLE001
         log.warning("vlm: generate_json failed: %s", exc)
         return None
+    if isinstance(raw, dict):
+        return raw
     return _extract_json(raw)
 
 

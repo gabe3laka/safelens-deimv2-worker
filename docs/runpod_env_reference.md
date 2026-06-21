@@ -45,7 +45,7 @@ The temporal VLM reuses the `risk.vlm_reasoner` model knobs: `VLM_REASONER_ENABL
 | --- | --- | --- |
 | `GEMINI_MODEL_ID` | `gemini-2.5-flash` | live Gemini model (API-only, no weights) |
 | `GEMINI_TIMEOUT_MS` | `12000` | hard budget for Gemini API calls |
-| `GEMINI_MAX_OUTPUT_TOKENS` | `512` | max tokens in Gemini JSON response |
+| `GEMINI_MAX_OUTPUT_TOKENS` | `1024` | max tokens in Gemini JSON response |
 | `GEMINI_TEMPERATURE` | `0` | deterministic Gemini output |
 | `GEMINI_MAX_IMAGE_SIDE` | `512` | pre-processor image resize cap |
 | `GEMINI_MAX_DETECTED_LABELS` | `20` | max detector labels sent in Gemini prompt |
