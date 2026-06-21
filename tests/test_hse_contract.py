@@ -467,30 +467,35 @@ def test_neither_frame_b64_nor_image_b64_rejected(monkeypatch):
 
 def test_gemini_prompt_includes_linkability_fields(monkeypatch):
     monkeypatch.setenv("REASONER_MODE", "gemini")
-    from risk.vlm_reasoner import _build_gemini_prompt
+    from risk.vlm_reasoner import _build_gemini_prompt, _build_box_decision_anchors, _select_candidate_entities
+    import risk.gemini_reasoner as gr
     from risk.reason_schema import ReasonRequest
     req = ReasonRequest(entities=[PERSON, FORKLIFT],
                         deterministic_risks=[DET_RISK_LINKED])
-    prompt = _build_gemini_prompt(req)
-    # New compact prompt passes anchor ids so Gemini can link risks to them.
-    # Field names are enforced via structured-output schema, not spelled out in prompt text.
-    assert "detected_object_anchors" in prompt, "'detected_object_anchors' missing from Gemini prompt"
-    # At least one anchor id should be present (from PERSON / FORKLIFT entities)
-    assert any(kw in prompt for kw in ("person", "forklift", "trk_")), \
+    candidates = _select_candidate_entities(req.entities, req.deterministic_risks,
+                                            gr.max_box_candidates())
+    anchors = _build_box_decision_anchors(candidates)
+    prompt = _build_gemini_prompt(req, anchors)
+    # New box-decision prompt passes anchors so Gemini can reference them.
+    # Key section name or at least one entity label must appear.
+    assert any(kw in prompt for kw in ("detected_box_anchors", "person", "forklift")), \
         "No entity anchor found in prompt"
 
 
 def test_gemini_prompt_includes_strict_linkability_rule(monkeypatch):
-    from risk.vlm_reasoner import _build_gemini_prompt
+    from risk.vlm_reasoner import _build_gemini_prompt, _build_box_decision_anchors, _select_candidate_entities
+    import risk.gemini_reasoner as gr
     from risk.reason_schema import ReasonRequest
     req = ReasonRequest(entities=[PERSON])
-    prompt = _build_gemini_prompt(req)
-    # New prompt expresses the linking rule as "Link risks only to ids in detected_object_anchors"
+    candidates = _select_candidate_entities(req.entities, req.deterministic_risks,
+                                            gr.max_box_candidates())
+    anchors = _build_box_decision_anchors(candidates)
+    prompt = _build_gemini_prompt(req, anchors)
+    # Box-decision prompt enforces the linking rule via anchor IDs
     assert (
-        "STRICT RULES" in prompt
-        or "MUST include" in prompt
-        or "detected_object_anchors" in prompt
-        or "Link risks only" in prompt
+        "detected_box_anchors" in prompt
+        or "box IDs" in prompt
+        or "Use only box IDs" in prompt
     )
 
 
