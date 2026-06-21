@@ -327,9 +327,9 @@ detector entities → per-session tracker (IoU/centroid) → scene graph (geomet
 
 `/debug/state` reports a `risk_engine` block (flags, matrix profile/version,
 active sessions, and the last evaluation's risk/alert counts + highest level).
-## Event-driven reasoning (Qwen-VL) + open-vocab scanner (GroundingDINO)
+## Event-driven reasoning (Gemini API) + open-vocab scanner (GroundingDINO)
 
-`risk/vlm_reasoner.py` is a **real** Qwen-VL (and optional DeepSeek-VL2) reasoner
+`risk/vlm_reasoner.py` is a **Gemini API** vision reasoner
 behind `POST /reason`, plus a non-blocking trigger from `/detect`. It is **not**
 the safety authority — the deterministic engine is. The VLM only **explains /
 verifies / drafts** *after* the deterministic engine produces a candidate, and
@@ -343,13 +343,12 @@ trusted from the model).
   waits** — it attaches the most recent cached draft (if any) as `scene_risks`
   plus a `reasoner_status` and returns. If the VLM is slow/unavailable the live
   loop is unaffected.
-- **Real but lazy.** `torch`/`transformers` import only on first model use;
-  Qwen weights resolve at runtime into `REASONER_CACHE_DIR`/the HF cache and are
-  **never baked into the image or downloaded at Docker build**. Missing
-  deps/weights → `reasoner_status="unavailable"`; over-budget → `"timeout"`;
+- **API-only, no weights.** Gemini is called via `google-genai`; no transformer
+  weights are ever loaded or baked into the image. Missing `GEMINI_API_KEY` →
+  `reasoner_status="unavailable"`; over-budget → `"timeout"`;
   disabled → `"disabled"` — it never raises into the request path.
 - **`REASONER_MODE=mock`** gives a CPU, weight-free implementation of the full
-  `/reason` contract so the app can integrate before a GPU/Qwen deployment.
+  `/reason` contract so the app can integrate before a Gemini API key is available.
 - **Privacy.** When `PRIVACY_BLUR_ENABLED`, the frame is blurred (persons)
   **before** it is passed to the model — no un-blurred frame reaches the VLM.
 
@@ -366,16 +365,16 @@ worker logs diagnostics and falls back to full precision without breaking `/dete
 
 | Env | Default | Notes |
 |-----|---------|-------|
-| `VLM_REASONER_ENABLED` | `false` | master switch for `/reason` + `/detect` trigger |
-| `REASONER_MODE` | `qwen_vl` | `qwen_vl` \| `deepseek_vl2` \| `mock` |
-| `QWEN_VL_MODEL_ID` | `Qwen/Qwen2.5-VL-3B-Instruct` | live default on 24GB GPUs; cache path precedence: `QWEN_VL_CACHE_DIR` → `REASONER_CACHE_DIR` |
-| `QWEN_VL_DEEP_MODEL_ID` / `QWEN_VL_DEEP_ENABLED` | `Qwen/Qwen2.5-VL-7B-Instruct` / `false` | optional offline/deep analysis only (not loaded on live `/detect`) |
+| `VLM_REASONER_ENABLED` | `true` | master switch for `/reason` + `/detect` trigger |
+| `REASONER_MODE` | `gemini` | `gemini` (default) \| `mock` \| `disabled`; `qwen_vl`/`deepseek_vl2` degrade to `unavailable` |
+| `GEMINI_MODEL_ID` | `gemini-2.5-flash` | Gemini model (API-only, no weights) |
+| `GEMINI_TIMEOUT_MS` | `12000` | Gemini API hard timeout |
+| `GEMINI_MAX_OUTPUT_TOKENS` | `512` | max tokens in Gemini response |
+| `GEMINI_MAX_IMAGE_SIDE` | `512` | image resize cap before sending to Gemini |
+| `QWEN_VL_DEEP_MODEL_ID` / `QWEN_VL_DEEP_ENABLED` | `Qwen/Qwen2.5-VL-7B-Instruct` / `false` | inert future/deep/offline placeholder (not used live) |
 | `REASONER_TRIGGER_LEVEL` / `REASONER_MIN_INTERVAL_MS` | `YELLOW` / `1500` | live heartbeat trigger + cadence |
 | `REASONER_TIMEOUT_MS` | `2500` | hard cap; over-budget → `reasoner_status:"timeout"` |
-| `REASONER_MAX_IMAGE_SIDE` / `REASONER_MAX_NEW_TOKENS` | `512` / `128` | heartbeat-safe response latency |
-| `REASONER_QUANTIZATION` | `4bit` | `none` \| `8bit` \| `4bit` (GPU memory) |
-| `QWEN_VL_MIN_VISUAL_TOKENS` / `QWEN_VL_MAX_VISUAL_TOKENS` | `256` / `768` | processor `min_pixels`/`max_pixels`; optional accuracy mode: max `1280` |
-| `REASONER_SERVE_BACKEND` | `transformers` | hooks for future `vllm` / `sglang` backends |
+| `REASONER_MAX_IMAGE_SIDE` | `512` | image resize cap |
 | `OPEN_VOCAB_SCANNER_ENABLED` | `false` | GroundingDINO scanner (candidate-only) |
 
 `/debug/state` reports `reasoner` and `open_vocab_scanner` blocks. **Deferred to
@@ -434,21 +433,24 @@ HF_HOME=/runpod-volume/.cache/huggingface
 TRANSFORMERS_CACHE=/runpod-volume/.cache/huggingface
 ```
 
-### Recommended RunPod live heartbeat env (24 GB GPU)
+### Recommended RunPod live heartbeat env (Gemini API)
 
-`VLM_REASONER_ENABLED` stays `false` in the image by default; enable it
-explicitly per deployment:
+`VLM_REASONER_ENABLED` is `true` in the image by default with `REASONER_MODE=gemini`.
+Set `GEMINI_API_KEY` at deploy time (never bake into the image):
 
 ```env
 VLM_REASONER_ENABLED=true
-QWEN_VL_MODEL_ID=Qwen/Qwen2.5-VL-3B-Instruct
+REASONER_MODE=gemini
+GEMINI_MODEL_ID=gemini-2.5-flash
+GEMINI_TIMEOUT_MS=12000
+GEMINI_MAX_OUTPUT_TOKENS=512
+GEMINI_TEMPERATURE=0
+GEMINI_MAX_IMAGE_SIDE=512
+GEMINI_MAX_DETECTED_LABELS=20
+GEMINI_REQUEST_RETRIES=1
 QWEN_VL_DEEP_MODEL_ID=Qwen/Qwen2.5-VL-7B-Instruct
 QWEN_VL_DEEP_ENABLED=false
-REASONER_QUANTIZATION=4bit
 REASONER_MAX_IMAGE_SIDE=512
-QWEN_VL_MIN_VISUAL_TOKENS=256
-QWEN_VL_MAX_VISUAL_TOKENS=768
-REASONER_MAX_NEW_TOKENS=128
 REASONER_TIMEOUT_MS=2500
 REASONER_MIN_INTERVAL_MS=1500
 REASONER_RESULT_STALE_MS=8000
@@ -465,9 +467,6 @@ REASONER_MATCH_IOU_MIN=0.20
 REASONER_MATCH_CENTER_DIST_MAX=0.20
 REASONER_LINKED_RISK_TTL_MS=8000
 REASONER_UNMATCHED_CANDIDATE_TTL_MS=5000
-REASONER_SERVE_BACKEND=transformers
-QWEN_VLLM_BASE_URL=http://127.0.0.1:8001/v1
-QWEN_SGLANG_BASE_URL=http://127.0.0.1:30000/v1
 ```
 
 ## Files

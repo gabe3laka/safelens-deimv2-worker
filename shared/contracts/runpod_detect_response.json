@@ -46,7 +46,7 @@
   ],
   "reasoner_status": {
     "enabled": true,
-    "mode": "qwen_vl",
+    "mode": "gemini",
     "state": "ready",
     "last_trigger": "scene_mismatch",
     "result_age_ms": 2000,

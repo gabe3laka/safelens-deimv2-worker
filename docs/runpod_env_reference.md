@@ -35,23 +35,24 @@ to `true` explicitly for live RunPod heartbeat deployments.
 | `GPU_REASONER_MAX_INFLIGHT` | `1` | bounded GPU reasoner slots (drop-if-busy) |
 
 The temporal VLM reuses the `risk.vlm_reasoner` model knobs: `VLM_REASONER_ENABLED`
-(default `false`), `REASONER_MODE` (`qwen_vl`|`deepseek_vl2`|`mock`|`disabled`),
-`REASONER_MIN_INTERVAL_MS`, `REASONER_CACHE_DIR`, `PRIVACY_BLUR_ENABLED`, etc.
-(unchanged — see the Dockerfile / `docs/runbook.md`).
+(default `true`), `REASONER_MODE` (`gemini`|`mock`|`disabled`; `qwen_vl`/`deepseek_vl2` degrade to `unavailable`),
+`REASONER_MIN_INTERVAL_MS`, `PRIVACY_BLUR_ENABLED`, etc.
+(see the Dockerfile / `docs/runbook.md`).
 
-### Live heartbeat reasoner defaults (24 GB GPU)
+### Live heartbeat reasoner defaults (Gemini API)
 
 | Env | Default | Meaning |
 | --- | --- | --- |
-| `QWEN_VL_MODEL_ID` | `Qwen/Qwen2.5-VL-3B-Instruct` | live heartbeat model |
-| `QWEN_VL_DEEP_MODEL_ID` | `Qwen/Qwen2.5-VL-7B-Instruct` | optional offline/deep model only |
+| `GEMINI_MODEL_ID` | `gemini-2.5-flash` | live Gemini model (API-only, no weights) |
+| `GEMINI_TIMEOUT_MS` | `12000` | hard budget for Gemini API calls |
+| `GEMINI_MAX_OUTPUT_TOKENS` | `512` | max tokens in Gemini JSON response |
+| `GEMINI_TEMPERATURE` | `0` | deterministic Gemini output |
+| `GEMINI_MAX_IMAGE_SIDE` | `512` | pre-processor image resize cap |
+| `GEMINI_MAX_DETECTED_LABELS` | `20` | max detector labels sent in Gemini prompt |
+| `GEMINI_REQUEST_RETRIES` | `1` | retries on transient Gemini API error |
+| `QWEN_VL_DEEP_MODEL_ID` | `Qwen/Qwen2.5-VL-7B-Instruct` | inert future/deep/offline placeholder only |
 | `QWEN_VL_DEEP_ENABLED` | `false` | guardrail; no live dual-model load |
-| `QWEN_VL_CACHE_DIR` | `/runpod-volume/models/qwen-vl-3b` | preferred Qwen cache path (overrides `REASONER_CACHE_DIR`) |
-| `REASONER_CACHE_DIR` | `/runpod-volume/models/qwen-vl-3b` | legacy shared cache fallback |
 | `REASONER_MAX_IMAGE_SIDE` | `512` | pre-processor image resize cap |
-| `QWEN_VL_MIN_VISUAL_TOKENS` | `256` | processor `min_pixels=tokens*28*28` |
-| `QWEN_VL_MAX_VISUAL_TOKENS` | `768` | processor `max_pixels=tokens*28*28` (optional accuracy: `1280`) |
-| `REASONER_MAX_NEW_TOKENS` | `128` | compact heartbeat JSON budget (supports 80) |
 | `REASONER_TIMEOUT_MS` | `2500` | hard budget for async reasoner calls |
 | `REASONER_MIN_INTERVAL_MS` | `1500` | per-session trigger throttle |
 | `REASONER_CACHE_TTL_MS` | `10000` | cached draft freshness window |
@@ -61,9 +62,6 @@ The temporal VLM reuses the `risk.vlm_reasoner` model knobs: `VLM_REASONER_ENABL
 | `REASONER_MATCH_CENTER_DIST_MAX` | `0.20` | max normalized center distance for linkage |
 | `REASONER_LINKED_RISK_TTL_MS` | `8000` | linked overlay freshness |
 | `REASONER_UNMATCHED_CANDIDATE_TTL_MS` | `5000` | unmatched advisory candidate freshness |
-| `REASONER_SERVE_BACKEND` | `transformers` | backend hook (`transformers` default) |
-| `QWEN_VLLM_BASE_URL` | `http://127.0.0.1:8001/v1` | future vLLM hook |
-| `QWEN_SGLANG_BASE_URL` | `http://127.0.0.1:30000/v1` | future SGLang hook |
 
 ## CPU agent
 

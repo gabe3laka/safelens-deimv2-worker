@@ -1,6 +1,6 @@
 """
-risk/vlm_reasoner.py -- REAL event-driven Qwen-VL (and optional DeepSeek-VL2)
-reasoning adapter for POST /reason and the non-blocking /detect trigger.
+risk/vlm_reasoner.py -- event-driven vision reasoning adapter for POST /reason
+and the non-blocking /detect trigger.
 
 Design / safety rules (hard):
   * The deterministic engine is the safety signal. The VLM only explains /
@@ -12,23 +12,20 @@ Design / safety rules (hard):
     run on a bounded background executor, and it NEVER blocks the live loop --
     /detect attaches the most recent cached draft (if any) + a reasoner_status
     and returns immediately.
-  * Real but lazy: torch/transformers are imported only on first model use, and
-    weights resolve at runtime into REASONER_CACHE_DIR / the HF cache (NEVER
-    baked at Docker build). If the model/deps are unavailable the worker
-    degrades to reasoner_status="unavailable"/"timeout"/"disabled" with empty
-    risks -- it never raises into the request path.
   * Privacy: when PRIVACY_BLUR_ENABLED, the frame is blurred (persons) before it
     is ever passed to the model. No un-blurred frame reaches the VLM.
 
-Modes (REASONER_MODE): qwen_vl (default) | deepseek_vl2 | mock | disabled.
+Modes (REASONER_MODE): gemini (default) | mock | disabled.
 `mock` lets the app integrate the full contract on CPU with no weights.
+`qwen_vl` and `deepseek_vl2` are no longer supported; they degrade to
+reasoner_status="unavailable" with a clear error message -- no transformers or
+weights are ever loaded for these modes.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
-import importlib.metadata
 import io
 import json
 import logging
@@ -38,7 +35,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import controls, privacy
+from . import controls, gemini_reasoner, privacy
 from .reason_schema import ReasonRequest, ReasonResponse, VlmRisk
 
 log = logging.getLogger("safelens-vision-worker.vlm")
@@ -53,16 +50,18 @@ def enabled() -> bool:
 
 
 def mode() -> str:
-    return os.getenv("REASONER_MODE", "qwen_vl").strip().lower()
+    return os.getenv("REASONER_MODE", "gemini").strip().lower()
 
 
 def _model_id() -> str:
     m = mode()
-    if m == "deepseek_vl2":
-        return os.getenv("DEEPSEEK_VL_MODEL_ID", "deepseek-ai/deepseek-vl2-small")
+    if m == "gemini":
+        return gemini_reasoner.model_id()
     if m == "mock":
         return "mock"
-    return os.getenv("QWEN_VL_MODEL_ID", "Qwen/Qwen2.5-VL-3B-Instruct")
+    if m == "disabled":
+        return "disabled"
+    return "unknown"
 
 
 def trigger_level() -> str:
@@ -104,86 +103,6 @@ def _max_image_side() -> int:
         return 512
 
 
-def _max_new_tokens() -> int:
-    try:
-        return max(1, int(os.getenv("REASONER_MAX_NEW_TOKENS", "128")))
-    except (TypeError, ValueError):
-        return 128
-
-
-def _quantization_requested() -> str:
-    q = os.getenv("REASONER_QUANTIZATION", "4bit").strip().lower()
-    if q not in ("none", "8bit", "4bit"):
-        return "none"
-    return q
-
-
-def _serve_backend() -> str:
-    return os.getenv("REASONER_SERVE_BACKEND", "transformers").strip().lower()
-
-
-def _visual_tokens(name: str, default: int) -> int:
-    try:
-        return max(1, int(os.getenv(name, str(default))))
-    except (TypeError, ValueError):
-        return default
-
-
-def _visual_pixels(name: str, default_tokens: int) -> int:
-    patch = 28 * 28
-    return _visual_tokens(name, default_tokens) * patch
-
-
-def _quantization_diagnostics() -> Dict[str, Any]:
-    requested = _quantization_requested()
-    bnb_available = False
-    bnb_version = None
-    bnb_error = None
-    try:
-        import bitsandbytes as bnb  # type: ignore
-        bnb_available = True
-        bnb_version = getattr(bnb, "__version__", None)
-    except Exception as exc:  # noqa: BLE001
-        bnb_error = f"{type(exc).__name__}: {exc}"
-    if bnb_version is None:
-        try:
-            bnb_version = importlib.metadata.version("bitsandbytes")
-        except Exception:  # noqa: BLE001
-            pass
-    return {
-        "vlm.bitsandbytes_available": bnb_available,
-        "vlm.bitsandbytes_version": bnb_version,
-        "vlm.bitsandbytes_error": bnb_error,
-        "vlm.quantization_requested": requested,
-        "vlm.quantization_active": False,
-        "vlm.quantization_backend": "bitsandbytes",
-    }
-
-
-def _configure_quantization(kwargs: Dict[str, Any], quant_diag: Dict[str, Any]) -> None:
-    quant = quant_diag.get("vlm.quantization_requested", "none")
-    if quant not in ("4bit", "8bit"):
-        return
-    if quant_diag.get("vlm.bitsandbytes_available"):
-        try:
-            from transformers import BitsAndBytesConfig
-            kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=(quant == "4bit"), load_in_8bit=(quant == "8bit"))
-            quant_diag["vlm.quantization_active"] = True
-        except Exception as exc:  # noqa: BLE001
-            quant_diag["vlm.bitsandbytes_error"] = f"{type(exc).__name__}: {exc}"
-            log.warning(
-                "vlm: quantization requested=%s unavailable; full precision fallback (%s)",
-                quant,
-                exc,
-            )
-    else:
-        log.warning(
-            "vlm: quantization requested=%s but bitsandbytes unavailable; full precision fallback",
-            quant,
-        )
-
-
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -196,6 +115,7 @@ _LAST_RUN_MS: Dict[str, int] = {}
 _INFLIGHT: set = set()
 _LAST_STATUS: Dict[str, Any] = {"status": "idle", "ts": 0}
 _EXECUTOR: Optional[ThreadPoolExecutor] = None
+_ADAPTER_STATE: Dict[str, Any] = {}         # mode -> built adapter dict
 
 
 def _executor() -> ThreadPoolExecutor:
@@ -240,6 +160,8 @@ def reset() -> None:
         _LAST_RUN_MS.clear()
         _INFLIGHT.clear()
         _LAST_STATUS.update(status="idle", ts=0)
+    global _ADAPTER_STATE
+    _ADAPTER_STATE = {}
 
 
 # -- public: non-blocking trigger used by /detect -----------------------------
@@ -319,7 +241,7 @@ def _cache_terminal_response(sid: str, resp: Dict[str, Any]) -> None:
 
 
 def _run_and_cache(sid: str, req: Dict[str, Any]) -> None:
-    log.info("qwen_job_started", extra={"session_id": sid, "frame_id": req.get("frame_id")})
+    log.info("vlm_job_started", extra={"session_id": sid, "frame_id": req.get("frame_id")})
     timeout_s = max(0.05, _timeout_ms() / 1000.0)
     try:
         # Use a one-shot worker so the background /detect orchestration can impose
@@ -329,7 +251,7 @@ def _run_and_cache(sid: str, req: Dict[str, Any]) -> None:
         try:
             resp = fut.result(timeout=timeout_s)
         except FutureTimeout:
-            log.warning("qwen_timeout", extra={"session_id": sid, "frame_id": req.get("frame_id")})
+            log.warning("vlm_timeout", extra={"session_id": sid, "frame_id": req.get("frame_id")})
             resp = ReasonResponse(
                 reasoner_status="timeout", reasoner_model=_model_id(),
                 session_id=sid, frame_id=req.get("frame_id"),
@@ -339,12 +261,12 @@ def _run_and_cache(sid: str, req: Dict[str, Any]) -> None:
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
         _cache_terminal_response(sid, resp)
-        log.info("qwen_result_stored", extra={
+        log.info("vlm_result_stored", extra={
             "session_id": sid, "frame_id": req.get("frame_id"),
             "reasoner_status": resp.get("reasoner_status"),
         })
     except Exception as exc:  # noqa: BLE001 -- background must never crash the worker
-        log.warning("qwen_error", extra={"session_id": sid, "frame_id": req.get("frame_id")}, exc_info=True)
+        log.warning("vlm_error", extra={"session_id": sid, "frame_id": req.get("frame_id")}, exc_info=True)
         resp = ReasonResponse(
             reasoner_status="error", reasoner_model=_model_id(),
             session_id=sid, frame_id=req.get("frame_id"),
@@ -376,11 +298,15 @@ def reason_sync(payload: Any) -> Dict[str, Any]:
     try:
         if m == "mock":
             resp = _mock_reason(req)
-        elif m in ("qwen_vl", "deepseek_vl2"):
-            resp = _model_reason(req, m)
+        elif m == "gemini":
+            resp = _gemini_reason(req)
+        elif m == "disabled":
+            resp = ReasonResponse(reasoner_status="disabled", **base)
         else:
-            resp = ReasonResponse(reasoner_status="unavailable",
-                                  error=f"unknown REASONER_MODE={m}")
+            resp = ReasonResponse(
+                reasoner_status="unavailable",
+                error=f"unknown or removed REASONER_MODE={m}",
+            )
     except Exception as exc:  # noqa: BLE001
         log.warning("vlm: reason failed: %s", exc)
         resp = ReasonResponse(reasoner_status="error", error=f"{type(exc).__name__}: {exc}")
@@ -420,7 +346,7 @@ def _mock_reason(req: ReasonRequest) -> ReasonResponse:
 
     This is NOT a fake-success of the real model -- it is an explicit, labelled
     mock path (reasoner_model='mock') so the app can wire the full /reason
-    contract before a GPU/Qwen deployment exists.
+    contract before a GPU/Gemini deployment exists.
     """
     risks: List[VlmRisk] = []
     for i, dr in enumerate(req.deterministic_risks):
@@ -451,67 +377,82 @@ def _mock_reason(req: ReasonRequest) -> ReasonResponse:
                           scene_summary=summary, risks=risks)
 
 
-# -- real model reasoner (lazy; Qwen-VL / DeepSeek-VL2) ------------------------
-
-_ADAPTER_STATE: Dict[str, Any] = {}  # mode -> {"loaded": bool, "error": str, model/proc}
+# -- Gemini vision reasoner ---------------------------------------------------
 
 
-def _model_reason(req: ReasonRequest, m: str) -> ReasonResponse:
-    adapter = _get_adapter(m)
+def _gemini_reason(req: ReasonRequest) -> ReasonResponse:
+    adapter = _get_adapter("gemini")
     if not adapter["available"]:
         return ReasonResponse(reasoner_status="unavailable",
-                              error=adapter.get("error", "model/deps unavailable"))
+                              error=adapter.get("error", "Gemini adapter unavailable"))
     image = _decode_blurred(req)
-    prompt = _build_prompt(req)
+    prompt = _build_gemini_prompt(req)
     try:
-        log.info("qwen_generate_started", extra={"session_id": req.session_id, "frame_id": req.frame_id})
+        log.info("gemini_generate_started", extra={"session_id": req.session_id, "frame_id": req.frame_id})
         raw = adapter["generate"](prompt, image)
-        log.info("qwen_generate_completed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
+        log.info("gemini_generate_completed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
     except Exception as exc:  # noqa: BLE001
-        return ReasonResponse(reasoner_status="error", error=f"generate: {exc}")
+        return ReasonResponse(reasoner_status="error", error=f"gemini generate: {exc}")
     data = _extract_json(raw)
     if data is None:
-        # Log as a message string (not extra={}) so the deployed log formatter,
-        # which does not render extra fields, actually shows the raw excerpt.
-        excerpt = _safe_raw_output_excerpt(raw)
         log.warning(
-            "qwen_json_parse_failed session_id=%s frame_id=%s qwen_raw_output_excerpt=%r",
-            req.session_id, req.frame_id, excerpt,
+            "gemini_json_parse_failed session_id=%s frame_id=%s raw_excerpt=%r",
+            req.session_id, req.frame_id, (raw or "")[:400],
         )
-        repair_raw = None
-        try:
-            log.info("qwen_json_repair_started session_id=%s frame_id=%s",
-                     req.session_id, req.frame_id)
-            repair_raw = adapter["generate"](_build_json_repair_prompt(excerpt), None)
-            log.info("qwen_json_repair_completed session_id=%s frame_id=%s",
-                     req.session_id, req.frame_id)
-            data = _extract_json(repair_raw)
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "qwen_json_repair_failed session_id=%s frame_id=%s "
-                "qwen_raw_output_excerpt=%r qwen_repair_output_excerpt=%r",
-                req.session_id, req.frame_id, excerpt, _safe_raw_output_excerpt(repair_raw),
-            )
-            return ReasonResponse(reasoner_status="json_parse_error",
-                                  error=f"json repair failed: {exc}",
-                                  scene_summary="", risks=[], uncertain_items=[])
-        if data is None:
-            log.warning(
-                "qwen_json_repair_failed session_id=%s frame_id=%s "
-                "qwen_raw_output_excerpt=%r qwen_repair_output_excerpt=%r",
-                req.session_id, req.frame_id, excerpt, _safe_raw_output_excerpt(repair_raw),
-            )
-            return ReasonResponse(reasoner_status="json_parse_error",
-                                  error="model did not return valid JSON",
-                                  scene_summary="", risks=[], uncertain_items=[])
+        return ReasonResponse(reasoner_status="json_parse_error",
+                              error="Gemini did not return valid JSON",
+                              scene_summary="", risks=[], uncertain_items=[])
     try:
         resp = ReasonResponse(**{k: v for k, v in data.items()
                                  if k in ReasonResponse.model_fields})
         resp.reasoner_status = "ok"
         return resp
     except Exception as exc:  # noqa: BLE001
-        log.warning("qwen_schema_failed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
+        log.warning("gemini_schema_failed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
         return ReasonResponse(reasoner_status="schema_error", error=f"schema: {exc}")
+
+
+def _build_gemini_prompt(req: ReasonRequest) -> str:
+    max_labels = gemini_reasoner.max_detected_labels()
+    context = {
+        "deterministic_risks": req.deterministic_risks[:10],
+        "entities": req.entities[:max_labels],
+        "tracks": req.tracks[:20],
+        "scene_graph": {"relations": (req.scene_graph or {}).get("relations", [])[:20]},
+    }
+    schema_hint = {
+        "scene_summary": "Short visible scene description.",
+        "risks": [
+            {
+                "risk_id": "gemini_1",
+                "hazard_type": "object_near_edge",
+                "risk_level": "YELLOW",
+                "risk_state": "active",
+                "linked_entity_id": "track_1",
+                "involved_track_ids": ["track_1"],
+                "involved_detection_ids": [],
+                "bbox": None,
+                "reason": "The object appears close to an edge.",
+                "visual_evidence": ["object near edge"],
+                "recommended_action": "Move the object away from the edge.",
+                "confidence": 0.7,
+            }
+        ],
+        "uncertain_items": [],
+    }
+    return (
+        "Return JSON only. No markdown. No prose. No code fences. "
+        "If uncertain, return an empty risks array. At most 3 risks. "
+        "Every risk MUST include at least one linkability field: "
+        "linked_entity_id, involved_track_ids, involved_detection_ids, bbox, or approximate_region. "
+        "STRICT RULES: Do not invent risks; risks: [] is a successful answer. "
+        "Do not set should_alert or requires_human_review. "
+        "Do not output bbox coordinates for detections -- YOLO is the coordinate truth. "
+        "Use this small schema shape exactly; omit fields you cannot support.\n"
+        f"Target JSON example: {json.dumps(schema_hint, separators=(',', ':'))}\n"
+        "Detector/tracker context:\n"
+        + json.dumps(context, default=str, separators=(",", ":"))[:4000]
+    )
 
 
 def _decode_blurred(req: ReasonRequest):
@@ -534,67 +475,106 @@ def _decode_blurred(req: ReasonRequest):
         return None
 
 
-def _build_prompt(req: ReasonRequest) -> str:
-    context = {
-        "deterministic_risks": req.deterministic_risks[:10],
-        "entities": req.entities[:20],
-        "tracks": req.tracks[:20],
-        "scene_graph": {"relations": (req.scene_graph or {}).get("relations", [])[:20]},
+def _get_adapter(m: str) -> Dict[str, Any]:
+    """Lazily build/cache a generate() callable for the mode. Never raises."""
+    with _LOCK:
+        st = _ADAPTER_STATE.get(m)
+        if st is not None:
+            return st
+    st = _build_adapter(m)
+    with _LOCK:
+        _ADAPTER_STATE[m] = st
+    return st
+
+
+def _build_adapter(m: str) -> Dict[str, Any]:
+    """Build the adapter for the given mode. Gemini only; other modes are unavailable."""
+    if m == "gemini":
+        return gemini_reasoner.build_adapter()
+    return {
+        "available": False,
+        "error": f"REASONER_MODE={m} is not available in live vision reasoner",
+        "generate": None,
+        "model_id": _model_id(),
+        "diagnostics": {},
     }
-    schema_hint = {
-        "scene_summary": "Short visible scene description.",
-        "risks": [
-            {
-                "risk_id": "qwen_1",
-                "hazard_type": "object_near_edge",
-                "risk_level": "YELLOW",
-                "risk_state": "active",
-                "linked_entity_id": "track_1",
-                "involved_track_ids": ["track_1"],
-                "involved_detection_ids": [],
-                "bbox": None,
-                "reason": "The object appears close to an edge.",
-                "visual_evidence": ["object near edge"],
-                "recommended_action": "Move the object away from the edge.",
-                "confidence": 0.7,
-            }
-        ],
-        "uncertain_items": [],
+
+
+# -- reusable raw-JSON generation (temporal perception layer) -----------------
+
+def generate_json(prompt: str, *, frame_b64: Optional[str] = None,
+                  entities: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    """Run the configured VLM on (prompt, optional frame) and return parsed JSON.
+
+    Reuses the same lazy adapter + the privacy blur in _decode_blurred, so no
+    un-blurred frame ever reaches the model. Returns None in mock mode, when the
+    model/deps are unavailable, or when the model does not emit valid JSON. Never
+    raises -- callers degrade on None. This is the shared bridge the temporal
+    perception layer (scene_context / semantic_corrections) uses so it does not
+    duplicate model loading.
+    """
+    m = mode()
+    if m == "mock" or not enabled():
+        return None
+    adapter = _get_adapter(m)
+    if not adapter.get("available"):
+        return None
+    req = ReasonRequest(frame_b64=frame_b64, entities=entities or [])
+    image = _decode_blurred(req)
+    try:
+        raw = adapter["generate"](prompt, image)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("vlm: generate_json failed: %s", exc)
+        return None
+    return _extract_json(raw)
+
+
+def adapter_available() -> bool:
+    """True when the Gemini adapter is loaded and available.
+
+    Returns False in mock/disabled modes and when GEMINI_API_KEY is missing.
+    Never raises.
+    """
+    if not enabled() or mode() != "gemini":
+        return False
+    try:
+        return bool(_get_adapter("gemini").get("available"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# -- status (for /debug/state) ------------------------------------------------
+
+def status_snapshot() -> Dict[str, Any]:
+    with _LOCK:
+        active = len(_CACHE)
+        last = dict(_LAST_STATUS)
+    m = mode()
+    snap: Dict[str, Any] = {
+        "enabled": enabled(),
+        "mode": m,
+        "model_id": _model_id(),
+        "serve_backend": "google_genai" if m == "gemini" else m,
+        "trigger_level": trigger_level(),
+        "min_interval_ms": _min_interval_ms(),
+        "timeout_ms": _timeout_ms(),
+        "cache_ttl_ms": _cache_ttl_ms(),
+        "max_image_side": _max_image_side(),
+        "privacy_blur_enabled": privacy.blur_enabled(),
+        "active_sessions": active,
+        "last_status": last,
     }
-    return (
-        "Return JSON only. No markdown. No prose. No code fences. "
-        "If uncertain, return an empty risks array. At most 3 risks. "
-        "Every risk must link to detector evidence using linked_entity_id, "
-        "involved_track_ids, involved_detection_ids, bbox, or approximate_region. "
-        "Do not invent risks; risks: [] is a successful answer. "
-        "Do not set should_alert or requires_human_review. "
-        "Use this small schema shape exactly; omit fields you cannot support.\n"
-        f"Target JSON example: {json.dumps(schema_hint, separators=(',', ':'))}\n"
-        "Detector/tracker context:\n"
-        + json.dumps(context, default=str, separators=(",", ":"))[:4000]
-    )
+    if m == "gemini":
+        cfg = gemini_reasoner.config()
+        snap.update({
+            "gemini_max_output_tokens": cfg["max_output_tokens"],
+            "gemini_temperature": cfg["temperature"],
+            "gemini_max_detected_labels": cfg["max_detected_labels"],
+        })
+    return snap
 
 
-def _safe_raw_output_excerpt(raw: Any, limit: int = 800) -> str:
-    text = "" if raw is None else str(raw)
-    return text[:limit].replace("\r", "\\r").replace("\n", "\\n")
-
-
-def _build_json_repair_prompt(raw_excerpt: str) -> str:
-    return (
-        "You are repairing model output for a production JSON parser.\n\n"
-        "Return valid minified JSON only.\n"
-        "No markdown.\n"
-        "No prose.\n"
-        "No code fences.\n\n"
-        "Required top-level schema (valid JSON, empty values shown):\n"
-        '{"scene_summary":"","risks":[],"uncertain_items":[]}\n\n'
-        "If a field is missing, use a safe empty value.\n"
-        'If you cannot recover a risk, return "risks": [].\n'
-        "Repair this output into valid JSON only:\n\n"
-        f"{raw_excerpt}"
-    )
-
+# -- JSON extraction helpers --------------------------------------------------
 
 def _json_candidates(s: str) -> List[str]:
     """Return balanced ``{...}`` substrings in order, respecting strings/escapes.
@@ -689,188 +669,3 @@ def _extract_json(raw: Any) -> Optional[Dict[str, Any]]:
         if "scene_summary" in o or "risks" in o or "scene_context" in o:
             return o
     return parsed[0]
-
-
-def _get_adapter(m: str) -> Dict[str, Any]:
-    """Lazily build/cache a generate() callable for the mode. Never raises."""
-    with _LOCK:
-        st = _ADAPTER_STATE.get(m)
-        if st is not None:
-            return st
-    st = _build_adapter(m)
-    with _LOCK:
-        _ADAPTER_STATE[m] = st
-    return st
-
-
-def _build_adapter(m: str) -> Dict[str, Any]:
-    """Import torch/transformers and load the model lazily. Returns a dict with
-    available + generate(prompt, image) or an error string. Heavy + best-effort:
-    on any import/load failure -> available=False so the worker degrades."""
-    quant_diag = _quantization_diagnostics()
-    try:
-        import torch  # noqa: F401
-        from transformers import AutoProcessor  # noqa: F401
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "available": False,
-            "error": f"deps unavailable: {exc}",
-            "generate": None,
-            "diagnostics": quant_diag,
-            "model_id": _model_id(),
-        }
-
-    model_id = _model_id()
-    # Prefer QWEN_VL_CACHE_DIR, fallback to REASONER_CACHE_DIR
-    cache_dir = os.getenv("QWEN_VL_CACHE_DIR") or os.getenv("REASONER_CACHE_DIR", "/runpod-volume/models/qwen-vl-3b")
-    device = os.getenv("REASONER_DEVICE", "cuda")
-
-    def _load():
-        import torch
-        from transformers import AutoProcessor
-        kwargs: Dict[str, Any] = {"cache_dir": cache_dir, "trust_remote_code": True}
-        dtype = os.getenv("REASONER_DTYPE", "auto")
-        if dtype != "auto":
-            kwargs["torch_dtype"] = getattr(torch, dtype, "auto")
-        else:
-            kwargs["torch_dtype"] = "auto"
-        _configure_quantization(kwargs, quant_diag)
-        if m == "deepseek_vl2":
-            from transformers import AutoModelForCausalLM
-            model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
-        else:
-            try:
-                from transformers import Qwen2_5_VLForConditionalGeneration as _Q
-            except Exception:  # noqa: BLE001 -- older transformers
-                from transformers import AutoModelForImageTextToText as _Q
-            model = _Q.from_pretrained(model_id, **kwargs)
-        if ("quantization_config" not in kwargs) and device:
-            model = model.to(device)
-        processor = AutoProcessor.from_pretrained(
-            model_id,
-            cache_dir=cache_dir,
-            trust_remote_code=True,
-            # Qwen2.5-VL uses 28x28 visual patches; token limits are translated to pixels.
-            min_pixels=_visual_pixels("QWEN_VL_MIN_VISUAL_TOKENS", 256),
-            max_pixels=_visual_pixels("QWEN_VL_MAX_VISUAL_TOKENS", 768),
-        )
-        model.eval()
-        return model, processor
-
-    state: Dict[str, Any] = {
-        "available": True,
-        "error": None,
-        "model": None,
-        "processor": None,
-        "lock": threading.Lock(),
-        "diagnostics": quant_diag,
-        "model_id": model_id,
-    }
-
-    def generate(prompt: str, image) -> str:
-        import torch
-        with state["lock"]:
-            if state["model"] is None:
-                log.info("qwen_model_load_started", extra={"model_id": model_id})
-                state["model"], state["processor"] = _load()
-                log.info("qwen_model_loaded", extra={"model_id": model_id})
-        model, processor = state["model"], state["processor"]
-        content = []
-        if image is not None:
-            content.append({"type": "image", "image": image})
-        content.append({"type": "text", "text": prompt})
-        messages = [{"role": "user", "content": content}]
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        proc_kwargs: Dict[str, Any] = {"text": [text], "return_tensors": "pt"}
-        if image is not None:
-            proc_kwargs["images"] = [image]
-        inputs = processor(**proc_kwargs).to(model.device)
-        max_new = _max_new_tokens()
-        with torch.no_grad():
-            out = model.generate(**inputs, max_new_tokens=max_new, do_sample=False)
-        trimmed = out[:, inputs["input_ids"].shape[1]:]
-        return processor.batch_decode(trimmed, skip_special_tokens=True)[0]
-
-    state["generate"] = generate
-    return state
-
-
-# -- reusable raw-JSON generation (temporal perception layer) -----------------
-
-def generate_json(prompt: str, *, frame_b64: Optional[str] = None,
-                  entities: Optional[List[Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
-    """Run the configured VLM on (prompt, optional frame) and return parsed JSON.
-
-    Reuses the same lazy adapter + the privacy blur in _decode_blurred, so no
-    un-blurred frame ever reaches the model. Returns None in mock mode, when the
-    model/deps are unavailable, or when the model does not emit valid JSON. Never
-    raises -- callers degrade on None. This is the shared bridge the temporal
-    perception layer (scene_context / semantic_corrections) uses so it does not
-    duplicate model loading.
-    """
-    m = mode()
-    if m == "mock" or not enabled():
-        return None
-    adapter = _get_adapter(m)
-    if not adapter.get("available"):
-        return None
-    req = ReasonRequest(frame_b64=frame_b64, entities=entities or [])
-    image = _decode_blurred(req)
-    try:
-        raw = adapter["generate"](prompt, image)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("vlm: generate_json failed: %s", exc)
-        return None
-    return _extract_json(raw)
-
-
-def adapter_available() -> bool:
-    """True when the configured real model adapter is loaded and available.
-
-    Lets callers (e.g. the temporal layer) distinguish a JSON parse failure from
-    a genuinely unavailable model/deps: when this is True but the parse produced
-    no usable JSON, the correct status is ``json_parse_error`` -- not
-    ``unavailable``. Returns False in mock/disabled modes. Never raises.
-    """
-    if not enabled():
-        return False
-    m = mode()
-    if m not in ("qwen_vl", "deepseek_vl2"):
-        return False
-    try:
-        return bool(_get_adapter(m).get("available"))
-    except Exception:  # noqa: BLE001
-        return False
-
-
-# -- status (for /debug/state) -------------------------------------------------
-
-def status_snapshot() -> Dict[str, Any]:
-    diag = _quantization_diagnostics()
-    adapter = _ADAPTER_STATE.get(mode())
-    if isinstance(adapter, dict):
-        diag.update(adapter.get("diagnostics") or {})
-    with _LOCK:
-        active = len(_CACHE)
-        last = dict(_LAST_STATUS)
-    return {
-        "enabled": enabled(),
-        "mode": mode(),
-        "model_id": _model_id(),
-        "serve_backend": _serve_backend(),
-        "trigger_level": trigger_level(),
-        "min_interval_ms": _min_interval_ms(),
-        "timeout_ms": _timeout_ms(),
-        "cache_ttl_ms": _cache_ttl_ms(),
-        "max_image_side": _max_image_side(),
-        "max_new_tokens": _max_new_tokens(),
-        "qwen_vl_min_visual_tokens": _visual_tokens("QWEN_VL_MIN_VISUAL_TOKENS", 256),
-        "qwen_vl_max_visual_tokens": _visual_tokens("QWEN_VL_MAX_VISUAL_TOKENS", 768),
-        "qwen_vllm_base_url": os.getenv("QWEN_VLLM_BASE_URL", "http://127.0.0.1:8001/v1"),
-        "qwen_sglang_base_url": os.getenv("QWEN_SGLANG_BASE_URL", "http://127.0.0.1:30000/v1"),
-        "privacy_blur_enabled": privacy.blur_enabled(),
-        "active_sessions": active,
-        "last_status": last,
-        "diagnostics": diag,
-        "note": "AI draft only; requires_human_review=true; never per-frame; never blocks /detect.",
-    }
