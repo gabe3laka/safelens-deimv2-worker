@@ -35,7 +35,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Any, Dict, List, Optional, Tuple
 
+from pydantic import ValidationError
+
 from . import controls, gemini_reasoner, privacy
+from .gemini_reasoner import GeminiReasonResponse
 from .reason_schema import ReasonRequest, ReasonResponse, VlmRisk
 
 log = logging.getLogger("safelens-vision-worker.vlm")
@@ -380,6 +383,48 @@ def _mock_reason(req: ReasonRequest) -> ReasonResponse:
 # -- Gemini vision reasoner ---------------------------------------------------
 
 
+def _gemini_data_to_reason_response(data: Dict[str, Any], req: ReasonRequest) -> ReasonResponse:
+    gem: GeminiReasonResponse = GeminiReasonResponse.model_validate(data)
+
+    risks: List[VlmRisk] = []
+    frame_or_session = req.frame_id or req.session_id or "frame"
+    for i, gr in enumerate(gem.risks):
+        level = str(gr.risk_level or "GREEN").upper()
+        risk_state = "active" if level in ("YELLOW", "ORANGE", "RED") else "latent"
+        visual_evidence = list(gr.visual_evidence or [])
+        risks.append(VlmRisk(
+            risk_id=f"gemini_{frame_or_session}_{i}",
+            hazard_type=gr.hazard_type,
+            risk_level=level,
+            risk_state=risk_state,
+            risk_reason=gr.reason,
+            reason=gr.reason,
+            visual_evidence=visual_evidence,
+            evidence=visual_evidence,
+            recommended_action=gr.recommended_action or None,
+            involved_track_ids=list(gr.involved_track_ids or []),
+            linked_entity_id=gr.linked_entity_id,
+            approximate_region=gr.approximate_region,
+            confidence=float(gr.confidence or 0.0),
+            produced_by="vlm_reasoner",
+            reasoner_model=gemini_reasoner.model_id(),
+            reasoner_status="ok",
+            requires_human_review=True,
+            should_alert=False,
+        ))
+
+    return ReasonResponse(
+        reasoner_status="ok",
+        reasoner_model=gemini_reasoner.model_id(),
+        scene_summary=gem.scene_summary,
+        risks=risks,
+        uncertain_items=list(gem.uncertain_items or []),
+        session_id=req.session_id,
+        frame_id=req.frame_id,
+        request_id=req.request_id,
+    )
+
+
 def _gemini_reason(req: ReasonRequest) -> ReasonResponse:
     adapter = _get_adapter("gemini")
     if not adapter["available"]:
@@ -393,28 +438,29 @@ def _gemini_reason(req: ReasonRequest) -> ReasonResponse:
         log.info("gemini_generate_completed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
     except Exception as exc:  # noqa: BLE001
         return ReasonResponse(reasoner_status="error", error=f"gemini generate: {exc}")
-    # Adapter may return a pre-validated dict (GeminiReasonResponse.model_dump())
-    # or a raw string for legacy/fallback paths.
-    if isinstance(raw, dict):
-        data = raw
-    else:
-        data = _extract_json(raw)
-    if data is None:
-        log.warning(
-            "gemini_json_parse_failed session_id=%s frame_id=%s raw_excerpt=%r",
-            req.session_id, req.frame_id, (raw or "")[:400],
-        )
-        return ReasonResponse(reasoner_status="json_parse_error",
-                              error="Gemini did not return valid JSON",
-                              scene_summary="", risks=[], uncertain_items=[])
     try:
-        resp = ReasonResponse(**{k: v for k, v in data.items()
-                                 if k in ReasonResponse.model_fields})
-        resp.reasoner_status = "ok"
-        return resp
-    except Exception as exc:  # noqa: BLE001
+        # Adapter may return a pre-validated dict (GeminiReasonResponse.model_dump())
+        # or a raw string for legacy/fallback paths.
+        if isinstance(raw, dict):
+            data = raw
+        else:
+            data = _extract_json(raw)
+
+        if data is None:
+            log.warning(
+                "gemini_json_parse_failed session_id=%s frame_id=%s raw_excerpt=%r",
+                req.session_id, req.frame_id, (raw or "")[:400],
+            )
+            return ReasonResponse(reasoner_status="json_parse_error",
+                                  error="Gemini did not return valid JSON",
+                                  scene_summary="", risks=[], uncertain_items=[])
+
+        return _gemini_data_to_reason_response(data, req)
+    except ValidationError as exc:
         log.warning("gemini_schema_failed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
         return ReasonResponse(reasoner_status="schema_error", error=f"schema: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        return ReasonResponse(reasoner_status="error", error=f"gemini map: {type(exc).__name__}: {exc}")
 
 
 def _compact_entity_anchors(req: ReasonRequest, limit: int) -> List[Dict[str, str]]:

@@ -685,6 +685,76 @@ def test_gemini_reason_with_dict_returning_adapter(monkeypatch):
     assert out["should_alert"] is False
 
 
+def test_gemini_reason_maps_real_risk_to_vlmrisk(monkeypatch):
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+
+    def fake_generate(prompt, image):
+        return {
+            "scene_summary": "Cup near table edge.",
+            "risks": [{
+                "hazard_type": "object_near_edge",
+                "risk_level": "YELLOW",
+                "reason": "Cup appears close to the table edge.",
+                "recommended_action": "Move the cup away from the edge.",
+                "visual_evidence": ["cup near table edge"],
+                "involved_track_ids": ["t1"],
+                "linked_entity_id": "t1",
+                "approximate_region": "table edge",
+                "confidence": 0.82,
+                "should_alert": True,
+            }],
+            "uncertain_items": [],
+        }
+
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "gemini", {
+        "available": True,
+        "generate": fake_generate,
+        "model_id": "gemini-2.5-flash",
+        "diagnostics": {},
+        "error": None,
+    })
+
+    out = vlm.reason_sync({
+        "request_id": "r1",
+        "session_id": "cam1",
+        "frame_id": "f1",
+        "entities": [{"track_id": "t1", "label": "cup"}],
+    })
+
+    assert out["reasoner_status"] == "ok"
+    assert len(out["risks"]) == 1
+    r = out["risks"][0]
+    assert r["risk_id"].startswith("gemini_f1_")
+    assert r["hazard_type"] == "object_near_edge"
+    assert r["risk_level"] == "YELLOW"
+    assert r["reason"] == "Cup appears close to the table edge."
+    assert r["risk_reason"] == "Cup appears close to the table edge."
+    assert r["visual_evidence"] == ["cup near table edge"]
+    assert r["evidence"] == ["cup near table edge"]
+    assert r["recommended_action"] == "Move the cup away from the edge."
+    assert r["linked_entity_id"] == "t1"
+    assert r["involved_track_ids"] == ["t1"]
+    assert r["should_alert"] is False
+    assert r["requires_human_review"] is True
+
+
+def test_gemini_reason_malformed_dict_returns_schema_error(monkeypatch):
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+
+    def fake_generate(prompt, image):
+        return {"scene_summary": "x", "risks": [{"risk_level": "YELLOW"}], "uncertain_items": []}
+
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "gemini", {
+        "available": True,
+        "generate": fake_generate,
+        "model_id": "gemini-2.5-flash",
+        "diagnostics": {},
+        "error": None,
+    })
+    out = vlm.reason_sync(_req())
+    assert out["reasoner_status"] == "schema_error"
+
+
 def test_gemini_reason_dict_no_double_parse(monkeypatch):
     """Dict return must not hit _extract_json (which would stringify it incorrectly)."""
     monkeypatch.setenv("REASONER_MODE", "gemini")
