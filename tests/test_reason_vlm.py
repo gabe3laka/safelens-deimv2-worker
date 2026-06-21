@@ -876,6 +876,15 @@ def test_gemini_risk_schema_no_bbox_field():
     assert "box_id" in fields
     assert "severity" in fields
     assert "likelihood" in fields
+    # Verify field constraints are present.
+    d = GeminiBoxDecision(box_id="A", hazard_type="slip_trip", severity=1, likelihood=1)
+    assert d.severity == 1
+    assert d.likelihood == 1
+    import pytest as _pytest
+    with _pytest.raises(Exception):
+        GeminiBoxDecision(box_id="AB", hazard_type="slip_trip", severity=1, likelihood=1)
+    with _pytest.raises(Exception):
+        GeminiBoxDecision(box_id="A", hazard_type="slip_trip", severity=0, likelihood=1)
 
 
 def test_gemini_reason_response_json_schema_exported():

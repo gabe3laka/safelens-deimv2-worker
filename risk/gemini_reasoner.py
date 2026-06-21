@@ -65,7 +65,10 @@ class GeminiBoxDecision(BaseModel):
     (A, B, C…) shown on the annotated frame passed to Gemini.
     """
 
-    box_id: str = Field(description="Short YOLO box id shown on the annotated frame, e.g. A, B, C.")
+    box_id: str = Field(
+        description="Short YOLO box id shown on the annotated frame, e.g. A, B, C.",
+        pattern=r"^[A-Z]$",
+    )
     hazard_type: HazardType
     severity: int = Field(ge=1, le=5)
     likelihood: int = Field(ge=1, le=5)

@@ -659,8 +659,26 @@ def _gemini_reason(req: ReasonRequest) -> ReasonResponse:
 
 def _build_gemini_prompt(req: ReasonRequest, anchors: List[Dict[str, str]]) -> str:
     """Build the box-decision prompt.  anchors is the list of {box_id, entity_id, label}."""
+    from .risk_matrix import get_matrix
+    from .gemini_reasoner import GeminiBoxDecisionResponse
+
     # Compact anchor list for the prompt (box_id + label only; no entity_id/coords).
     prompt_anchors = [{"box_id": a["box_id"], "label": a["label"]} for a in anchors]
+
+    # Source risk matrix bands from the configured matrix so the prompt always matches.
+    matrix = get_matrix()
+    max_updates = GeminiBoxDecisionResponse.model_fields["box_updates"].metadata
+    # Extract the max_length from the Annotated metadata if available, else use schema default.
+    try:
+        import annotated_types
+        max_box = next((m.max_length for m in max_updates
+                        if isinstance(m, annotated_types.MaxLen)), 4)
+    except Exception:  # noqa: BLE001
+        max_box = 4
+    band_lines = "\n".join(
+        f"{b['min']}-{b['max']} {b['level']}" for b in matrix.bands
+    )
+
     return (
         "You are an HSE box risk classifier.\n"
         "The image contains YOLO boxes labeled with short IDs such as A, B, C.\n"
@@ -680,15 +698,12 @@ def _build_gemini_prompt(req: ReasonRequest, anchors: List[Dict[str, str]]) -> s
         "- Do not output class IDs.\n"
         "- Do not create new boxes.\n"
         "- Do not explain in sentences.\n"
-        "- If no clear risk exists, return box_updates=[].\n"
-        "- Max 4 box_updates.\n"
+        f"- If no clear risk exists, return box_updates=[].\n"
+        f"- Max {max_box} box_updates.\n"
         "- Prefer no risk over guessing.\n"
         "Risk matrix:\n"
         "risk_score = severity * likelihood\n"
-        "1-4 GREEN\n"
-        "5-9 YELLOW\n"
-        "10-16 ORANGE\n"
-        "17-25 RED\n"
+        + band_lines + "\n"
         "Detected box anchors:\n"
         + json.dumps(prompt_anchors, default=str, separators=(",", ":"))
     )
