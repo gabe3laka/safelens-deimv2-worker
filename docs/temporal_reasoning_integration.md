@@ -83,7 +83,7 @@ and vehicles are never flagged as falling objects.
   "semantic_corrections": [ { "track_id": "trk_7", "raw_label": "bus",
     "corrected_label": "ceiling panel", "correction_type": "false_positive",
     "action": "suppress_from_hse_alerts", "requires_human_review": false } ],
-  "reasoner_status": { "enabled": true, "mode": "qwen_vl", "state": "ready",
+  "reasoner_status": { "enabled": true, "mode": "gemini", "state": "ready",
     "last_trigger": "scene_mismatch", "result_age_ms": 2000, "stale": false }
 }
 ```
@@ -113,7 +113,7 @@ which routes through `_decode_blurred` — no un-blurred frame reaches the model
 
 The temporal VLM reuses `risk.vlm_reasoner` (`REASONER_MODE`):
 `mock` (no weights; deterministic; used by tests + CPU integration),
-`qwen_vl` / `deepseek_vl2` (real, lazy, weights resolved at runtime — never baked).
+`gemini` (Google GenAI API). Removed transformer modes return unavailable and do not load weights.
 When `VLM_REASONER_ENABLED=false`, the deterministic temporal layer (memory, edge
 risk, triggers, blocks) still runs; `reasoner_status.state="disabled"`.
 

@@ -85,7 +85,7 @@ class ReasonerStatus(BaseModel):
     """Non-blocking reasoner state attached to /detect (never makes it wait)."""
 
     enabled: bool = False
-    mode: str = "qwen_vl"
+    mode: str = "gemini"
     # idle | queued | queued_latest | running | ready | cached | throttled | timeout | error | unavailable | disabled
     state: str = "idle"
     last_trigger: Optional[str] = None

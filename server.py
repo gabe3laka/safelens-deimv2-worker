@@ -1068,7 +1068,7 @@ async def detect(payload: Dict[str, Any]):
                 do_not_start_new_reasoning_job = prefs.get("do_not_start_new_reasoning_job") is True
                 force_reason = prefs.get("force_reason") is True
                 if do_not_start_new_reasoning_job and not force_reason:
-                    # Poll-only/cached-only live frames must not replace pending Qwen work.
+                    # Poll-only/cached-only live frames must not replace pending reasoner work.
                     draft = vlm.get_cached_draft(session_id)
                     raw_status = (
                         (draft.get("reasoner_status") if isinstance(draft, dict) else None)
@@ -1092,10 +1092,6 @@ async def detect(payload: Dict[str, Any]):
                 snap = vlm.status_snapshot()
                 _reasoner_diag = {
                     "model_id": snap.get("model_id"),
-                    "quantization_requested": (snap.get("diagnostics") or {}).get("vlm.quantization_requested"),
-                    "quantization_active": (snap.get("diagnostics") or {}).get("vlm.quantization_active"),
-                    "quantization_backend": (snap.get("diagnostics") or {}).get("vlm.quantization_backend"),
-                    "bitsandbytes_available": (snap.get("diagnostics") or {}).get("vlm.bitsandbytes_available"),
                     "last_status": snap.get("last_status"),
                 }
                 resp_dict["reasoner_status"] = _normalize_reasoner_status(
@@ -1171,7 +1167,7 @@ async def detect(payload: Dict[str, Any]):
 
 # -- Reasoning endpoints (event-driven; AI draft only; never the safety authority) --
 #
-# POST /reason runs the REAL Qwen-VL (or DeepSeek-VL2 / mock) reasoner with a
+# POST /reason runs the Gemini (or mock) reasoner with a
 # hard timeout and returns strict JSON. The deterministic engine remains the
 # safety signal; VLM output is always produced_by="vlm_reasoner",
 # requires_human_review=true, should_alert=false. The reasoner is event-driven

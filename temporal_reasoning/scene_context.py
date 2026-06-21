@@ -3,8 +3,8 @@ temporal_reasoning/scene_context.py -- latest scene understanding.
 
 Produces a SceneContext (scene_type / environment_type / confidence / reason).
 In mock mode it derives a plausible context deterministically from the scene_hint
-+ detected entities (no weights, used by tests + CPU integration). In qwen_vl /
-deepseek_vl2 mode it asks the real VLM (via risk.vlm_reasoner.generate_json,
++ detected entities (no weights, used by tests + CPU integration). In gemini /
+gemini mode it asks the real VLM (via risk.vlm_reasoner.generate_json,
 which blurs people first) and parses strict JSON, degrading to mock-style context
 if the model is unavailable.
 
