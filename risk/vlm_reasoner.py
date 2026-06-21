@@ -385,6 +385,37 @@ def _mock_reason(req: ReasonRequest) -> ReasonResponse:
 # Short letter IDs assigned to YOLO box candidates for Gemini
 _BOX_LABELS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
+# Lookup tables for worker-generated risk text (keeps Gemini output compact).
+RISK_REASON_BY_HAZARD: Dict[str, str] = {
+    "object_near_edge": "Object appears near an edge.",
+    "blocked_path": "Object may block the path.",
+    "slip_trip": "Visible slip/trip concern.",
+    "falling_object": "Object may fall if disturbed.",
+    "ppe_missing": "Visible PPE concern.",
+    "worker_near_vehicle": "Person is close to vehicle/equipment.",
+    "broken_object": "Broken/sharp object concern.",
+    "unsafe_interaction": "Unsafe human-object interaction.",
+    "other": "Visible HSE concern.",
+}
+
+ACTION_BY_HAZARD: Dict[str, str] = {
+    "object_near_edge": "Move item away from edge.",
+    "blocked_path": "Clear the path.",
+    "slip_trip": "Remove or mark the hazard.",
+    "falling_object": "Secure or lower the object.",
+    "ppe_missing": "Verify required PPE.",
+    "worker_near_vehicle": "Increase separation.",
+    "broken_object": "Isolate or remove item.",
+    "unsafe_interaction": "Stop and reassess task.",
+    "other": "Inspect and correct condition.",
+}
+
+
+def _safe_id_part(value: Any) -> str:
+    """Sanitize a value for use in a stable risk_id string."""
+    raw = str(value or "unknown")
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in raw)[:80]
+
 
 def _select_candidate_entities(
     entities: List[Dict[str, Any]],
@@ -490,7 +521,7 @@ def _render_annotated_reasoner_frame(
     if image is None or not anchors:
         return image
     try:
-        from PIL import Image as _PILImage, ImageDraw, ImageFont
+        from PIL import ImageDraw, ImageFont
 
         # Build entity_id → bbox mapping for quick lookup
         id_to_entity: Dict[str, Dict[str, Any]] = {}
@@ -565,8 +596,7 @@ def _gemini_data_to_reason_response(
     matrix = get_matrix()
 
     risks: List[VlmRisk] = []
-    frame_or_session = req.frame_id or req.session_id or "frame"
-    for i, bd in enumerate(gem.box_updates):
+    for bd in gem.box_updates:
         # Silently skip any box_id Gemini hallucinated outside our anchor set.
         if bd.box_id not in valid_box_ids:
             log.debug("gemini: unknown box_id=%r skipped (valid=%s)", bd.box_id, sorted(valid_box_ids))
@@ -577,8 +607,18 @@ def _gemini_data_to_reason_response(
         risk_score = evaluated["risk_score"]
         risk_state = "active" if level in ("YELLOW", "ORANGE", "RED") else "latent"
         evidence = [bd.evidence_code] if bd.evidence_code else []
+        # Stable risk_id: based on session + entity + hazard so the app can rebind
+        # across frames when the camera moves away and comes back.
+        risk_id = "gemini_{}_{}_{}".format(
+            _safe_id_part(req.session_id or "session"),
+            _safe_id_part(anchor["entity_id"]),
+            _safe_id_part(bd.hazard_type),
+        )
+        # Worker-generated text from compact hazard codes (keeps Gemini output short).
+        risk_reason = RISK_REASON_BY_HAZARD.get(bd.hazard_type, RISK_REASON_BY_HAZARD["other"])
+        recommended_action = ACTION_BY_HAZARD.get(bd.hazard_type, ACTION_BY_HAZARD["other"])
         risks.append(VlmRisk(
-            risk_id=f"gemini_{frame_or_session}_{i}",
+            risk_id=risk_id,
             hazard_type=bd.hazard_type,
             risk_level=level,
             risk_score=risk_score,
@@ -589,6 +629,9 @@ def _gemini_data_to_reason_response(
             visual_evidence=evidence,
             involved_track_ids=[anchor["entity_id"]],
             linked_entity_id=anchor["entity_id"],
+            risk_reason=risk_reason,
+            reason=risk_reason,
+            recommended_action=recommended_action,
             confidence=float(bd.confidence or 0.0),
             produced_by="vlm_reasoner",
             reasoner_model=gemini_reasoner.model_id(),
@@ -698,7 +741,7 @@ def _build_gemini_prompt(req: ReasonRequest, anchors: List[Dict[str, str]]) -> s
         "- Do not output class IDs.\n"
         "- Do not create new boxes.\n"
         "- Do not explain in sentences.\n"
-        f"- If no clear risk exists, return box_updates=[].\n"
+        "- If no clear risk exists, return box_updates=[].\n"
         f"- Max {max_box} box_updates.\n"
         "- Prefer no risk over guessing.\n"
         "Risk matrix:\n"

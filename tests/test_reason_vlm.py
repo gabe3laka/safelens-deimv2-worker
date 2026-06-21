@@ -721,7 +721,8 @@ def test_gemini_reason_maps_real_risk_to_vlmrisk(monkeypatch):
     assert out["reasoner_status"] == "ok"
     assert len(out["risks"]) == 1
     r = out["risks"][0]
-    assert r["risk_id"].startswith("gemini_f1_")
+    # Stable risk_id: uses session_id + entity_id + hazard_type (not frame_id + index).
+    assert r["risk_id"] == "gemini_cam1_t1_object_near_edge"
     assert r["hazard_type"] == "object_near_edge"
     # severity=3, likelihood=3, risk_score=9 -> ORANGE (9-14 band)
     assert r["risk_score"] == 9
@@ -902,3 +903,292 @@ def test_gemini_max_output_tokens_default():
     # Without override the code default must be at least 1024.
     tok = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"))
     assert tok >= 1024
+
+
+# -- App compatibility tests (Part 6) -----------------------------------------
+
+def _fake_gemini_adapter(fake_generate):
+    return {
+        "available": True,
+        "generate": fake_generate,
+        "model_id": "gemini-2.5-flash",
+        "diagnostics": {},
+        "error": None,
+    }
+
+
+def test_box_id_a_maps_to_linked_entity_id(monkeypatch):
+    """Gemini box_id=A maps to the linked_entity_id of the first YOLO entity."""
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+
+    def fake_generate(prompt, image):
+        return {"box_updates": [{"box_id": "A", "hazard_type": "slip_trip",
+                                 "severity": 2, "likelihood": 3, "confidence": 0.7,
+                                 "evidence_code": "spill_or_wet_surface"}],
+                "uncertain_box_ids": []}
+
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "gemini", _fake_gemini_adapter(fake_generate))
+    out = vlm.reason_sync({
+        "session_id": "sess1",
+        "entities": [{"track_id": "track_7", "label": "cup",
+                      "bbox": {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1}}],
+    })
+    assert out["reasoner_status"] == "ok"
+    assert len(out["risks"]) == 1
+    r = out["risks"][0]
+    assert r["linked_entity_id"] == "track_7"
+    assert "track_7" in r["involved_track_ids"]
+
+
+def test_stable_risk_id_uses_session_entity_hazard(monkeypatch):
+    """risk_id must be stable: based on session_id + linked_entity_id + hazard_type."""
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+
+    def fake_generate(prompt, image):
+        return {"box_updates": [{"box_id": "A", "hazard_type": "object_near_edge",
+                                 "severity": 2, "likelihood": 3, "confidence": 0.8,
+                                 "evidence_code": "near_edge"}],
+                "uncertain_box_ids": []}
+
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "gemini", _fake_gemini_adapter(fake_generate))
+    out1 = vlm.reason_sync({
+        "session_id": "cam_A", "frame_id": "frame_001",
+        "entities": [{"track_id": "track_7", "label": "cup",
+                      "bbox": {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1}}],
+    })
+    # Simulate camera away and back (different frame_id, same session/entity/hazard).
+    out2 = vlm.reason_sync({
+        "session_id": "cam_A", "frame_id": "frame_099",
+        "entities": [{"track_id": "track_7", "label": "cup",
+                      "bbox": {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1}}],
+    })
+    assert out1["risks"][0]["risk_id"] == out2["risks"][0]["risk_id"], (
+        "risk_id must be stable across frames for the same session+entity+hazard")
+    assert out1["risks"][0]["risk_id"] == "gemini_cam_A_track_7_object_near_edge"
+
+
+def test_risk_score_via_matrix(monkeypatch):
+    """severity x likelihood is evaluated through the risk matrix."""
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+
+    def fake_generate(prompt, image):
+        return {"box_updates": [{"box_id": "A", "hazard_type": "falling_object",
+                                 "severity": 2, "likelihood": 3, "confidence": 0.7,
+                                 "evidence_code": "falling_object_potential"}],
+                "uncertain_box_ids": []}
+
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "gemini", _fake_gemini_adapter(fake_generate))
+    out = vlm.reason_sync({
+        "session_id": "sess2",
+        "entities": [{"track_id": "e1", "label": "box",
+                      "bbox": {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1}}],
+    })
+    r = out["risks"][0]
+    # severity=2, likelihood=3 -> risk_score=6 (YELLOW band 4-8)
+    assert r["risk_score"] == 6
+    assert r["severity"] == 2
+    assert r["likelihood"] == 3
+    assert r["risk_level"] == "YELLOW"
+
+
+def test_vlm_risk_has_linked_entity_and_track_ids(monkeypatch):
+    """VlmRisk must have linked_entity_id and involved_track_ids set."""
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+
+    def fake_generate(prompt, image):
+        return {"box_updates": [{"box_id": "A", "hazard_type": "ppe_missing",
+                                 "severity": 3, "likelihood": 2, "confidence": 0.9,
+                                 "evidence_code": "ppe_absent_visible"}],
+                "uncertain_box_ids": []}
+
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "gemini", _fake_gemini_adapter(fake_generate))
+    out = vlm.reason_sync({
+        "session_id": "sess3",
+        "entities": [{"track_id": "worker_1", "label": "person",
+                      "bbox": {"x": 0.2, "y": 0.2, "w": 0.1, "h": 0.3}}],
+    })
+    r = out["risks"][0]
+    assert r["linked_entity_id"] == "worker_1"
+    assert r["involved_track_ids"] == ["worker_1"]
+
+
+def test_vlm_risk_alert_flags(monkeypatch):
+    """VlmRisk must have should_alert=False and requires_human_review=True."""
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+
+    def fake_generate(prompt, image):
+        return {"box_updates": [{"box_id": "A", "hazard_type": "other",
+                                 "severity": 5, "likelihood": 5, "confidence": 1.0,
+                                 "evidence_code": "other_visible"}],
+                "uncertain_box_ids": []}
+
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "gemini", _fake_gemini_adapter(fake_generate))
+    out = vlm.reason_sync({
+        "session_id": "sess4",
+        "entities": [{"track_id": "e1", "label": "object",
+                      "bbox": {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1}}],
+    })
+    r = out["risks"][0]
+    assert r["should_alert"] is False
+    assert r["requires_human_review"] is True
+
+
+def test_hallucinated_box_id_ignored(monkeypatch):
+    """Invalid/hallucinated box_id not in anchor set must be ignored."""
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+
+    def fake_generate(prompt, image):
+        return {"box_updates": [
+            {"box_id": "Z", "hazard_type": "slip_trip",
+             "severity": 3, "likelihood": 3, "confidence": 0.8,
+             "evidence_code": "spill_or_wet_surface"},
+        ], "uncertain_box_ids": ["Z"]}
+
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "gemini", _fake_gemini_adapter(fake_generate))
+    out = vlm.reason_sync({
+        "session_id": "sess5",
+        "entities": [{"track_id": "t1", "label": "floor",
+                      "bbox": {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1}}],
+    })
+    # Only 1 anchor (A), Z is hallucinated -> no risks
+    assert out["risks"] == [], "hallucinated box_id must be ignored"
+    assert "Z" in out["uncertain_items"]
+
+
+def test_gemini_schema_contains_only_box_updates_and_uncertain_box_ids():
+    """GeminiBoxDecisionResponse schema must have only box_updates and uncertain_box_ids."""
+    from risk.gemini_reasoner import GeminiBoxDecisionResponse
+    fields = GeminiBoxDecisionResponse.model_fields
+    assert set(fields.keys()) == {"box_updates", "uncertain_box_ids"}, (
+        "Schema must only have box_updates and uncertain_box_ids, "
+        f"got: {set(fields.keys())}")
+
+
+def test_gemini_schema_does_not_contain_narrative_fields():
+    """GeminiBoxDecisionResponse and GeminiBoxDecision must not have narrative fields."""
+    from risk.gemini_reasoner import GeminiBoxDecisionResponse, GeminiBoxDecision
+    forbidden = {"scene_summary", "reason", "recommended_action", "bbox",
+                 "class_id", "coordinates", "detector_confidence"}
+    response_fields = set(GeminiBoxDecisionResponse.model_fields.keys())
+    decision_fields = set(GeminiBoxDecision.model_fields.keys())
+    all_fields = response_fields | decision_fields
+    violations = all_fields & forbidden
+    assert not violations, f"Gemini schema must not contain: {violations}"
+
+
+def test_gemini_reason_text_from_lookup_tables(monkeypatch):
+    """Worker must generate risk_reason and recommended_action from hazard lookup tables."""
+    monkeypatch.setenv("REASONER_MODE", "gemini")
+
+    def fake_generate(prompt, image):
+        return {"box_updates": [{"box_id": "A", "hazard_type": "object_near_edge",
+                                 "severity": 2, "likelihood": 3, "confidence": 0.8,
+                                 "evidence_code": "near_edge"}],
+                "uncertain_box_ids": []}
+
+    monkeypatch.setitem(vlm._ADAPTER_STATE, "gemini", _fake_gemini_adapter(fake_generate))
+    out = vlm.reason_sync({
+        "session_id": "sess6",
+        "entities": [{"track_id": "t1", "label": "cup",
+                      "bbox": {"x": 0.1, "y": 0.1, "w": 0.1, "h": 0.1}}],
+    })
+    r = out["risks"][0]
+    assert r["risk_reason"] == "Object appears near an edge."
+    assert r["recommended_action"] == "Move item away from edge."
+    assert r["reason"] == "Object appears near an edge."
+
+
+def test_detect_scene_risks_present_with_vlm_draft(server_mod, monkeypatch):
+    """After /detect with HSE + cached VLM draft, scene_risks must be populated."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    import vision_backend
+    import risk.vlm_reasoner as _vlm
+
+    monkeypatch.setenv("RISK_ENGINE_ENABLED", "true")
+    monkeypatch.setattr(vision_backend, "run_inference", lambda **kw: _fake_resp())
+
+    # Pre-populate the cache with a VLM draft that links to the "person" entity.
+    fake_draft = {
+        "reasoner_status": "ok",
+        "produced_by": "vlm_reasoner",
+        "requires_human_review": True,
+        "should_alert": False,
+        "risks": [{
+            "risk_id": "gemini_cam_e_person_object_near_edge",
+            "hazard_type": "object_near_edge",
+            "risk_level": "YELLOW",
+            "risk_score": 6,
+            "severity": 2,
+            "likelihood": 3,
+            "risk_reason": "Object appears near an edge.",
+            "recommended_action": "Move item away from edge.",
+            "produced_by": "vlm_reasoner",
+            "involved_track_ids": ["person"],
+            "linked_entity_id": "person",
+            "requires_human_review": True,
+            "should_alert": False,
+        }],
+    }
+    with _vlm._LOCK:
+        _vlm._CACHE["cam_e"] = {"response": fake_draft, "ts": _vlm._now_ms()}
+
+    with server_mod._STATE_LOCK:
+        server_mod._STATE["status"] = "ready"
+    try:
+        with TestClient(server_mod.app) as c:
+            r = c.post("/detect", json={
+                "image_b64": _tiny_jpeg_b64(),
+                "session_id": "cam_e",
+                "hse": True,
+                "reasoning_preferences": {"do_not_start_new_reasoning_job": True},
+            })
+            assert r.status_code == 200
+            body = r.json()
+            scene_risks = body.get("scene_risks", [])
+            assert len(scene_risks) >= 1, f"Expected scene_risks in response, got {scene_risks}"
+            vlm_risks = [s for s in scene_risks if s.get("produced_by") == "vlm_reasoner"]
+            assert len(vlm_risks) >= 1, "At least one vlm_reasoner scene_risk expected"
+    finally:
+        with server_mod._STATE_LOCK:
+            server_mod._STATE["status"] = "cold"
+
+
+def test_safe_id_part_sanitizes_special_chars():
+    """_safe_id_part must replace non-alnum chars (except - and _) with underscore."""
+    assert vlm._safe_id_part("session/123") == "session_123"
+    assert vlm._safe_id_part("track 7") == "track_7"
+    assert vlm._safe_id_part("obj-edge_1") == "obj-edge_1"
+    assert vlm._safe_id_part(None) == "unknown"
+    assert vlm._safe_id_part("") == "unknown"
+    # Length capped at 80 chars
+    long_val = "x" * 100
+    assert len(vlm._safe_id_part(long_val)) == 80
+
+
+def test_call_generate_uses_typed_config_first(monkeypatch):
+    """_call_generate must try GenerateContentConfig (typed) before dict fallback."""
+    import risk.gemini_reasoner as gr
+    calls = []
+
+    class FakeConfig:
+        def __init__(self, **kwargs):
+            calls.append(("config", kwargs))
+
+    class FakeTypes:
+        GenerateContentConfig = FakeConfig
+
+    class FakeClient:
+        class models:
+            @staticmethod
+            def generate_content(*, model, contents, config):
+                calls.append(("generate", type(config).__name__))
+                class Resp:
+                    text = '{"box_updates":[],"uncertain_box_ids":[]}'
+                return Resp()
+
+    gr._call_generate(FakeClient(), FakeTypes(), "gemini-2.5-flash", ["prompt"])
+    # First call must be with typed config (FakeConfig), not a dict.
+    assert calls[0][0] == "config", f"First call should be config init, got: {calls}"
+    assert calls[1][0] == "generate", f"Second call should be generate, got: {calls}"
+    assert calls[1][1] == "FakeConfig", "generate must be called with typed config object"

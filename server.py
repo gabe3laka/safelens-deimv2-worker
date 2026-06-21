@@ -967,6 +967,67 @@ def _build_scene_risks(
     return scene_risks
 
 
+def _stamp_entities_with_risks(
+    entities: list,
+    scene_risks: list,
+) -> list:
+    """Stamp each entity in-place with risk fields from the highest matching scene_risk.
+
+    The app expects entities to carry risk_level, risk_score, risk_reason,
+    recommended_action, produced_by, severity, likelihood, requires_human_review,
+    and risk_color so it can color YOLO boxes directly.
+    """
+    if not entities or not scene_risks:
+        return entities
+
+    # Build entity_id -> highest risk mapping.
+    entity_risk: Dict[str, Dict[str, Any]] = {}
+    _level_order = {"GREEN": 0, "YELLOW": 1, "ORANGE": 2, "RED": 3}
+    for risk in scene_risks:
+        if not isinstance(risk, dict):
+            continue
+        level = str(risk.get("risk_level", "GREEN")).upper()
+        score = int(risk.get("risk_score", 0) or 0)
+        # Collect all entity IDs this risk links to.
+        candidate_ids = list(risk.get("involved_track_ids") or [])
+        eid = risk.get("linked_entity_id")
+        if eid:
+            candidate_ids.append(str(eid))
+        for eid_key in candidate_ids:
+            eid_key = str(eid_key)
+            existing = entity_risk.get(eid_key)
+            if existing is None or (
+                _level_order.get(level, 0) > _level_order.get(str(existing.get("risk_level", "GREEN")).upper(), 0)
+                or (
+                    _level_order.get(level, 0) == _level_order.get(str(existing.get("risk_level", "GREEN")).upper(), 0)
+                    and score > int(existing.get("risk_score", 0) or 0)
+                )
+            ):
+                entity_risk[eid_key] = risk
+
+    stamped = []
+    for entity in entities:
+        if not isinstance(entity, dict):
+            stamped.append(entity)
+            continue
+        e = dict(entity)
+        track_id = str(e.get("track_id") or e.get("id") or e.get("entity_id") or "")
+        best = entity_risk.get(track_id) if track_id else None
+        if best:
+            level = str(best.get("risk_level", "GREEN")).upper()
+            e.setdefault("risk_level", level)
+            e.setdefault("risk_color", level)
+            e.setdefault("risk_score", best.get("risk_score"))
+            e.setdefault("severity", best.get("severity"))
+            e.setdefault("likelihood", best.get("likelihood"))
+            e.setdefault("risk_reason", best.get("risk_reason") or best.get("reason", ""))
+            e.setdefault("recommended_action", best.get("recommended_action"))
+            e.setdefault("produced_by", best.get("produced_by", "risk_engine"))
+            e.setdefault("requires_human_review", best.get("requires_human_review", False))
+        stamped.append(e)
+    return stamped
+
+
 def _add_warning(resp: Dict[str, Any], key: str) -> None:
     """Append *key* to resp['warnings'] if not already present."""
     existing = resp.get("warnings") or []
@@ -1113,6 +1174,14 @@ async def detect(payload: Dict[str, Any]):
                 resp_dict["scene_risks"] = _build_scene_risks(
                     resp_dict.get("risks", []), None, resp_dict.get("tracks", []))
                 _add_warning(resp_dict, "reasoner_unavailable")
+        # Stamp entities with risk fields from scene_risks so the app can color
+        # YOLO boxes directly (entity.risk_level, risk_score, risk_reason etc.).
+        if resp_dict.get("scene_risks"):
+            try:
+                resp_dict["entities"] = _stamp_entities_with_risks(
+                    resp_dict.get("entities") or [], resp_dict["scene_risks"])
+            except Exception as sexc:  # noqa: BLE001 -- stamping must never break /detect
+                log.warning("detect: entity risk stamp failed: %s", sexc)
         # Event-triggered temporal perception (PR: single-worker GPU+CPU). ADDITIVE
         # + NON-BLOCKING: folds the frame into per-session memory, adds deterministic
         # object-near-edge risk, and (rarely, rate-limited) kicks an async VLM job

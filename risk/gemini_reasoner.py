@@ -282,34 +282,12 @@ def build_adapter() -> Dict[str, Any]:
 def _call_generate(client: Any, types: Any, mid: str, parts: List[Any]) -> Any:
     """Call client.models.generate_content with structured JSON schema output.
 
-    Tries the documented response_format dict first (newer SDK); falls back to
-    types.GenerateContentConfig with response_schema (older SDK style).
-    Both paths enforce the GeminiBoxDecisionResponse schema so Gemini is
+    Tries types.GenerateContentConfig with response_schema first (preferred);
+    falls back to passing the JSON Schema dict, then to a response_format dict.
+    Both primary paths enforce the GeminiBoxDecisionResponse schema so Gemini is
     constrained to emit only the box-decision fields and nothing else.
     """
-    schema_dict = GeminiBoxDecisionResponse.model_json_schema()
-
-    # Attempt 1: response_format dict (documented pattern for newer SDKs)
-    try:
-        response = client.models.generate_content(
-            model=mid,
-            contents=parts,
-            config={
-                "response_format": {
-                    "text": {
-                        "mime_type": "application/json",
-                        "schema": schema_dict,
-                    }
-                },
-                "temperature": _temperature(),
-                "max_output_tokens": _max_output_tokens(),
-            },
-        )
-        return response
-    except (TypeError, ValueError, AttributeError):
-        pass  # SDK may not accept this dict shape; fall through
-
-    # Attempt 2: types.GenerateContentConfig with response_schema
+    # Attempt 1: types.GenerateContentConfig with Pydantic class (preferred)
     try:
         cfg = types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -317,16 +295,43 @@ def _call_generate(client: Any, types: Any, mid: str, parts: List[Any]) -> Any:
             temperature=_temperature(),
             max_output_tokens=_max_output_tokens(),
         )
+        return client.models.generate_content(
+            model=mid,
+            contents=parts,
+            config=cfg,
+        )
     except (TypeError, ValueError, AttributeError):
-        # Older SDK may not accept a Pydantic class; pass the JSON Schema dict.
+        pass  # SDK may not accept a Pydantic class; fall through
+
+    # Attempt 2: types.GenerateContentConfig with JSON Schema dict
+    try:
         cfg = types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=schema_dict,
+            response_schema=GeminiBoxDecisionResponse.model_json_schema(),
             temperature=_temperature(),
             max_output_tokens=_max_output_tokens(),
         )
+        return client.models.generate_content(
+            model=mid,
+            contents=parts,
+            config=cfg,
+        )
+    except (TypeError, ValueError, AttributeError):
+        pass  # Fall through to dict config
+
+    # Attempt 3: response_format dict (older SDK fallback)
+    schema_dict = GeminiBoxDecisionResponse.model_json_schema()
     return client.models.generate_content(
         model=mid,
         contents=parts,
-        config=cfg,
+        config={
+            "response_format": {
+                "text": {
+                    "mime_type": "application/json",
+                    "schema": schema_dict,
+                }
+            },
+            "temperature": _temperature(),
+            "max_output_tokens": _max_output_tokens(),
+        },
     )
