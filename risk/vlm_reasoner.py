@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from pydantic import ValidationError
 
 from . import controls, gemini_reasoner, privacy
-from .gemini_reasoner import GeminiReasonResponse
+from .gemini_reasoner import GeminiBoxDecisionResponse
 from .reason_schema import ReasonRequest, ReasonResponse, VlmRisk
 
 log = logging.getLogger("safelens-vision-worker.vlm")
@@ -382,30 +382,214 @@ def _mock_reason(req: ReasonRequest) -> ReasonResponse:
 
 # -- Gemini vision reasoner ---------------------------------------------------
 
+# Short letter IDs assigned to YOLO box candidates for Gemini
+_BOX_LABELS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
-def _gemini_data_to_reason_response(data: Dict[str, Any], req: ReasonRequest) -> ReasonResponse:
-    gem: GeminiReasonResponse = GeminiReasonResponse.model_validate(data)
+
+def _select_candidate_entities(
+    entities: List[Dict[str, Any]],
+    deterministic_risks: List[Dict[str, Any]],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Return up to `limit` candidate YOLO entities ordered by HSE priority.
+
+    Priority (highest first):
+      1. Entities already linked to deterministic risks.
+      2. People / vehicles / PPE objects.
+      3. Objects near image boundaries (edge ≤ 10 % of frame dimension).
+      4. All remaining entities by descending detection confidence.
+    """
+    if not entities:
+        return []
+
+    # Collect entity IDs that have a deterministic risk link.
+    linked_ids: set = set()
+    for r in (deterministic_risks or []):
+        if not isinstance(r, dict):
+            continue
+        for tid in (r.get("involved_track_ids") or []):
+            linked_ids.add(str(tid))
+        eid = r.get("linked_entity_id") or r.get("entity_id")
+        if eid:
+            linked_ids.add(str(eid))
+
+    hse_labels = {
+        "person", "worker", "forklift", "vehicle", "truck", "car",
+        "helmet", "hardhat", "vest", "ppe", "pedestrian",
+    }
+
+    def _entity_id(e: Dict[str, Any], idx: int) -> str:
+        return str(
+            e.get("track_id") or e.get("id") or e.get("entity_id")
+            or e.get("detection_id") or f"entity_{idx}"
+        )
+
+    def _near_edge(bbox: Any) -> bool:
+        if not isinstance(bbox, dict):
+            return False
+        x, y = bbox.get("x", 0.5), bbox.get("y", 0.5)
+        w, h = bbox.get("w", 0.0), bbox.get("h", 0.0)
+        edge = 0.10
+        return (x < edge or y < edge or (x + w) > (1.0 - edge) or (y + h) > (1.0 - edge))
+
+    def _priority(item: tuple) -> tuple:
+        idx, e = item
+        eid = _entity_id(e, idx)
+        label = str(
+            e.get("semantic_label") or e.get("display_label")
+            or e.get("label") or e.get("class_name") or ""
+        ).lower()
+        bbox = e.get("bbox") or {}
+        conf = float(e.get("confidence") or 0.0)
+        is_linked = eid in linked_ids
+        is_hse = any(h in label for h in hse_labels)
+        is_edge = _near_edge(bbox)
+        # Lower tuple = higher priority (used for stable ascending sort + reversal)
+        return (0 if is_linked else 1, 0 if is_hse else 1, 0 if is_edge else 1, -conf)
+
+    ranked = sorted(enumerate(entities), key=_priority)
+    return [e for _, e in ranked[:limit]]
+
+
+def _build_box_decision_anchors(
+    entities: List[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    """Assign short letter IDs (A, B, C…) to candidate entities.
+
+    Returns a list of {"box_id": "A", "entity_id": "...", "label": "..."}.
+    """
+    anchors = []
+    for i, e in enumerate(entities):
+        if i >= len(_BOX_LABELS):
+            break
+        if not isinstance(e, dict):
+            continue
+        box_id = _BOX_LABELS[i]
+        label = str(
+            e.get("semantic_label") or e.get("display_label")
+            or e.get("label") or e.get("class_name") or "object"
+        ).strip() or "object"
+        entity_id = str(
+            e.get("track_id") or e.get("id") or e.get("entity_id")
+            or e.get("detection_id") or f"entity_{i}"
+        )
+        anchors.append({"box_id": box_id, "entity_id": entity_id, "label": label[:50]})
+    return anchors
+
+
+def _render_annotated_reasoner_frame(
+    image: Any,
+    entities: List[Dict[str, Any]],
+    anchors: List[Dict[str, str]],
+) -> Any:
+    """Draw YOLO box labels (A, B, C…) on a copy of `image` for Gemini reasoning.
+
+    The annotated image is only for Gemini reasoning — it is not saved, logged,
+    or returned to the app. Returns the original image unchanged on any error.
+    """
+    if image is None or not anchors:
+        return image
+    try:
+        from PIL import ImageDraw, ImageFont
+
+        # Build entity_id → bbox mapping for quick lookup
+        id_to_entity: Dict[str, Dict[str, Any]] = {}
+        for e in entities:
+            if not isinstance(e, dict):
+                continue
+            eid = str(
+                e.get("track_id") or e.get("id") or e.get("entity_id")
+                or e.get("detection_id") or ""
+            )
+            if eid:
+                id_to_entity[eid] = e
+
+        # Work on a copy so we don't mutate the original.
+        annotated = image.copy()
+        draw = ImageDraw.Draw(annotated)
+        w_img, h_img = annotated.size
+        try:
+            font = ImageFont.load_default()
+        except Exception:  # noqa: BLE001
+            font = None
+
+        for anchor in anchors:
+            eid = anchor.get("entity_id", "")
+            box_id = anchor.get("box_id", "?")
+            entity = id_to_entity.get(eid)
+            if not entity:
+                continue
+            bbox = entity.get("bbox") or {}
+            if not isinstance(bbox, dict):
+                continue
+            x = float(bbox.get("x", 0.0))
+            y = float(bbox.get("y", 0.0))
+            bw = float(bbox.get("w", 0.0))
+            bh = float(bbox.get("h", 0.0))
+            if bw <= 0 or bh <= 0:
+                continue
+            # Convert normalized coords to pixel coords.
+            px0 = int(x * w_img)
+            py0 = int(y * h_img)
+            px1 = int((x + bw) * w_img)
+            py1 = int((y + bh) * h_img)
+            draw.rectangle([px0, py0, px1, py1], outline="white", width=2)
+            label_text = box_id
+            # Draw label background + text.
+            tx, ty = px0 + 2, py0 + 2
+            if font:
+                draw.text((tx, ty), label_text, fill="white", font=font)
+            else:
+                draw.text((tx, ty), label_text, fill="white")
+
+        return annotated
+    except Exception as exc:  # noqa: BLE001
+        log.warning("vlm: annotated frame render failed: %s", exc)
+        return image
+
+
+def _gemini_data_to_reason_response(
+    data: Dict[str, Any],
+    req: ReasonRequest,
+    anchors: List[Dict[str, str]],
+) -> ReasonResponse:
+    """Map GeminiBoxDecisionResponse data → ReasonResponse via anchor lookup."""
+    gem = GeminiBoxDecisionResponse.model_validate(data)
+
+    # Build box_id → anchor mapping for entity resolution.
+    box_id_to_anchor = {a["box_id"]: a for a in anchors}
+    valid_box_ids = set(box_id_to_anchor.keys())
+
+    # Import risk matrix here to avoid circular at module level.
+    from .risk_matrix import get_matrix
+    matrix = get_matrix()
 
     risks: List[VlmRisk] = []
     frame_or_session = req.frame_id or req.session_id or "frame"
-    for i, gr in enumerate(gem.risks):
-        level = str(gr.risk_level or "GREEN").upper()
+    for i, bd in enumerate(gem.box_updates):
+        # Silently skip any box_id Gemini hallucinated outside our anchor set.
+        if bd.box_id not in valid_box_ids:
+            log.debug("gemini: unknown box_id=%r skipped (valid=%s)", bd.box_id, sorted(valid_box_ids))
+            continue
+        anchor = box_id_to_anchor[bd.box_id]
+        evaluated = matrix.evaluate(bd.severity, bd.likelihood)
+        level = evaluated["risk_level"]
+        risk_score = evaluated["risk_score"]
         risk_state = "active" if level in ("YELLOW", "ORANGE", "RED") else "latent"
-        visual_evidence = list(gr.visual_evidence or [])
+        evidence = [bd.evidence_code] if bd.evidence_code else []
         risks.append(VlmRisk(
             risk_id=f"gemini_{frame_or_session}_{i}",
-            hazard_type=gr.hazard_type,
+            hazard_type=bd.hazard_type,
             risk_level=level,
+            risk_score=risk_score,
+            severity=bd.severity,
+            likelihood=bd.likelihood,
             risk_state=risk_state,
-            risk_reason=gr.reason,
-            reason=gr.reason,
-            visual_evidence=visual_evidence,
-            evidence=visual_evidence,
-            recommended_action=gr.recommended_action or None,
-            involved_track_ids=list(gr.involved_track_ids or []),
-            linked_entity_id=gr.linked_entity_id,
-            approximate_region=gr.approximate_region,
-            confidence=float(gr.confidence or 0.0),
+            evidence=evidence,
+            visual_evidence=evidence,
+            involved_track_ids=[anchor["entity_id"]],
+            linked_entity_id=anchor["entity_id"],
+            confidence=float(bd.confidence or 0.0),
             produced_by="vlm_reasoner",
             reasoner_model=gemini_reasoner.model_id(),
             reasoner_status="ok",
@@ -416,9 +600,8 @@ def _gemini_data_to_reason_response(data: Dict[str, Any], req: ReasonRequest) ->
     return ReasonResponse(
         reasoner_status="ok",
         reasoner_model=gemini_reasoner.model_id(),
-        scene_summary=gem.scene_summary,
         risks=risks,
-        uncertain_items=list(gem.uncertain_items or []),
+        uncertain_items=list(gem.uncertain_box_ids or []),
         session_id=req.session_id,
         frame_id=req.frame_id,
         request_id=req.request_id,
@@ -430,16 +613,27 @@ def _gemini_reason(req: ReasonRequest) -> ReasonResponse:
     if not adapter["available"]:
         return ReasonResponse(reasoner_status="unavailable",
                               error=adapter.get("error", "Gemini adapter unavailable"))
-    image = _decode_blurred(req)
-    prompt = _build_gemini_prompt(req)
+
+    # Select candidate boxes (priority-ordered, capped).
+    limit = gemini_reasoner.max_box_candidates()
+    candidates = _select_candidate_entities(req.entities or [], req.deterministic_risks or [], limit)
+    anchors = _build_box_decision_anchors(candidates)
+
+    # Build base frame (decoded + blurred for privacy).
+    base_image = _decode_blurred(req)
+
+    # Render annotated frame with A/B/C box labels for Gemini.
+    annotated_image = _render_annotated_reasoner_frame(base_image, candidates, anchors)
+
+    prompt = _build_gemini_prompt(req, anchors)
     try:
         log.info("gemini_generate_started", extra={"session_id": req.session_id, "frame_id": req.frame_id})
-        raw = adapter["generate"](prompt, image)
+        raw = adapter["generate"](prompt, annotated_image)
         log.info("gemini_generate_completed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
     except Exception as exc:  # noqa: BLE001
         return ReasonResponse(reasoner_status="error", error=f"gemini generate: {exc}")
     try:
-        # Adapter may return a pre-validated dict (GeminiReasonResponse.model_dump())
+        # Adapter may return a pre-validated dict (GeminiBoxDecisionResponse.model_dump())
         # or a raw string for legacy/fallback paths.
         if isinstance(raw, dict):
             data = raw
@@ -455,7 +649,7 @@ def _gemini_reason(req: ReasonRequest) -> ReasonResponse:
                                   error="Gemini did not return valid JSON",
                                   scene_summary="", risks=[], uncertain_items=[])
 
-        return _gemini_data_to_reason_response(data, req)
+        return _gemini_data_to_reason_response(data, req, anchors)
     except ValidationError as exc:
         log.warning("gemini_schema_failed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
         return ReasonResponse(reasoner_status="schema_error", error=f"schema: {exc}")
@@ -463,76 +657,55 @@ def _gemini_reason(req: ReasonRequest) -> ReasonResponse:
         return ReasonResponse(reasoner_status="error", error=f"gemini map: {type(exc).__name__}: {exc}")
 
 
-def _compact_entity_anchors(req: ReasonRequest, limit: int) -> List[Dict[str, str]]:
-    """Return compact {id, label} anchors from req.entities (no bbox/conf/class_id)."""
-    anchors: List[Dict[str, str]] = []
-    for idx, e in enumerate(req.entities or []):
-        if not isinstance(e, dict):
-            continue
-        label = str(
-            e.get("semantic_label")
-            or e.get("display_label")
-            or e.get("label")
-            or e.get("class_name")
-            or "object"
-        ).strip() or "object"
-        track = (
-            e.get("track_id")
-            or e.get("id")
-            or e.get("entity_id")
-            or e.get("detection_id")
-            or f"entity_{idx}"
-        )
-        anchors.append({"id": str(track), "label": label[:50]})
-        if len(anchors) >= limit:
-            break
-    return anchors
+def _build_gemini_prompt(req: ReasonRequest, anchors: List[Dict[str, str]]) -> str:
+    """Build the box-decision prompt.  anchors is the list of {box_id, entity_id, label}."""
+    from .risk_matrix import get_matrix
+    from .gemini_reasoner import GeminiBoxDecisionResponse
 
+    # Compact anchor list for the prompt (box_id + label only; no entity_id/coords).
+    prompt_anchors = [{"box_id": a["box_id"], "label": a["label"]} for a in anchors]
 
-def _compact_risk_context(req: ReasonRequest) -> Dict[str, Any]:
-    """Return a compact scene context without raw detector dumps."""
-    risks = req.deterministic_risks or []
-    levels = [str(r.get("risk_level", "GREEN")).upper() for r in risks if isinstance(r, dict)]
-    highest = max(
-        levels,
-        key=lambda x: _LEVEL.get(x, 0),
-        default="GREEN",
+    # Source risk matrix bands from the configured matrix so the prompt always matches.
+    matrix = get_matrix()
+    max_updates = GeminiBoxDecisionResponse.model_fields["box_updates"].metadata
+    # Extract the max_length from the Annotated metadata if available, else use schema default.
+    try:
+        import annotated_types
+        max_box = next((m.max_length for m in max_updates
+                        if isinstance(m, annotated_types.MaxLen)), 4)
+    except Exception:  # noqa: BLE001
+        max_box = 4
+    band_lines = "\n".join(
+        f"{b['min']}-{b['max']} {b['level']}" for b in matrix.bands
     )
-    hazard_types = sorted({
-        str(r.get("hazard_type") or r.get("hazard") or "other")
-        for r in risks
-        if isinstance(r, dict)
-    })[:8]
-    return {
-        "detected_object_anchors": _compact_entity_anchors(req, gemini_reasoner.max_detected_labels()),
-        "highest_deterministic_risk_level": highest,
-        "known_deterministic_risk_types": hazard_types,
-        "scene_hint": "live_hse_monitoring",
-    }
 
-
-def _build_gemini_prompt(req: ReasonRequest) -> str:
-    context = _compact_risk_context(req)
     return (
-        "You are an HSE scene-reasoning assistant.\n"
-        "Analyze the current image for visible physical safety risks.\n"
-        "YOLO already provides object boxes and coordinates. "
-        "Do not output detector entities, bounding boxes, class IDs, "
-        "detector confidence values, or track geometry.\n"
-        "Return only JSON matching the provided schema.\n"
+        "You are an HSE box risk classifier.\n"
+        "The image contains YOLO boxes labeled with short IDs such as A, B, C.\n"
+        "Return ONLY valid JSON matching the schema.\n"
+        "Your job:\n"
+        "- choose which existing YOLO boxes should change risk color\n"
+        "- assign hazard_type\n"
+        "- assign severity 1-5\n"
+        "- assign likelihood 1-5\n"
+        "- assign confidence 0-1\n"
+        "- assign evidence_code\n"
         "Rules:\n"
-        '- If no visible supported risk exists, return {"scene_summary":"","risks":[],"uncertain_items":[]}.\n'
-        "- Do not invent hazards.\n"
-        "- Do not assume danger from object presence alone.\n"
-        "- Use current-frame visual evidence only.\n"
-        "- Keep reasons and actions short.\n"
-        "- At most 3 risks.\n"
-        "- Link risks only to ids in detected_object_anchors.\n"
-        "- If a risk cannot be visually supported and linked, "
-        "put it in uncertain_items or return no risk.\n"
-        "- The model is advisory only; the worker will enforce human-review metadata.\n"
-        "Compact context:\n"
-        + json.dumps(context, default=str, separators=(",", ":"))
+        "- Use only visible evidence in the current image.\n"
+        "- Use only box IDs shown in detected_box_anchors.\n"
+        "- Do not output coordinates.\n"
+        "- Do not output bbox.\n"
+        "- Do not output class IDs.\n"
+        "- Do not create new boxes.\n"
+        "- Do not explain in sentences.\n"
+        f"- If no clear risk exists, return box_updates=[].\n"
+        f"- Max {max_box} box_updates.\n"
+        "- Prefer no risk over guessing.\n"
+        "Risk matrix:\n"
+        "risk_score = severity * likelihood\n"
+        + band_lines + "\n"
+        "Detected box anchors:\n"
+        + json.dumps(prompt_anchors, default=str, separators=(",", ":"))
     )
 
 
@@ -749,6 +922,6 @@ def _extract_json(raw: Any) -> Optional[Dict[str, Any]]:
     if not parsed:
         return None
     for o in parsed:
-        if "scene_summary" in o or "risks" in o or "scene_context" in o:
+        if "box_updates" in o or "scene_summary" in o or "risks" in o or "scene_context" in o:
             return o
     return parsed[0]

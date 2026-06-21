@@ -7,10 +7,11 @@ Implements the same adapter contract as vlm_reasoner._build_adapter():
 
 Design rules (inherited from vlm_reasoner):
   * Never log or return GEMINI_API_KEY.
-  * Scene-level only: Gemini must NOT output bbox, class_id, confidence, or
-    raw detector coordinates. YOLO remains the coordinate/detection truth.
+  * Box-decision only: Gemini assigns risk to existing YOLO boxes (identified
+    by short letter IDs A/B/C) and must NOT output bbox, class_id, confidence,
+    or raw detector coordinates. YOLO remains the coordinate/detection truth.
   * On any import/API failure -> available=False, never raises into the caller.
-  * generate() returns a validated dict (GeminiReasonResponse.model_dump())
+  * generate() returns a validated dict (GeminiBoxDecisionResponse.model_dump())
     when Pydantic parse succeeds; falls back to raw str for _extract_json().
   * _call_generate() uses response_schema structured output; falls back
     gracefully if the installed SDK version uses a different config shape.
@@ -28,7 +29,7 @@ log = logging.getLogger("safelens-vision-worker.gemini")
 
 # ---------------------------------------------------------------------------
 # Gemini structured-output schema
-# (scene-level only; no bbox / class_id / detector confidence)
+# (box-decision only; no bbox / class_id / detector confidence / narratives)
 # ---------------------------------------------------------------------------
 
 RiskLevel = Literal["GREEN", "YELLOW", "ORANGE", "RED"]
@@ -43,41 +44,49 @@ HazardType = Literal[
     "broken_object",
     "other",
 ]
+EvidenceCode = Literal[
+    "near_edge",
+    "unstable_position",
+    "blocked_path_visible",
+    "spill_or_wet_surface",
+    "person_vehicle_proximity",
+    "ppe_absent_visible",
+    "broken_or_sharp_object",
+    "falling_object_potential",
+    "other_visible",
+]
 
 
-class GeminiRisk(BaseModel):
-    """Scene-level HSE risk returned by Gemini.
+class GeminiBoxDecision(BaseModel):
+    """Risk decision for a single existing YOLO box (identified by short letter ID).
 
     Deliberately omits bbox, class_id, and detector confidence — YOLO remains
-    the coordinate/detection truth.  Risks must be linked back to the anchor
-    ids supplied in the prompt's detected_object_anchors list.
+    the coordinate/detection truth.  box_id must match one of the short IDs
+    (A, B, C…) shown on the annotated frame passed to Gemini.
     """
 
-    hazard_type: HazardType = Field(description="Visible HSE hazard category.")
-    risk_level: RiskLevel = Field(
-        description="Risk level based only on current-frame visual evidence."
+    box_id: str = Field(
+        description="Short YOLO box id shown on the annotated frame, e.g. A, B, C.",
+        pattern=r"^[A-Z]$",
     )
-    reason: str = Field(default="", max_length=240)
-    recommended_action: str = Field(default="", max_length=180)
-    visual_evidence: List[str] = Field(default_factory=list, max_length=3)
-    involved_track_ids: List[str] = Field(default_factory=list, max_length=3)
-    linked_entity_id: Optional[str] = None
-    approximate_region: Optional[str] = None
+    hazard_type: HazardType
+    severity: int = Field(ge=1, le=5)
+    likelihood: int = Field(ge=1, le=5)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    evidence_code: EvidenceCode = "other_visible"
 
 
-class GeminiReasonResponse(BaseModel):
-    """Top-level structured output schema for Gemini's HSE scene analysis.
+class GeminiBoxDecisionResponse(BaseModel):
+    """Top-level structured output schema for Gemini's HSE box risk decisions.
 
-    Enforces that risks are linked to detected_object_anchors supplied in the
-    prompt.  This is the schema passed to Gemini via response_schema so the
-    model is constrained to emit exactly these fields.  The worker maps this
-    into ReasonResponse and calls enforce_draft_contract() before returning.
+    Gemini returns only box_updates (which existing YOLO boxes to flag) and
+    uncertain_box_ids (boxes it cannot assess confidently).  The worker maps
+    box_id back to the YOLO entity/track, computes risk_score = severity *
+    likelihood, and applies the risk matrix for the final color.
     """
 
-    scene_summary: str = Field(default="", max_length=240)
-    risks: List[GeminiRisk] = Field(default_factory=list, max_length=3)
-    uncertain_items: List[str] = Field(default_factory=list, max_length=5)
+    box_updates: List[GeminiBoxDecision] = Field(default_factory=list, max_length=4)
+    uncertain_box_ids: List[str] = Field(default_factory=list, max_length=4)
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -126,6 +135,13 @@ def _max_detected_labels() -> int:
         return 20
 
 
+def _max_box_candidates() -> int:
+    try:
+        return max(1, int(os.getenv("GEMINI_MAX_BOX_CANDIDATES", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
 def _request_retries() -> int:
     try:
         return max(0, int(os.getenv("GEMINI_REQUEST_RETRIES", "1")))
@@ -144,6 +160,7 @@ def config() -> Dict[str, Any]:
         "max_output_tokens": _max_output_tokens(),
         "temperature": _temperature(),
         "max_detected_labels": _max_detected_labels(),
+        "max_box_candidates": _max_box_candidates(),
         "max_image_side": _max_image_side(),
         "timeout_ms": _timeout_ms(),
         "request_retries": _request_retries(),
@@ -153,6 +170,11 @@ def config() -> Dict[str, Any]:
 def max_detected_labels() -> int:
     """Public accessor for GEMINI_MAX_DETECTED_LABELS (number of entity labels in prompts)."""
     return _max_detected_labels()
+
+
+def max_box_candidates() -> int:
+    """Public accessor for GEMINI_MAX_BOX_CANDIDATES (max YOLO boxes sent to Gemini)."""
+    return _max_box_candidates()
 
 
 def build_adapter() -> Dict[str, Any]:
@@ -202,7 +224,7 @@ def build_adapter() -> Dict[str, Any]:
     def generate(prompt: str, image: Any) -> Any:
         """Call Gemini and return a validated dict or raw text on fallback.
 
-        Returns GeminiReasonResponse.model_dump() when Pydantic validation
+        Returns GeminiBoxDecisionResponse.model_dump() when Pydantic validation
         succeeds so the caller can skip JSON re-parsing.  Falls back to raw
         str so _extract_json() in vlm_reasoner can still recover.  Raises on
         API error (caller handles).
@@ -239,7 +261,7 @@ def build_adapter() -> Dict[str, Any]:
                 raw_text = response.text or ""
                 # Prefer validated Pydantic dict; fall back to raw str.
                 try:
-                    return GeminiReasonResponse.model_validate_json(raw_text).model_dump()
+                    return GeminiBoxDecisionResponse.model_validate_json(raw_text).model_dump()
                 except Exception:  # noqa: BLE001
                     return raw_text
             except Exception as exc:  # noqa: BLE001
@@ -262,10 +284,10 @@ def _call_generate(client: Any, types: Any, mid: str, parts: List[Any]) -> Any:
 
     Tries the documented response_format dict first (newer SDK); falls back to
     types.GenerateContentConfig with response_schema (older SDK style).
-    Both paths enforce the GeminiReasonResponse schema so Gemini is constrained
-    to emit only the fields we need and nothing the model should not invent.
+    Both paths enforce the GeminiBoxDecisionResponse schema so Gemini is
+    constrained to emit only the box-decision fields and nothing else.
     """
-    schema_dict = GeminiReasonResponse.model_json_schema()
+    schema_dict = GeminiBoxDecisionResponse.model_json_schema()
 
     # Attempt 1: response_format dict (documented pattern for newer SDKs)
     try:
@@ -291,7 +313,7 @@ def _call_generate(client: Any, types: Any, mid: str, parts: List[Any]) -> Any:
     try:
         cfg = types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=GeminiReasonResponse,
+            response_schema=GeminiBoxDecisionResponse,
             temperature=_temperature(),
             max_output_tokens=_max_output_tokens(),
         )
