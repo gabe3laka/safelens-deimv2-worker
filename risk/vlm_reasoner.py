@@ -223,7 +223,7 @@ def maybe_trigger(session_id: Optional[str], *, frame_b64: Optional[str],
             return draft, (cached_status if draft else "throttled")
         # Error backoff: after a Gemini failure, do not immediately retry.
         err_last = _LAST_ERROR_MS.get(sid, 0)
-        if not force_reason and (now - err_last) < _error_backoff_ms():
+        if (now - err_last) < _error_backoff_ms():
             return draft, (cached_status if draft else "throttled")
         # trigger
         _LAST_RUN_MS[sid] = now
