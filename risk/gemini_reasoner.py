@@ -99,6 +99,14 @@ class GeminiBoxDecision(BaseModel):
     likelihood: int = Field(ge=1, le=5)
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     evidence_code: EvidenceCode = "other_visible"
+    semantic_label: Optional[str] = Field(
+        default=None,
+        max_length=48,
+        description=(
+            "Short visual object noun phrase for this existing YOLO box. "
+            "Object identity only; no risk words."
+        ),
+    )
 
 
 class GeminiBoxDecisionResponse(BaseModel):

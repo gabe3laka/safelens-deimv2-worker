@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
-from . import controls, gemini_reasoner, privacy
+from . import controls, gemini_reasoner, privacy, semantic_memory
 from .gemini_reasoner import GeminiBoxDecisionResponse
 from .reason_schema import ReasonRequest, ReasonResponse, VlmRisk
 
@@ -601,6 +601,21 @@ def _gemini_data_to_reason_response(
     from .risk_matrix import get_matrix
     matrix = get_matrix()
 
+    # Build a lookup from anchor entity_id → original entity dict so we can
+    # retrieve track_id / detection_id for semantic memory updates.
+    entity_id_to_entity: Dict[str, Dict[str, Any]] = {}
+    for e in (req.entities or []):
+        if not isinstance(e, dict):
+            continue
+        eid = str(
+            e.get("track_id") or e.get("id") or e.get("entity_id")
+            or e.get("detection_id") or ""
+        )
+        if eid:
+            entity_id_to_entity[eid] = e
+
+    sem_min_conf = semantic_memory._min_confidence()  # noqa: SLF001
+
     risks: List[VlmRisk] = []
     frame_or_session = req.frame_id or req.session_id or "frame"
     for i, bd in enumerate(gem.box_updates):
@@ -633,6 +648,21 @@ def _gemini_data_to_reason_response(
             requires_human_review=True,
             should_alert=False,
         ))
+
+        # Update semantic memory when a semantic_label is provided and the box
+        # maps to a real known anchor entity.
+        if bd.semantic_label and bd.confidence >= sem_min_conf and req.session_id:
+            entity = entity_id_to_entity.get(anchor["entity_id"])
+            if entity is not None:
+                semantic_memory.update(
+                    req.session_id,
+                    track_id=entity.get("track_id"),
+                    detection_id=entity.get("detection_id"),
+                    entity_id=(entity.get("entity_id") or entity.get("id")),
+                    semantic_label=bd.semantic_label,
+                    confidence=float(bd.confidence or 0.0),
+                    source="gemini",
+                )
 
     return ReasonResponse(
         reasoner_status="ok",
@@ -742,6 +772,15 @@ def _build_gemini_prompt(req: ReasonRequest, anchors: List[Dict[str, str]]) -> s
         f"- If no clear risk exists, return box_updates=[].\n"
         f"- Max {max_box} box_updates.\n"
         "- Prefer no risk over guessing.\n"
+        "semantic_label rules:\n"
+        "- For each box_update, optionally include semantic_label only when object "
+        "identity is visually clear.\n"
+        "- semantic_label must be a short object noun phrase only (e.g. 'plant pot', "
+        "'office chair', 'metal cabinet').\n"
+        "- Do not include risk words such as danger, hazardous, unsafe, risk, yellow, "
+        "red, edge, falling.\n"
+        "- Do not invent a label if uncertain; omit the field instead.\n"
+        "- semantic_label belongs only to an existing box_id; do not create new boxes.\n"
         "Risk matrix:\n"
         "risk_score = severity * likelihood\n"
         + band_lines + "\n"
