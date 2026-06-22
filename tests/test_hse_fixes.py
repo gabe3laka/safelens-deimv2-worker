@@ -73,7 +73,17 @@ def _reset(monkeypatch):
     vlm.reset()
 
 
+@pytest.fixture()
+def server_mod(monkeypatch):
+    monkeypatch.setenv("SKIP_WARMUP", "true")
+    monkeypatch.setenv("AUTO_WARMUP", "false")
+    if "server" in sys.modules:
+        del sys.modules["server"]
+    return importlib.import_module("server")
+
+
 def _get_srv(monkeypatch):
+    """Inline server load for tests that don't use the server_mod fixture."""
     monkeypatch.setenv("SKIP_WARMUP", "true")
     if "server" in sys.modules:
         del sys.modules["server"]
@@ -633,15 +643,6 @@ def test_error_backoff_ms_default():
 # ---------------------------------------------------------------------------
 # End-to-end: detect returns entity-stamped boxes when highest_risk_level=YELLOW
 # ---------------------------------------------------------------------------
-
-@pytest.fixture()
-def server_mod(monkeypatch):
-    monkeypatch.setenv("SKIP_WARMUP", "true")
-    monkeypatch.setenv("AUTO_WARMUP", "false")
-    if "server" in sys.modules:
-        del sys.modules["server"]
-    return importlib.import_module("server")
-
 
 def test_detect_entity_stamped_when_yellow_risk(server_mod, monkeypatch):
     """When highest_risk_level=YELLOW and a matching scene_risk exists, entities have risk_level."""

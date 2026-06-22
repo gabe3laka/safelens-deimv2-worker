@@ -999,7 +999,12 @@ def _is_linkable_scene_risk(r: dict) -> bool:
         return True
     bbox = r.get("bbox")
     if isinstance(bbox, dict):
-        return all(isinstance(bbox.get(k), (int, float)) for k in ("x", "y", "w", "h"))
+        return (
+            isinstance(bbox.get("x"), (int, float))
+            and isinstance(bbox.get("y"), (int, float))
+            and isinstance(bbox.get("w"), (int, float))
+            and isinstance(bbox.get("h"), (int, float))
+        )
     return False
 
 
@@ -1068,8 +1073,11 @@ def _stamp_entity_risks(resp_dict: Dict[str, Any]) -> None:
                 best_level = rl_order
 
         if best_risk:
-            e["risk_level"] = best_risk.get("risk_level", "GREEN")
-            e["risk_color"] = _RISK_COLOR_MAP.get(e["risk_level"], e["risk_level"].lower())
+            rl = best_risk.get("risk_level", "GREEN")
+            if not isinstance(rl, str) or rl not in _RISK_LEVEL_ORDER:
+                rl = "GREEN"
+            e["risk_level"] = rl
+            e["risk_color"] = _RISK_COLOR_MAP.get(rl, rl.lower())
             e["risk_score"] = best_risk.get("risk_score")
             e["severity"] = best_risk.get("severity")
             e["likelihood"] = best_risk.get("likelihood")
