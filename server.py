@@ -858,7 +858,7 @@ def _has_finite_bbox(value: Any) -> bool:
         y = float(value.get("y"))
         w = float(value.get("w"))
         h = float(value.get("h"))
-    except Exception:  # noqa: BLE001
+    except (TypeError, ValueError):
         return False
     return all(math.isfinite(v) for v in (x, y, w, h)) and w > 0 and h > 0
 
@@ -872,7 +872,7 @@ def _deterministic_risk_is_scene_visible(risk: dict) -> bool:
     produced_by = str(risk.get("produced_by", "risk_engine")).lower()
     if produced_by == "vlm_reasoner":
         return False
-    if str(risk.get("risk_state", "active")).lower() in {"resolved", "resolving", "suppressed"}:
+    if str(risk.get("risk_state", "active")).lower() in {"resolved", "suppressed"}:
         return False
     level = str(risk.get("risk_level", "GREEN")).upper()
     if _RISK_LEVEL_ORDER.get(level, 0) < _RISK_LEVEL_ORDER["YELLOW"]:
