@@ -1014,7 +1014,7 @@ def _stamp_entity_risks(resp_dict: Dict[str, Any]) -> None:
     Matching priority:
       1. track_id in involved_track_ids / linked_entity_id / entity_id / track_id
       2. detection_id in involved_detection_ids
-      3. bbox IoU >= 0.30 fallback
+      3. bbox fallback: IoU >= 0.20 OR center-distance <= 0.12
 
     Stamped fields: risk_level, risk_color, risk_score, severity, likelihood,
       risk_reason, recommended_action, produced_by, requires_human_review.
@@ -1063,9 +1063,9 @@ def _stamp_entity_risks(resp_dict: Dict[str, Any]) -> None:
                 dids = [str(d) for d in (r.get("involved_detection_ids") or [])]
                 if e_did_s in dids:
                     matched = True
-            # 3. Bbox IoU fallback
+            # 3. Bbox fallback (app parity): IoU >= 0.20 OR center-distance <= 0.12
             if not matched and isinstance(e_bbox, dict) and isinstance(r.get("bbox"), dict):
-                if _iou(e_bbox, r["bbox"]) >= 0.30:
+                if _iou(e_bbox, r["bbox"]) >= 0.20 or _center_dist(e_bbox, r["bbox"]) <= 0.12:
                     matched = True
 
             if matched:
@@ -1225,11 +1225,6 @@ async def detect(payload: Dict[str, Any]):
                 resp_dict["scene_risks"] = _build_scene_risks(
                     resp_dict.get("risks", []), None, resp_dict.get("tracks", []))
                 _add_warning(resp_dict, "reasoner_unavailable")
-        # Stamp the highest matching scene_risk onto each YOLO entity so the app
-        # can color boxes without waiting for VLM. This is the primary mechanism
-        # that drives box coloring during live HSE streaming.
-        if resp_dict.get("scene_risks"):
-            _stamp_entity_risks(resp_dict)
         # Event-triggered temporal perception (PR: single-worker GPU+CPU). ADDITIVE
         # + NON-BLOCKING: folds the frame into per-session memory, adds deterministic
         # object-near-edge risk, and (rarely, rate-limited) kicks an async VLM job
@@ -1243,6 +1238,10 @@ async def detect(payload: Dict[str, Any]):
                     frame_b64=frame_b64, payload=payload)
         except Exception as texc:  # noqa: BLE001 -- temporal must never break detection
             log.warning("detect: temporal layer failed: %s", texc)
+        # Final stamping pass after all scene_risks (including temporal additions)
+        # are attached, so entity box colors reflect the final scene_risks payload.
+        if resp_dict.get("scene_risks"):
+            _stamp_entity_risks(resp_dict)
         # Degradation ladder (B4): surface degraded/degradation_mode + metrics.
         # VLM unavailability in HSE mode is also surfaced as degraded.
         rmeta = resp_dict.get("risk_engine") or {}

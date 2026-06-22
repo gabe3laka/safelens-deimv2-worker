@@ -321,6 +321,54 @@ def test_stamp_entity_risks_by_bbox_iou(monkeypatch):
     assert entity["risk_level"] == "RED"
 
 
+def test_stamp_entity_risks_by_bbox_iou_threshold_020(monkeypatch):
+    """IoU >= 0.20 (even < 0.30) stamps the entity."""
+    srv = _get_srv(monkeypatch)
+    entity = {
+        "label": "person",
+        "track_id": "trk_no_match",
+        "bbox": {"x": 0.00, "y": 0.00, "w": 0.50, "h": 0.50},
+    }
+    risk = {
+        "risk_id": "r_iou_020",
+        "risk_level": "YELLOW",
+        "bbox": {"x": 0.18, "y": 0.18, "w": 0.50, "h": 0.50},
+        "involved_track_ids": ["trk_other"],
+        "produced_by": "risk_engine",
+        "requires_human_review": False,
+    }
+    resp = {"entities": [entity], "scene_risks": [risk]}
+    iou = srv._iou(entity["bbox"], risk["bbox"])
+    assert iou == pytest.approx(0.2575, abs=0.005)
+    assert 0.20 <= iou < 0.30
+    assert srv._center_dist(entity["bbox"], risk["bbox"]) > 0.12
+    srv._stamp_entity_risks(resp)
+    assert entity["risk_level"] == "YELLOW"
+
+
+def test_stamp_entity_risks_by_center_distance_fallback(monkeypatch):
+    """Center-distance <= 0.12 stamps even when IoU is below 0.20."""
+    srv = _get_srv(monkeypatch)
+    entity = {
+        "label": "person",
+        "track_id": "trk_no_match",
+        "bbox": {"x": 0.40, "y": 0.40, "w": 0.08, "h": 0.08},
+    }
+    risk = {
+        "risk_id": "r_center",
+        "risk_level": "ORANGE",
+        "bbox": {"x": 0.35, "y": 0.35, "w": 0.30, "h": 0.30},
+        "involved_track_ids": ["trk_other"],
+        "produced_by": "risk_engine",
+        "requires_human_review": False,
+    }
+    resp = {"entities": [entity], "scene_risks": [risk]}
+    assert srv._iou(entity["bbox"], risk["bbox"]) < 0.20
+    assert srv._center_dist(entity["bbox"], risk["bbox"]) <= 0.12
+    srv._stamp_entity_risks(resp)
+    assert entity["risk_level"] == "ORANGE"
+
+
 def test_stamp_entity_risks_candidate_only_not_stamped(monkeypatch):
     """Candidate-only risks are not stamped onto boxes."""
     srv = _get_srv(monkeypatch)
@@ -674,6 +722,96 @@ def test_detect_entity_stamped_when_yellow_risk(server_mod, monkeypatch):
             assert "entities" in body
             # At least verify no exception was raised; entity stamping may depend
             # on the risk engine producing linkable risks in this test environment.
+    finally:
+        with server_mod._STATE_LOCK:
+            server_mod._STATE["status"] = "cold"
+
+
+def test_detect_temporal_added_scene_risk_stamps_entity(server_mod, monkeypatch):
+    """A scene_risk added by temporal attach is stamped in final detect response."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    import vision_backend
+    import temporal_reasoning
+
+    monkeypatch.setenv("RISK_ENGINE_ENABLED", "false")
+    monkeypatch.setattr(vision_backend, "run_inference", lambda **kw: _fake_resp_with_risk())
+    monkeypatch.setattr(vlm, "enabled", lambda: False)
+    monkeypatch.setattr(temporal_reasoning, "enabled", lambda: True)
+
+    def _attach(resp_dict, **kwargs):
+        out = dict(resp_dict)
+        out["scene_risks"] = [{
+            "risk_id": "temporal_risk_1",
+            "risk_level": "RED",
+            "bbox": dict(PERSON["bbox"]),
+            "risk_reason": "Temporal near-edge persistence",
+            "produced_by": "temporal_reasoning",
+            "requires_human_review": False,
+        }]
+        return out
+
+    monkeypatch.setattr(temporal_reasoning, "attach_temporal", _attach)
+
+    with server_mod._STATE_LOCK:
+        server_mod._STATE["status"] = "ready"
+    try:
+        with TestClient(server_mod.app) as c:
+            r = c.post("/detect", json={"image_b64": _tiny_jpeg_b64(), "session_id": "cam_temporal"})
+            assert r.status_code == 200
+            body = r.json()
+            stamped = [e for e in body.get("entities", []) if isinstance(e, dict) and e.get("risk_level") == "RED"]
+            assert stamped
+    finally:
+        with server_mod._STATE_LOCK:
+            server_mod._STATE["status"] = "cold"
+
+
+def test_detect_log_overlap_scene_risk_counts_stamp_count(server_mod, monkeypatch):
+    """linkable_scene_risks_count=1 with overlap yields entity_risk_stamped_count>=1."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+    import vision_backend
+    import temporal_reasoning
+    import worker_runtime as runtime_mod
+
+    logged: List[Dict[str, Any]] = []
+
+    def capture_log_event(event_name, **kwargs):
+        logged.append({"event": event_name, **kwargs})
+
+    monkeypatch.setenv("RISK_ENGINE_ENABLED", "false")
+    monkeypatch.setattr(vision_backend, "run_inference", lambda **kw: _fake_resp_with_risk())
+    monkeypatch.setattr(vlm, "enabled", lambda: False)
+    monkeypatch.setattr(temporal_reasoning, "enabled", lambda: True)
+    monkeypatch.setattr(runtime_mod, "log_event", capture_log_event)
+
+    def _attach(resp_dict, **kwargs):
+        out = dict(resp_dict)
+        out["scene_risks"] = [{
+            "risk_id": "temporal_risk_overlap",
+            "risk_level": "YELLOW",
+            "bbox": dict(PERSON["bbox"]),
+            "risk_reason": "Overlap with person",
+            "produced_by": "temporal_reasoning",
+            "requires_human_review": False,
+        }]
+        return out
+
+    monkeypatch.setattr(temporal_reasoning, "attach_temporal", _attach)
+
+    with server_mod._STATE_LOCK:
+        server_mod._STATE["status"] = "ready"
+    try:
+        with TestClient(server_mod.app) as c:
+            r = c.post("/detect", json={"image_b64": _tiny_jpeg_b64(), "session_id": "cam_temporal_log"})
+            assert r.status_code == 200
+        detect_events = [e for e in logged if e.get("event") == "detect"]
+        assert detect_events
+        ev = detect_events[-1]
+        assert ev["scene_risks_count"] == 1
+        assert ev["linkable_scene_risks_count"] == 1
+        assert ev["entity_risk_stamped_count"] >= 1
     finally:
         with server_mod._STATE_LOCK:
             server_mod._STATE["status"] = "cold"
