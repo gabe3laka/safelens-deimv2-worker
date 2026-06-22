@@ -332,13 +332,15 @@ def test_stamp_entity_risks_by_bbox_iou_threshold_020(monkeypatch):
     risk = {
         "risk_id": "r_iou_020",
         "risk_level": "YELLOW",
-        "bbox": {"x": 0.18, "y": 0.18, "w": 0.50, "h": 0.50},  # IoU ~= 0.258
+        "bbox": {"x": 0.18, "y": 0.18, "w": 0.50, "h": 0.50},
         "involved_track_ids": ["trk_other"],
         "produced_by": "risk_engine",
         "requires_human_review": False,
     }
     resp = {"entities": [entity], "scene_risks": [risk]}
-    assert 0.20 <= srv._iou(entity["bbox"], risk["bbox"]) < 0.30
+    iou = srv._iou(entity["bbox"], risk["bbox"])
+    assert iou == pytest.approx(0.2575, abs=0.005)
+    assert 0.20 <= iou < 0.30
     assert srv._center_dist(entity["bbox"], risk["bbox"]) > 0.12
     srv._stamp_entity_risks(resp)
     assert entity["risk_level"] == "YELLOW"
