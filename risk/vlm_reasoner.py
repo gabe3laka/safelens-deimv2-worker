@@ -92,6 +92,14 @@ def _cache_ttl_ms() -> int:
         return 10000
 
 
+def _error_backoff_ms() -> int:
+    """Minimum wait after a Gemini 503 / error / json_parse_error before retrying."""
+    try:
+        return max(0, int(os.getenv("REASONER_ERROR_BACKOFF_MS", "15000")))
+    except (TypeError, ValueError):
+        return 15000
+
+
 def _max_sessions() -> int:
     try:
         return int(os.getenv("REASONER_MAX_SESSIONS", "64"))
@@ -115,10 +123,16 @@ def _now_ms() -> int:
 _LOCK = threading.RLock()
 _CACHE: Dict[str, Dict[str, Any]] = {}      # session -> {"response": dict, "ts": ms}
 _LAST_RUN_MS: Dict[str, int] = {}
+_LAST_ERROR_MS: Dict[str, int] = {}         # session -> last failure timestamp (ms)
 _INFLIGHT: set = set()
 _LAST_STATUS: Dict[str, Any] = {"status": "idle", "ts": 0}
 _EXECUTOR: Optional[ThreadPoolExecutor] = None
 _ADAPTER_STATE: Dict[str, Any] = {}         # mode -> built adapter dict
+
+# Failure statuses that should not overwrite a previously successful cached result.
+_TERMINAL_FAILURES: frozenset = frozenset(
+    {"schema_error", "json_parse_error", "error", "timeout", "unavailable"}
+)
 
 
 def _executor() -> ThreadPoolExecutor:
@@ -138,11 +152,13 @@ def _sweep(now_ms: int) -> None:
     for sid in [s for s, v in list(_CACHE.items()) if now_ms - v.get("ts", now_ms) > ttl]:
         _CACHE.pop(sid, None)
         _LAST_RUN_MS.pop(sid, None)
+        _LAST_ERROR_MS.pop(sid, None)
     # bound active sessions
     while len(_CACHE) > _max_sessions():
         oldest = min(_CACHE.items(), key=lambda kv: kv[1].get("ts", 0))[0]
         _CACHE.pop(oldest, None)
         _LAST_RUN_MS.pop(oldest, None)
+        _LAST_ERROR_MS.pop(oldest, None)
 
 
 def get_cached_draft(session_id: Optional[str], max_age_ms: Optional[int] = None) -> Optional[Dict[str, Any]]:
@@ -161,6 +177,7 @@ def reset() -> None:
     with _LOCK:
         _CACHE.clear()
         _LAST_RUN_MS.clear()
+        _LAST_ERROR_MS.clear()
         _INFLIGHT.clear()
         _LAST_STATUS.update(status="idle", ts=0)
     global _ADAPTER_STATE
@@ -204,6 +221,10 @@ def maybe_trigger(session_id: Optional[str], *, frame_b64: Optional[str],
         last = _LAST_RUN_MS.get(sid, 0)
         if sid in _INFLIGHT or (now - last) < _min_interval_ms():
             return draft, (cached_status if draft else "throttled")
+        # Error backoff: after a Gemini failure, do not immediately retry.
+        err_last = _LAST_ERROR_MS.get(sid, 0)
+        if not force_reason and (now - err_last) < _error_backoff_ms():
+            return draft, (cached_status if draft else "throttled")
         # trigger
         _LAST_RUN_MS[sid] = now
         _INFLIGHT.add(sid)
@@ -223,7 +244,7 @@ def maybe_trigger(session_id: Optional[str], *, frame_b64: Optional[str],
 
 
 def _is_terminal_failure_status(status: Optional[str]) -> bool:
-    return status in {"schema_error", "json_parse_error", "error", "timeout"}
+    return status in _TERMINAL_FAILURES
 
 
 def _cached_reasoner_status(draft: Optional[Dict[str, Any]]) -> str:
@@ -238,9 +259,25 @@ def _cached_reasoner_status(draft: Optional[Dict[str, Any]]) -> str:
 
 
 def _cache_terminal_response(sid: str, resp: Dict[str, Any]) -> None:
+    status = resp.get("reasoner_status", "ok")
     with _LOCK:
-        _CACHE[sid] = {"response": resp, "ts": _now_ms()}
-        _LAST_STATUS.update(status=resp.get("reasoner_status", "ok"), ts=_now_ms())
+        now = _now_ms()
+        _LAST_STATUS.update(status=status, ts=now)
+        if status in _TERMINAL_FAILURES:
+            # Record the error timestamp for backoff.
+            _LAST_ERROR_MS[sid] = now
+            # If a previous successful result exists, keep it -- do not overwrite
+            # with a failure so deterministic scene_risks stay linked.
+            existing = _CACHE.get(sid)
+            if (existing is not None
+                    and existing.get("response", {}).get("reasoner_status")
+                    not in _TERMINAL_FAILURES):
+                log.info(
+                    "vlm_failure_not_overwriting_last_good session_id=%s status=%s",
+                    sid, status,
+                )
+                return
+        _CACHE[sid] = {"response": resp, "ts": now}
 
 
 def _run_and_cache(sid: str, req: Dict[str, Any]) -> None:
@@ -630,6 +667,10 @@ def _gemini_reason(req: ReasonRequest) -> ReasonResponse:
         log.info("gemini_generate_started", extra={"session_id": req.session_id, "frame_id": req.frame_id})
         raw = adapter["generate"](prompt, annotated_image)
         log.info("gemini_generate_completed", extra={"session_id": req.session_id, "frame_id": req.frame_id})
+    except gemini_reasoner.GeminiUnavailableError as exc:
+        # HTTP 503 from Google API -- service unavailable, not a JSON parse failure.
+        return ReasonResponse(reasoner_status="unavailable",
+                              error=f"gemini 503: {exc}")
     except Exception as exc:  # noqa: BLE001
         return ReasonResponse(reasoner_status="error", error=f"gemini generate: {exc}")
     try:

@@ -976,6 +976,110 @@ def _add_warning(resp: Dict[str, Any], key: str) -> None:
         resp["warnings"] = existing + [key]
 
 
+# -- HSE entity stamping + linkability helpers --------------------------------
+
+_RISK_LEVEL_ORDER: Dict[str, int] = {"GREEN": 0, "YELLOW": 1, "ORANGE": 2, "RED": 3}
+_RISK_COLOR_MAP: Dict[str, str] = {
+    "GREEN": "green", "YELLOW": "yellow", "ORANGE": "orange", "RED": "red",
+}
+
+
+def _is_linkable_scene_risk(r: dict) -> bool:
+    """Return True when a scene_risk entry can be linked to a specific entity/bbox.
+
+    Used to determine whether the app can use this risk to color a box.
+    """
+    if not isinstance(r, dict):
+        return False
+    if r.get("linked_entity_id") or r.get("entity_id") or r.get("track_id"):
+        return True
+    if isinstance(r.get("involved_track_ids"), list) and r["involved_track_ids"]:
+        return True
+    if isinstance(r.get("involved_detection_ids"), list) and r["involved_detection_ids"]:
+        return True
+    bbox = r.get("bbox")
+    if isinstance(bbox, dict):
+        return all(isinstance(bbox.get(k), (int, float)) for k in ("x", "y", "w", "h"))
+    return False
+
+
+def _stamp_entity_risks(resp_dict: Dict[str, Any]) -> None:
+    """Stamp the highest matching scene_risk onto each YOLO entity in-place.
+
+    Matching priority:
+      1. track_id in involved_track_ids / linked_entity_id / entity_id / track_id
+      2. detection_id in involved_detection_ids
+      3. bbox IoU >= 0.30 fallback
+
+    Stamped fields: risk_level, risk_color, risk_score, severity, likelihood,
+      risk_reason, recommended_action, produced_by, requires_human_review.
+    Candidate-only / advisory risks are NOT stamped onto boxes.
+    """
+    entities = resp_dict.get("entities") or []
+    scene_risks = resp_dict.get("scene_risks") or []
+    if not entities or not scene_risks:
+        return
+
+    for e in entities:
+        if not isinstance(e, dict):
+            continue
+        e_tid = str(e.get("track_id") or "")
+        e_did = e.get("detection_id")
+        e_did_s = str(e_did) if e_did is not None else None
+        e_bbox = e.get("bbox") or {}
+
+        best_risk: Optional[Dict[str, Any]] = None
+        best_level = -1
+
+        for r in scene_risks:
+            if not isinstance(r, dict):
+                continue
+            # Never stamp candidate-only / advisory risks onto boxes.
+            if r.get("candidate_only"):
+                continue
+            rl = r.get("risk_level", "GREEN")
+            rl_order = _RISK_LEVEL_ORDER.get(rl, 0)
+            if rl_order <= best_level:
+                continue
+
+            matched = False
+            # 1. Track-ID match
+            if e_tid:
+                tids = [str(t) for t in (r.get("involved_track_ids") or [])]
+                if e_tid in tids:
+                    matched = True
+                if not matched:
+                    for fld in ("linked_entity_id", "entity_id", "track_id"):
+                        if r.get(fld) and str(r[fld]) == e_tid:
+                            matched = True
+                            break
+            # 2. Detection-ID match
+            if not matched and e_did_s is not None:
+                dids = [str(d) for d in (r.get("involved_detection_ids") or [])]
+                if e_did_s in dids:
+                    matched = True
+            # 3. Bbox IoU fallback
+            if not matched and isinstance(e_bbox, dict) and isinstance(r.get("bbox"), dict):
+                if _iou(e_bbox, r["bbox"]) >= 0.30:
+                    matched = True
+
+            if matched:
+                best_risk = r
+                best_level = rl_order
+
+        if best_risk:
+            e["risk_level"] = best_risk.get("risk_level", "GREEN")
+            e["risk_color"] = _RISK_COLOR_MAP.get(e["risk_level"], e["risk_level"].lower())
+            e["risk_score"] = best_risk.get("risk_score")
+            e["severity"] = best_risk.get("severity")
+            e["likelihood"] = best_risk.get("likelihood")
+            e["risk_reason"] = (best_risk.get("risk_reason")
+                                or best_risk.get("reason", ""))
+            e["recommended_action"] = best_risk.get("recommended_action")
+            e["produced_by"] = best_risk.get("produced_by", "risk_engine")
+            e["requires_human_review"] = bool(best_risk.get("requires_human_review", False))
+
+
 # -- Detect endpoint ----------------------------------------------------------
 
 @app.post("/detect")
@@ -1113,6 +1217,11 @@ async def detect(payload: Dict[str, Any]):
                 resp_dict["scene_risks"] = _build_scene_risks(
                     resp_dict.get("risks", []), None, resp_dict.get("tracks", []))
                 _add_warning(resp_dict, "reasoner_unavailable")
+        # Stamp the highest matching scene_risk onto each YOLO entity so the app
+        # can color boxes without waiting for VLM. This is the primary mechanism
+        # that drives box coloring during live HSE streaming.
+        if resp_dict.get("scene_risks"):
+            _stamp_entity_risks(resp_dict)
         # Event-triggered temporal perception (PR: single-worker GPU+CPU). ADDITIVE
         # + NON-BLOCKING: folds the frame into per-session memory, adds deterministic
         # object-near-edge risk, and (rarely, rate-limited) kicks an async VLM job
@@ -1151,7 +1260,14 @@ async def detect(payload: Dict[str, Any]):
                           entities=len(resp_dict.get("entities", []) or []),
                           highest_risk_level=resp_dict.get("highest_risk_level"),
                           degradation_mode=mode,
-                          reasoner_status=_rs_label)
+                          reasoner_status=_rs_label,
+                          scene_risks_count=len(resp_dict.get("scene_risks") or []),
+                          linkable_scene_risks_count=sum(
+                              1 for r in resp_dict.get("scene_risks") or []
+                              if _is_linkable_scene_risk(r)),
+                          entity_risk_stamped_count=sum(
+                              1 for e in resp_dict.get("entities") or []
+                              if isinstance(e, dict) and e.get("risk_level")))
         return JSONResponse(resp_dict)
     except Exception as exc:
         runtime.inc("detect_errors_total")

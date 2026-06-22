@@ -28,6 +28,31 @@ from pydantic import BaseModel, Field
 log = logging.getLogger("safelens-vision-worker.gemini")
 
 # ---------------------------------------------------------------------------
+# Custom exception for Gemini 503 / service unavailable
+# ---------------------------------------------------------------------------
+
+
+class GeminiUnavailableError(RuntimeError):
+    """Raised when Gemini returns HTTP 503 or an equivalent service-unavailable error.
+
+    Distinct from generic RuntimeError so callers can map it to
+    reasoner_status='unavailable' rather than 'error' or 'json_parse_error'.
+    """
+    pass
+
+
+def _is_503(exc: Exception) -> bool:
+    """Return True when *exc* looks like a Gemini / Google API 503 error."""
+    exc_type = type(exc).__name__
+    exc_str = str(exc)
+    return (
+        "503" in exc_str
+        or "ServiceUnavailable" in exc_type
+        or "UNAVAILABLE" in exc_str
+        or "service_unavailable" in exc_str.lower()
+    )
+
+# ---------------------------------------------------------------------------
 # Gemini structured-output schema
 # (box-decision only; no bbox / class_id / detector confidence / narratives)
 # ---------------------------------------------------------------------------
@@ -255,6 +280,7 @@ def build_adapter() -> Dict[str, Any]:
         parts.append(prompt)
 
         last_exc: Optional[Exception] = None
+        last_is_unavailable = False
         for attempt in range(retries + 1):
             try:
                 response = _call_generate(client, types, mid, parts)
@@ -266,8 +292,14 @@ def build_adapter() -> Dict[str, Any]:
                     return raw_text
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
+                if _is_503(exc):
+                    last_is_unavailable = True
                 if attempt < retries:
                     log.warning("gemini: attempt %d failed: %s", attempt + 1, exc)
+        if last_is_unavailable:
+            raise GeminiUnavailableError(
+                f"Gemini unavailable (503) after {retries + 1} attempt(s): {last_exc}"
+            ) from last_exc
         raise RuntimeError(f"Gemini generate failed after {retries + 1} attempt(s): {last_exc}")
 
     return {
