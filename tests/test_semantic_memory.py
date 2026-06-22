@@ -447,8 +447,7 @@ def test_gemini_box_decision_accepts_semantic_label():
 
 def test_gemini_box_decision_rejects_long_semantic_label():
     from risk.gemini_reasoner import GeminiBoxDecision
-    import pytest as _pytest
-    with _pytest.raises(Exception):
+    with pytest.raises(Exception):
         GeminiBoxDecision(
             box_id="A",
             hazard_type="other",

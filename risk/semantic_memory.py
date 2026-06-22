@@ -62,6 +62,11 @@ def _min_confidence() -> float:
         return 0.55
 
 
+def min_confidence() -> float:
+    """Public accessor for SEMANTIC_LABEL_MIN_CONFIDENCE threshold."""
+    return _min_confidence()
+
+
 def _max_per_session() -> int:
     try:
         return max(1, int(os.getenv("SEMANTIC_LABEL_MAX_PER_SESSION", "64")))
@@ -95,6 +100,8 @@ def _bbox_fallback_center_max() -> float:
 # ---------------------------------------------------------------------------
 
 # Reject labels containing any of these risk words (word-boundary check).
+# Single-word entries are matched with word boundaries; multi-word entries
+# are matched as substrings (e.g. "near edge" covers the phrase).
 _RISK_WORDS = frozenset({
     "danger", "dangerous", "hazard", "hazardous", "unsafe", "risk",
     "yellow", "orange", "red", "fall", "falling", "edge", "near edge",
@@ -392,7 +399,6 @@ def apply_to_entities(
     """
     stats = {
         "semantic_label_cache_size": 0,
-        "semantic_label_update_count": 0,   # updated by update(); not tracked here
         "semantic_label_applied_count": 0,
         "semantic_label_track_match_count": 0,
         "semantic_label_detection_match_count": 0,

@@ -614,7 +614,7 @@ def _gemini_data_to_reason_response(
         if eid:
             entity_id_to_entity[eid] = e
 
-    sem_min_conf = semantic_memory._min_confidence()  # noqa: SLF001
+    sem_min_conf = semantic_memory.min_confidence()
 
     risks: List[VlmRisk] = []
     frame_or_session = req.frame_id or req.session_id or "frame"
