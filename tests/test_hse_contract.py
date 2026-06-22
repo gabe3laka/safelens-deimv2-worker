@@ -279,10 +279,27 @@ def test_vague_deterministic_risk_excluded(monkeypatch):
     assert scene == []
 
 
-def test_latent_risk_excluded_from_scene_risks(monkeypatch):
+def test_latent_linkable_yellow_risk_included_in_scene_risks(monkeypatch):
     srv = _get_srv(monkeypatch)
-    latent = dict(DET_RISK_LINKED, risk_state="latent")
+    latent = dict(DET_RISK_LINKED, risk_state="latent", risk_level="YELLOW")
     scene = srv._build_scene_risks([latent], None, [])
+    assert len(scene) == 1
+    assert scene[0]["risk_state"] == "latent"
+    assert scene[0]["risk_level"] == "YELLOW"
+
+
+def test_deterministic_green_risk_excluded_from_scene_risks(monkeypatch):
+    srv = _get_srv(monkeypatch)
+    green = dict(DET_RISK_LINKED, risk_level="GREEN")
+    scene = srv._build_scene_risks([green], None, [])
+    assert scene == []
+
+
+@pytest.mark.parametrize("state", ["suppressed", "resolved"])
+def test_suppressed_or_resolved_deterministic_risk_excluded(monkeypatch, state):
+    srv = _get_srv(monkeypatch)
+    risk = dict(DET_RISK_LINKED, risk_state=state)
+    scene = srv._build_scene_risks([risk], None, [])
     assert scene == []
 
 

@@ -30,6 +30,7 @@ GET  /build/session/{id}/replay -- Build Mode: replay stored JSON keyframes
 
 import asyncio
 import logging
+import math
 import os
 import shutil
 import sys
@@ -848,6 +849,41 @@ def _is_linkable(risk: Dict[str, Any]) -> bool:
     )
 
 
+def _has_finite_bbox(value: Any) -> bool:
+    """Return True when bbox has finite x/y/w/h and positive size."""
+    if not isinstance(value, dict):
+        return False
+    try:
+        x = float(value.get("x"))
+        y = float(value.get("y"))
+        w = float(value.get("w"))
+        h = float(value.get("h"))
+    except Exception:  # noqa: BLE001
+        return False
+    return all(math.isfinite(v) for v in (x, y, w, h)) and w > 0 and h > 0
+
+
+def _deterministic_risk_is_scene_visible(risk: dict) -> bool:
+    """Neutral inclusion gate for deterministic scene risks."""
+    if not isinstance(risk, dict):
+        return False
+    if risk.get("candidate_only") or risk.get("unmatched"):
+        return False
+    produced_by = str(risk.get("produced_by", "risk_engine")).lower()
+    if produced_by == "vlm_reasoner":
+        return False
+    if str(risk.get("risk_state", "active")).lower() in {"resolved", "resolving", "suppressed"}:
+        return False
+    level = str(risk.get("risk_level", "GREEN")).upper()
+    if _RISK_LEVEL_ORDER.get(level, 0) < _RISK_LEVEL_ORDER["YELLOW"]:
+        return False
+    if not _is_linkable(risk):
+        return False
+    if not _has_finite_bbox(risk.get("bbox")):
+        return False
+    return True
+
+
 def _build_scene_risks(
     det_risks: Optional[list],
     vlm_draft: Optional[Dict[str, Any]],
@@ -862,9 +898,9 @@ def _build_scene_risks(
     """
     scene_risks: list = []
 
-    # 1. Active linkable deterministic risks
+    # 1. Deterministic linkable scene-visible risks
     for risk in (det_risks or []):
-        if risk.get("risk_state", "active") == "active" and _is_linkable(risk):
+        if _deterministic_risk_is_scene_visible(risk):
             sr = dict(risk)
             sr.setdefault("produced_by", "risk_engine")
             sr.setdefault("reasoner_model", "risk_engine.v1")
@@ -872,6 +908,9 @@ def _build_scene_risks(
             sr.setdefault("risk_reason", risk.get("reason", ""))
             sr.setdefault("evidence", risk.get("visual_evidence") or
                           ([risk["reason"]] if risk.get("reason") else []))
+            sr.setdefault("should_alert", bool(risk.get("should_alert", False)))
+            sr.setdefault("requires_human_review", bool(risk.get("requires_human_review", False)))
+            sr["candidate_only"] = False
             scene_risks.append(sr)
 
     # 2. VLM draft risks -- enrich with track bbox if not already linked
@@ -1262,16 +1301,23 @@ async def detect(payload: Dict[str, Any]):
         _rs_label = _rs.get("state") if isinstance(_rs, dict) else _rs
         if _rs_label:
             runtime.inc("reasoner_status_total", {"status": str(_rs_label)})
+        _scene_risks = resp_dict.get("scene_risks") or []
         runtime.log_event("detect", session_id=session_id, frame_id=frame_id,
                           backend=resp_dict.get("backend"),
                           entities=len(resp_dict.get("entities", []) or []),
                           highest_risk_level=resp_dict.get("highest_risk_level"),
                           degradation_mode=mode,
                           reasoner_status=_rs_label,
-                          scene_risks_count=len(resp_dict.get("scene_risks") or []),
+                          scene_risks_count=len(_scene_risks),
                           linkable_scene_risks_count=sum(
-                              1 for r in resp_dict.get("scene_risks") or []
+                              1 for r in _scene_risks
                               if _is_linkable_scene_risk(r)),
+                          deterministic_scene_risks_count=sum(
+                              1 for r in _scene_risks
+                              if isinstance(r, dict) and str(r.get("produced_by", "risk_engine")).lower() == "risk_engine"),
+                          vlm_scene_risks_count=sum(
+                              1 for r in _scene_risks
+                              if isinstance(r, dict) and str(r.get("produced_by", "")).lower() == "vlm_reasoner"),
                           entity_risk_stamped_count=sum(
                               1 for e in resp_dict.get("entities") or []
                               if isinstance(e, dict) and e.get("risk_level")))

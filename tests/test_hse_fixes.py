@@ -140,6 +140,16 @@ def test_scene_risks_built_when_gemini_error(monkeypatch):
     assert srv._is_linkable_scene_risk(scene[0])
 
 
+def test_scene_risks_built_when_gemini_returns_empty(monkeypatch):
+    """When Gemini returns empty risks, deterministic scene_risks are still present."""
+    srv = _get_srv(monkeypatch)
+    empty_draft = {"reasoner_status": "ready", "risks": []}
+    scene = srv._build_scene_risks([DET_RISK_YELLOW], empty_draft, [])
+    assert len(scene) == 1
+    assert scene[0]["risk_level"] == "YELLOW"
+    assert scene[0]["candidate_only"] is False
+
+
 def test_scene_risks_built_when_gemini_json_parse_error(monkeypatch):
     """When Gemini returns json_parse_error, deterministic scene_risks still present."""
     srv = _get_srv(monkeypatch)
@@ -244,9 +254,13 @@ def test_detect_log_contains_scene_risk_counts(server_mod, monkeypatch):
         ev = detect_events[-1]
         assert "scene_risks_count" in ev, f"scene_risks_count missing from: {ev}"
         assert "linkable_scene_risks_count" in ev, f"linkable_scene_risks_count missing"
+        assert "deterministic_scene_risks_count" in ev, "deterministic_scene_risks_count missing"
+        assert "vlm_scene_risks_count" in ev, "vlm_scene_risks_count missing"
         assert "entity_risk_stamped_count" in ev, f"entity_risk_stamped_count missing"
         assert isinstance(ev["scene_risks_count"], int)
         assert isinstance(ev["linkable_scene_risks_count"], int)
+        assert isinstance(ev["deterministic_scene_risks_count"], int)
+        assert isinstance(ev["vlm_scene_risks_count"], int)
         assert isinstance(ev["entity_risk_stamped_count"], int)
     finally:
         with server_mod._STATE_LOCK:
@@ -275,6 +289,28 @@ def test_stamp_entity_risks_by_track_id(monkeypatch):
     assert entity["recommended_action"] == "Secure load."
     assert entity["produced_by"] == "risk_engine"
     assert entity["requires_human_review"] is False
+
+
+def test_stamp_entity_risks_is_label_agnostic(monkeypatch):
+    """Stamping matches links/bbox and does not depend on object labels."""
+    srv = _get_srv(monkeypatch)
+    entity = {
+        "label": "generic_entity",
+        "track_id": "trk_generic",
+        "bbox": {"x": 0.10, "y": 0.10, "w": 0.20, "h": 0.20},
+    }
+    risk = {
+        "risk_id": "r_generic",
+        "risk_level": "YELLOW",
+        "involved_track_ids": ["trk_generic"],
+        "bbox": {"x": 0.10, "y": 0.10, "w": 0.20, "h": 0.20},
+        "produced_by": "risk_engine",
+        "candidate_only": False,
+        "requires_human_review": False,
+    }
+    resp = {"entities": [entity], "scene_risks": [risk]}
+    srv._stamp_entity_risks(resp)
+    assert entity["risk_level"] == "YELLOW"
 
 
 def test_stamp_entity_risks_by_linked_entity_id(monkeypatch):
@@ -394,6 +430,20 @@ def test_stamp_entity_risks_highest_wins(monkeypatch):
     resp = {"entities": [entity], "scene_risks": [risk_yellow, risk_orange]}
     srv._stamp_entity_risks(resp)
     assert entity["risk_level"] == "ORANGE"
+
+
+def test_linkable_scene_risks_normally_produce_stamped_entity(monkeypatch):
+    """scene_risks_count>=1 and linkable_scene_risks_count>=1 should stamp >=1 entity."""
+    srv = _get_srv(monkeypatch)
+    entity = dict(PERSON)
+    resp = {"entities": [entity], "scene_risks": [dict(DET_RISK_YELLOW, candidate_only=False)]}
+    scene_count = len(resp["scene_risks"])
+    linkable_count = sum(1 for r in resp["scene_risks"] if srv._is_linkable_scene_risk(r))
+    assert scene_count >= 1
+    assert linkable_count >= 1
+    srv._stamp_entity_risks(resp)
+    stamped_count = sum(1 for e in resp["entities"] if isinstance(e, dict) and e.get("risk_level"))
+    assert stamped_count >= 1
 
 
 def test_stamp_entity_risks_no_match_no_stamp(monkeypatch):
