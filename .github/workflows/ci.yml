@@ -56,7 +56,7 @@ jobs:
       # surfaces (no GPU, no real weights, no LLM keys, no DB). The legacy DEIMv2
       # tests target removed functionality and are excluded here.
       - name: pytest (hardening + risk + reason + contract + temporal + agentic)
-        run: pytest -q tests/test_risk_engine.py tests/test_reason_vlm.py tests/test_hardening.py tests/test_contract.py tests/test_detector_config.py tests/test_temporal_reasoning.py tests/test_agentic_cpu.py tests/test_agent_import_guard.py
+        run: pytest -q tests/test_risk_engine.py tests/test_reason_vlm.py tests/test_hardening.py tests/test_contract.py tests/test_detector_config.py tests/test_temporal_reasoning.py tests/test_agentic_cpu.py tests/test_agent_import_guard.py tests/test_semantic_memory.py tests/test_primary_risk_focus.py
 
       # BLOCKING quality gate: deterministic risk-engine recall must not regress.
       - name: validation gate (blocking)

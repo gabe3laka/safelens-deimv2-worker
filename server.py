@@ -1277,6 +1277,20 @@ async def detect(payload: Dict[str, Any]):
                     frame_b64=frame_b64, payload=payload)
         except Exception as texc:  # noqa: BLE001 -- temporal must never break detection
             log.warning("detect: temporal layer failed: %s", texc)
+        # Primary risk focus filtering (PR #29): additive, guarded, shadow-mode by
+        # default (PRIMARY_RISK_FOCUS_APPLY_ENABLED / PRIMARY_RISK_CONTEXT_SUPPRESS_APPLY_ENABLED
+        # both false). Runs BEFORE stamping so context/support boxes marked
+        # candidate_only are not stamped yellow. Never raises; never creates risk.
+        _primary_focus_stats: Dict[str, Any] = {}
+        try:
+            import risk.primary_risk_focus as _primary_risk_focus
+            _primary_focus_stats = _primary_risk_focus.apply_focus_filter(
+                resp_dict,
+                session_id=session_id or "__default__",
+                current_det_risks=resp_dict.get("risks") or [],
+            )
+        except Exception as pexc:  # noqa: BLE001 -- primary focus must never break detection
+            log.warning("detect: primary risk focus filter failed: %s", pexc)
         # Final stamping pass after all scene_risks (including temporal additions)
         # are attached, so entity box colors reflect the final scene_risks payload.
         if resp_dict.get("scene_risks"):
@@ -1342,7 +1356,16 @@ async def detect(payload: Dict[str, Any]):
                           semantic_label_track_match_count=_semantic_stats.get("semantic_label_track_match_count", 0),
                           semantic_label_detection_match_count=_semantic_stats.get("semantic_label_detection_match_count", 0),
                           semantic_label_bbox_fallback_count=_semantic_stats.get("semantic_label_bbox_fallback_count", 0),
-                          semantic_label_ambiguous_skip_count=_semantic_stats.get("semantic_label_ambiguous_skip_count", 0))
+                          semantic_label_ambiguous_skip_count=_semantic_stats.get("semantic_label_ambiguous_skip_count", 0),
+                          primary_risk_focus_cache_size=_primary_focus_stats.get("primary_risk_focus_cache_size", 0),
+                          primary_risk_focus_update_count=_primary_focus_stats.get("primary_risk_focus_update_count", 0),
+                          primary_risk_focus_valid_count=_primary_focus_stats.get("primary_risk_focus_valid_count", 0),
+                          primary_risk_focus_expired_count=_primary_focus_stats.get("primary_risk_focus_expired_count", 0),
+                          primary_risk_focus_current_support_miss_count=_primary_focus_stats.get("primary_risk_focus_current_support_miss_count", 0),
+                          primary_risk_context_suppressed_count=_primary_focus_stats.get("primary_risk_context_suppressed_count", 0),
+                          primary_risk_context_would_suppress_count=_primary_focus_stats.get("primary_risk_context_would_suppress_count", 0),
+                          primary_risk_focus_shadow_mode=_primary_focus_stats.get("primary_risk_focus_shadow_mode", True),
+                          reasoner_linked_risk_ttl_ms=_primary_focus_stats.get("reasoner_linked_risk_ttl_ms", 0))
         return JSONResponse(resp_dict)
     except Exception as exc:
         runtime.inc("detect_errors_total")
