@@ -1281,6 +1281,22 @@ async def detect(payload: Dict[str, Any]):
         # are attached, so entity box colors reflect the final scene_risks payload.
         if resp_dict.get("scene_risks"):
             _stamp_entity_risks(resp_dict)
+        # Semantic label cache: additive, guarded, shadow-mode by default.
+        # SEMANTIC_LABEL_APPLY_ENABLED=false -> stores/logs only, no entity mutation.
+        _semantic_stats: Dict[str, int] = {}
+        try:
+            import risk.semantic_memory as _semantic_memory
+            _sem_apply = os.getenv("SEMANTIC_LABEL_APPLY_ENABLED", "false").strip().lower() in (
+                "1", "true", "yes", "on"
+            )
+            _semantic_stats = _semantic_memory.apply_to_entities(
+                resp_dict,
+                session_id=session_id or "__default__",
+                tracks=resp_dict.get("tracks", []) or [],
+                apply_enabled=_sem_apply,
+            )
+        except Exception as sexc:  # noqa: BLE001 -- semantic memory must never break detection
+            log.warning("detect: semantic memory apply failed: %s", sexc)
         # Degradation ladder (B4): surface degraded/degradation_mode + metrics.
         # VLM unavailability in HSE mode is also surfaced as degraded.
         rmeta = resp_dict.get("risk_engine") or {}
@@ -1320,7 +1336,13 @@ async def detect(payload: Dict[str, Any]):
                               if isinstance(r, dict) and str(r.get("produced_by", "")).lower() == "vlm_reasoner"),
                           entity_risk_stamped_count=sum(
                               1 for e in resp_dict.get("entities") or []
-                              if isinstance(e, dict) and e.get("risk_level")))
+                              if isinstance(e, dict) and e.get("risk_level")),
+                          semantic_label_cache_size=_semantic_stats.get("semantic_label_cache_size", 0),
+                          semantic_label_applied_count=_semantic_stats.get("semantic_label_applied_count", 0),
+                          semantic_label_track_match_count=_semantic_stats.get("semantic_label_track_match_count", 0),
+                          semantic_label_detection_match_count=_semantic_stats.get("semantic_label_detection_match_count", 0),
+                          semantic_label_bbox_fallback_count=_semantic_stats.get("semantic_label_bbox_fallback_count", 0),
+                          semantic_label_ambiguous_skip_count=_semantic_stats.get("semantic_label_ambiguous_skip_count", 0))
         return JSONResponse(resp_dict)
     except Exception as exc:
         runtime.inc("detect_errors_total")
