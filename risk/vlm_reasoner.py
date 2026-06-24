@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import ValidationError
 
-from . import controls, gemini_reasoner, privacy, semantic_memory
+from . import controls, gemini_reasoner, primary_risk_focus, privacy, semantic_memory
 from .gemini_reasoner import GeminiBoxDecisionResponse
 from .reason_schema import ReasonRequest, ReasonResponse, VlmRisk
 
@@ -664,6 +664,26 @@ def _gemini_data_to_reason_response(
                     source="gemini",
                 )
 
+        # Update primary risk focus when risk_role=="primary" and conditions are met.
+        # risk_role=="context" -> do not create a primary focus entry.
+        # risk_role=="uncertain" or None -> do nothing.
+        if (
+            bd.risk_role == "primary"
+            and level in ("YELLOW", "ORANGE", "RED")
+            and req.session_id
+        ):
+            entity = entity_id_to_entity.get(anchor["entity_id"])
+            if entity is not None:
+                primary_risk_focus.update(
+                    req.session_id,
+                    hazard_type=bd.hazard_type,
+                    risk_level=level,
+                    confidence=float(bd.confidence or 0.0),
+                    track_id=entity.get("track_id"),
+                    detection_id=entity.get("detection_id"),
+                    source="gemini",
+                )
+
     return ReasonResponse(
         reasoner_status="ok",
         reasoner_model=gemini_reasoner.model_id(),
@@ -781,6 +801,18 @@ def _build_gemini_prompt(req: ReasonRequest, anchors: List[Dict[str, str]]) -> s
         "red, edge, falling.\n"
         "- Do not invent a label if uncertain; omit the field instead.\n"
         "- semantic_label belongs only to an existing box_id; do not create new boxes.\n"
+        "risk_role rules:\n"
+        "- For each risky box, optionally assign risk_role to identify its role in the risk.\n"
+        "- risk_role='primary': the box is the DIRECT object creating the visible risk.\n"
+        "  Examples: cup/plant pot/bottle at the edge = primary.\n"
+        "- risk_role='context': support/background object not directly causing the risk.\n"
+        "  Examples: table/shelf holding the primary object = context.\n"
+        "  Examples: nearby chair/wall/floor unless they have their own risk = context.\n"
+        "- risk_role='uncertain': cannot determine role with confidence.\n"
+        "- Only mark a context object risky if it independently creates its own visible risk.\n"
+        "- Prefer uncertain over guessing; omit risk_role entirely if you cannot decide.\n"
+        "- If this box is a context box and you know which primary box it supports, set "
+        "context_for_box_id to that box's letter ID.\n"
         "Risk matrix:\n"
         "risk_score = severity * likelihood\n"
         + band_lines + "\n"

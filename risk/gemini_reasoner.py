@@ -80,6 +80,7 @@ EvidenceCode = Literal[
     "falling_object_potential",
     "other_visible",
 ]
+RiskRole = Literal["primary", "context", "uncertain"]
 
 
 class GeminiBoxDecision(BaseModel):
@@ -105,6 +106,21 @@ class GeminiBoxDecision(BaseModel):
         description=(
             "Short visual object noun phrase for this existing YOLO box. "
             "Object identity only; no risk words."
+        ),
+    )
+    risk_role: Optional[RiskRole] = Field(
+        default=None,
+        description=(
+            "primary = the box that is directly causing the risk; "
+            "context = support/background object; "
+            "uncertain = not enough evidence"
+        ),
+    )
+    context_for_box_id: Optional[str] = Field(
+        default=None,
+        max_length=1,
+        description=(
+            "If this is a context box, optionally reference the primary box_id it supports."
         ),
     )
 
