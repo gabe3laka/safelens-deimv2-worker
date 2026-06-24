@@ -132,6 +132,8 @@ def shadow_mode() -> bool:
 
 _LOCK = threading.RLock()
 _CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}
+# Process-cumulative count of stored focus updates (observability; logged per-frame).
+_UPDATE_COUNT = 0
 
 
 def _now_ms() -> int:
@@ -152,11 +154,12 @@ def _risk_key(hazard_type: str, track_id: Any, detection_id: Any) -> Optional[st
     return None
 
 
-def _expire_session(session_entries: Dict[str, Dict[str, Any]], now_ms: int) -> None:
-    """Remove expired entries from a session dict in-place."""
+def _expire_session(session_entries: Dict[str, Dict[str, Any]], now_ms: int) -> int:
+    """Remove expired entries from a session dict in-place. Returns count removed."""
     expired = [k for k, v in session_entries.items() if now_ms >= v["expires_at_ms"]]
     for k in expired:
         del session_entries[k]
+    return len(expired)
 
 
 # ---------------------------------------------------------------------------
@@ -212,12 +215,14 @@ def update(
         "source": source,
     }
 
+    global _UPDATE_COUNT
     with _LOCK:
         if session_id not in _CACHE:
             _CACHE[session_id] = {}
         session_entries = _CACHE[session_id]
         _expire_session(session_entries, now)
         session_entries[key] = entry
+        _UPDATE_COUNT += 1
 
     log.debug(
         "primary_risk_focus: stored session=%s key=%s level=%s conf=%.2f",
@@ -278,9 +283,11 @@ def expire_session(session_id: str) -> None:
 
 
 def reset() -> None:
-    """Clear all cache (tests / shutdown)."""
+    """Clear all cache + counters (tests / shutdown)."""
+    global _UPDATE_COUNT
     with _LOCK:
         _CACHE.clear()
+        _UPDATE_COUNT = 0
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +388,7 @@ def apply_focus_filter(
     *,
     session_id: str,
     current_det_risks: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     """Apply primary risk focus filtering to scene_risks.
 
     Must be called BEFORE _stamp_entity_risks().
@@ -401,9 +408,9 @@ def apply_focus_filter(
 
     Returns stats dict with log fields.
     """
-    stats = {
+    stats: Dict[str, Any] = {
         "primary_risk_focus_cache_size": 0,
-        "primary_risk_focus_update_count": 0,
+        "primary_risk_focus_update_count": _UPDATE_COUNT,
         "primary_risk_focus_valid_count": 0,
         "primary_risk_focus_expired_count": 0,
         "primary_risk_focus_current_support_miss_count": 0,
@@ -423,7 +430,7 @@ def apply_focus_filter(
     now = _now_ms()
     with _LOCK:
         session_entries = _CACHE.get(session_id) or {}
-        _expire_session(session_entries, now)
+        stats["primary_risk_focus_expired_count"] = _expire_session(session_entries, now)
         stats["primary_risk_focus_cache_size"] = len(session_entries)
         if not session_entries:
             return stats

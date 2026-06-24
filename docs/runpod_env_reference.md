@@ -60,8 +60,47 @@ The temporal VLM reuses the `risk.vlm_reasoner` model knobs: `VLM_REASONER_ENABL
 | `REASONER_MAX_WORKERS` | `1` | single-worker reasoner |
 | `REASONER_MATCH_IOU_MIN` | `0.20` | min IoU for VLM-to-detector linkage |
 | `REASONER_MATCH_CENTER_DIST_MAX` | `0.20` | max normalized center distance for linkage |
-| `REASONER_LINKED_RISK_TTL_MS` | `8000` | linked overlay freshness |
+| `REASONER_LINKED_RISK_TTL_MS` | `8000` | linked overlay freshness (operators may lower to `3500` to cut stale yellow carryover) |
 | `REASONER_UNMATCHED_CANDIDATE_TTL_MS` | `5000` | unmatched advisory candidate freshness |
+
+## Primary risk focus filtering (shadow-mode by default)
+
+When Gemini marks the **primary** object causing a risk (e.g. a plant pot near an
+edge), only that object stays yellow; nearby **context/support** boxes (table,
+chair) are treated as non-yellow unless they carry their own independent risk. A
+short-lived per-session focus cache is validated against the **current frame**
+before it may suppress anything, so a stale VLM "yellow" cannot survive once the
+live frame no longer supports the risk.
+
+Safety properties: the focus cache stores **metadata only** (track/detection id,
+hazard_type, risk_level, confidence, timestamps) — never images, crops, base64
+frames, or full Gemini text. It is keyed by `session_id + hazard_type +
+track_id/detection_id` — **never** by semantic label (the semantic label cache
+stays purely descriptive and never creates risk). Filtering applies only to
+`object_near_edge`, `falling_object`, `blocked_path`, `broken_object`; it never
+touches `ppe_missing`/`worker_near_vehicle`/`unsafe_interaction`/`fire`/`smoke` or
+independent `RED`/`ORANGE` risks. TTL is intentionally shorter than the semantic
+label cache because it affects which boxes stay yellow.
+
+| Env | Default | Meaning |
+| --- | --- | --- |
+| `PRIMARY_RISK_FOCUS_ENABLED` | `true` | master switch for the focus cache + filter |
+| `PRIMARY_RISK_FOCUS_APPLY_ENABLED` | `false` | shadow mode; `true` lets the filter mark context risks `candidate_only` |
+| `PRIMARY_RISK_FOCUS_TTL_MS` | `3500` | focus entry lifetime (shorter than the semantic label cache) |
+| `PRIMARY_RISK_FOCUS_MIN_CONFIDENCE` | `0.65` | min Gemini confidence to store a primary focus |
+| `PRIMARY_RISK_FOCUS_REQUIRE_CURRENT_DETERMINISTIC_SUPPORT` | `true` | a cached focus needs current-frame deterministic support of the same hazard linked to the same track |
+| `PRIMARY_RISK_CONTEXT_SUPPRESS_ENABLED` | `true` | enable context-risk suppression logic |
+| `PRIMARY_RISK_CONTEXT_SUPPRESS_APPLY_ENABLED` | `false` | shadow mode; `true` actually suppresses context risks from stamping |
+
+Both apply flags are `false` on first deploy (shadow mode): the worker logs
+`primary_risk_context_would_suppress_count` but does not change `scene_risks` or
+entity stamping. Recommended companion override: `REASONER_LINKED_RISK_TTL_MS=3500`
+to reduce stale VLM yellow carryover (env-only; the code defaults safely if unset).
+New `detect` log fields: `primary_risk_focus_cache_size`,
+`primary_risk_focus_update_count`, `primary_risk_focus_valid_count`,
+`primary_risk_focus_expired_count`, `primary_risk_focus_current_support_miss_count`,
+`primary_risk_context_suppressed_count`, `primary_risk_context_would_suppress_count`,
+`primary_risk_focus_shadow_mode`, `reasoner_linked_risk_ttl_ms`.
 
 ## CPU agent
 

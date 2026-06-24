@@ -339,6 +339,9 @@ ENV REASONER_MAX_WORKERS="1"
 ENV REASONER_MAX_SESSIONS="64"
 ENV REASONER_MATCH_IOU_MIN="0.20"
 ENV REASONER_MATCH_CENTER_DIST_MAX="0.20"
+# Linked VLM-risk overlay freshness. Operators may LOWER this to "3500" at deploy
+# time to reduce stale "yellow" carryover (a primary-risk-focus recommendation);
+# left at the stable default here, and the code defaults safely if unset.
 ENV REASONER_LINKED_RISK_TTL_MS="8000"
 ENV REASONER_UNMATCHED_CANDIDATE_TTL_MS="5000"
 ENV REASONER_LATEST_WINS="true"
@@ -351,6 +354,27 @@ ENV GEMINI_TEMPERATURE="0"
 ENV GEMINI_MAX_IMAGE_SIDE="512"
 ENV GEMINI_MAX_DETECTED_LABELS="20"
 ENV GEMINI_REQUEST_RETRIES="1"
+
+# ------- Primary risk focus filtering (PR #29) -------------------------------
+# When Gemini identifies the PRIMARY object causing a risk (e.g. plant pot near
+# an edge), keep only that object yellow and treat nearby support/context boxes
+# (table, chair) as non-yellow -- unless they have their own independent risk.
+# A short-lived per-session focus cache (metadata only: track/detection id +
+# hazard + level + timestamps; NO images/crops/base64/Gemini text) is validated
+# against the CURRENT frame before it can suppress anything, so stale "yellow"
+# cannot survive once the live frame no longer supports the risk. Keyed by
+# session + hazard + track (never by semantic label); applies only to
+# object_near_edge/falling_object/blocked_path/broken_object; never to
+# PPE/person/vehicle/fire/smoke or to independent RED/ORANGE risks.
+# Ships SHADOW MODE by default (apply flags false): stores + logs would-suppress
+# counts but does NOT change scene_risks or entity stamping.
+ENV PRIMARY_RISK_FOCUS_ENABLED="true"
+ENV PRIMARY_RISK_FOCUS_APPLY_ENABLED="false"
+ENV PRIMARY_RISK_FOCUS_TTL_MS="3500"
+ENV PRIMARY_RISK_FOCUS_MIN_CONFIDENCE="0.65"
+ENV PRIMARY_RISK_FOCUS_REQUIRE_CURRENT_DETERMINISTIC_SUPPORT="true"
+ENV PRIMARY_RISK_CONTEXT_SUPPRESS_ENABLED="true"
+ENV PRIMARY_RISK_CONTEXT_SUPPRESS_APPLY_ENABLED="false"
 
 # ------- Open-vocabulary scanner (GroundingDINO) -----------------------------
 # Optional, OFF by default, NEVER per-frame. Candidate-only output (requires
