@@ -49,6 +49,15 @@ results/
 *.png
 *.mp4
 
+# Datasets — never commit images/labels/zips to git
+datasets/
+*.zip
+data/*.zip
+
+# Drive OAuth tokens — keep out of repo
+token.json
+credentials.json
+
 # Logs
 *.log
 logs/
